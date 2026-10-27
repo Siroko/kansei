@@ -60,7 +60,7 @@ impl AnisotropicMips {
             entries: &[sampled(0), sampled(1), sampled(2), sampled(3), storage(4), storage(5), storage(6)],
         });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("VoxelGI/AnisotropicMips"), source: wgpu::ShaderSource::Wgsl(ANISO_MIP_WGSL.into()) });
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("VoxelGI/AnisotropicMips"), bind_group_layouts: &[&bgl], push_constant_ranges: &[] });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("VoxelGI/AnisotropicMips"), bind_group_layouts: &[Some(&bgl)], immediate_size: 0 });
         let pipelines = ["first_pos", "first_neg", "down_pos", "down_neg"].map(|entry| {
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("VoxelGI/AnisotropicMips"),

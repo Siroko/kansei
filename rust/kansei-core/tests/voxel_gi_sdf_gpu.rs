@@ -7,9 +7,9 @@ use wgpu::util::DeviceExt;
 
 fn gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
     let instance = wgpu::Instance::default();
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?;
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
     let desc = wgpu::DeviceDescriptor { required_features: wgpu::Features::FLOAT32_FILTERABLE & adapter.features(), ..Default::default() };
-    pollster::block_on(adapter.request_device(&desc, None)).ok()
+    pollster::block_on(adapter.request_device(&desc)).ok()
 }
 
 struct Rng(u64);
@@ -47,8 +47,8 @@ fn read_field(device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Textur
     );
     queue.submit(Some(encoder.finish()));
     buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-    device.poll(wgpu::Maintain::Wait);
-    let bytes = buffer.slice(..).get_mapped_range();
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    let bytes = buffer.slice(..).get_mapped_range().unwrap();
     let mut out = Vec::with_capacity((w * h * d) as usize);
     for z in 0..d {
         for y in 0..h {
@@ -215,7 +215,7 @@ mod scene {
 
     fn renderer() -> Option<Renderer> {
         let instance = wgpu::Instance::default();
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?;
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
         let mut renderer = Renderer::new(RendererConfig { width: W, height: H, sample_count: 1, ..Default::default() });
         pollster::block_on(renderer.initialize_headless(&adapter));
         Some(renderer)
@@ -433,8 +433,8 @@ fn read_mip0(device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Texture
     );
     queue.submit(Some(encoder.finish()));
     buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-    device.poll(wgpu::Maintain::Wait);
-    let bytes = buffer.slice(..).get_mapped_range();
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    let bytes = buffer.slice(..).get_mapped_range().unwrap();
     let mut out = Vec::new();
     for z in 0..d {
         for y in 0..h {
@@ -461,8 +461,8 @@ fn read_image(device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Textur
     );
     queue.submit(Some(encoder.finish()));
     buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-    device.poll(wgpu::Maintain::Wait);
-    let bytes = buffer.slice(..).get_mapped_range();
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    let bytes = buffer.slice(..).get_mapped_range().unwrap();
     (0..w * h)
         .map(|i| {
             let o = ((i / w) * row + (i % w) * 8) as usize;
@@ -505,8 +505,8 @@ fn particles_take_the_sun_from_the_volume_field() {
         encoder.copy_buffer_to_buffer(gi.lighting_buffer(), 0, &staging, 0, 32);
         queue.submit(Some(encoder.finish()));
         staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-        device.poll(wgpu::Maintain::Wait);
-        let light: Vec<f32> = bytemuck::cast_slice(&staging.slice(..).get_mapped_range()).to_vec();
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let light: Vec<f32> = bytemuck::cast_slice(&staging.slice(..).get_mapped_range().unwrap()).to_vec();
         light[3]
     };
     let (behind, beside) = (sun([1.0, 0.0, 0.0]), sun([-1.0, 0.0, 0.0]));

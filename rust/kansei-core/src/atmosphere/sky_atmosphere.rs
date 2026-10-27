@@ -384,7 +384,7 @@ pub(crate) fn compute_pipeline(device: &wgpu::Device, label: &str, code: &str, b
 
 fn compute_pipeline_at(device: &wgpu::Device, label: &str, code: &str, bgl: &wgpu::BindGroupLayout, entry_point: &str) -> wgpu::ComputePipeline {
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(code.into()) });
-    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some(label), bind_group_layouts: &[bgl], push_constant_ranges: &[] });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some(label), bind_group_layouts: &[Some(bgl)], immediate_size: 0 });
     device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some(label),
         layout: Some(&layout),
@@ -482,7 +482,7 @@ impl SkyAtmosphere {
                 label: Some("SkyAtmosphere/EnvironmentSampler"),
                 mag_filter: wgpu::FilterMode::Linear,
                 min_filter: wgpu::FilterMode::Linear,
-                mipmap_filter: wgpu::FilterMode::Linear,
+                mipmap_filter: wgpu::MipmapFilterMode::Linear,
                 ..Default::default()
             }),
             lut_sampler: sampler("SkyAtmosphere/LutSampler", wgpu::AddressMode::ClampToEdge),
@@ -609,7 +609,7 @@ impl SkyAtmosphere {
                     usage: wgpu::BufferUsages::UNIFORM,
                     mapped_at_creation: true,
                 });
-                params.slice(..).get_mapped_range_mut().copy_from_slice(bytemuck::cast_slice(&[
+                params.slice(..).get_mapped_range_mut().unwrap().copy_from_slice(bytemuck::cast_slice(&[
                     roughness.to_bits(),
                     ENVIRONMENT_SAMPLES,
                     0,
@@ -971,8 +971,8 @@ mod tests {
         );
         queue.submit(Some(encoder.finish()));
         buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-        device.poll(wgpu::Maintain::Wait);
-        let bytes = buffer.slice(..).get_mapped_range();
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let bytes = buffer.slice(..).get_mapped_range().unwrap();
         let halves: &[u16] = bytemuck::cast_slice(&bytes);
         let mut out = Vec::new();
         for face in 0..6 {
@@ -990,12 +990,12 @@ mod tests {
     /// texel taking all of them (the same samples, summed in another order).
     #[test]
     fn rough_mips_match_one_invocation_per_texel() {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-        let Some(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
             eprintln!("no GPU adapter: skipped");
             return;
         };
-        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default(), None)).unwrap();
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
         let mut sky = SkyAtmosphere::new(&device, SkyAtmosphereOptions::default());
         // a low sun: the sky's radiance varies round the cube
         sky.sun.direction = crate::atmosphere::direction_from_elevation_bearing(4.0, 90.0);

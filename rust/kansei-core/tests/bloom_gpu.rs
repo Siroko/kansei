@@ -16,8 +16,8 @@ const SPOT: f32 = 20.0;
 
 fn gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
     let instance = wgpu::Instance::default();
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?;
-    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None)).ok()
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
+    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()
 }
 
 fn f16_to_f32(h: u16) -> f32 {
@@ -96,7 +96,7 @@ impl Harness {
             primitive: Default::default(),
             depth_stencil: None,
             multisample: Default::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
         let mut encoder = self.device.create_command_encoder(&Default::default());
@@ -105,12 +105,14 @@ impl Harness {
                 label: None,
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: target,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
                 })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             pass.set_pipeline(&pipeline);
             pass.draw(0..3, 0..1);
@@ -142,8 +144,8 @@ impl Harness {
         );
         self.queue.submit(Some(encoder.finish()));
         staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-        self.device.poll(wgpu::Maintain::Wait);
-        let data = staging.slice(..).get_mapped_range();
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        let data = staging.slice(..).get_mapped_range().unwrap();
         let halves: &[u16] = bytemuck::cast_slice(&data);
         halves.chunks_exact(4).map(|t| f16_to_f32(t[0])).collect()
     }

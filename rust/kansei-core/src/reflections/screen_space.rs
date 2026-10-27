@@ -60,7 +60,7 @@ impl ScreenSpaceProjection {
             ],
         });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("PlanarReflection/ScreenSpace"), source: wgpu::ShaderSource::Wgsl(WGSL.into()) });
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("PlanarReflection/ScreenSpace"), bind_group_layouts: &[&bgl], push_constant_ranges: &[] });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("PlanarReflection/ScreenSpace"), bind_group_layouts: &[Some(&bgl)], immediate_size: 0 });
         let pipeline = |entry: &str| {
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("PlanarReflection/ScreenSpace"),
@@ -171,8 +171,8 @@ mod tests {
     #[test]
     fn the_screen_projected_across_the_plane_is_the_mirror_image() {
         let instance = wgpu::Instance::default();
-        let Some(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
-        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default(), None)).unwrap();
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
 
         let eye = glam::Vec3::new(0.0, 2.0, 12.0);
         let view = glam::Mat4::look_at_rh(eye, glam::Vec3::new(0.0, 0.5, 0.0), glam::Vec3::Y);
@@ -238,9 +238,9 @@ mod tests {
             vertex: wgpu::VertexState { module: &module, entry_point: Some("vs"), buffers: &[], compilation_options: Default::default() },
             fragment: Some(wgpu::FragmentState { module: &module, entry_point: Some("fs"), targets: &[], compilation_options: Default::default() }),
             primitive: Default::default(),
-            depth_stencil: Some(wgpu::DepthStencilState { format: wgpu::TextureFormat::Depth32Float, depth_write_enabled: true, depth_compare: wgpu::CompareFunction::Always, stencil: Default::default(), bias: Default::default() }),
+            depth_stencil: Some(wgpu::DepthStencilState { format: wgpu::TextureFormat::Depth32Float, depth_write_enabled: Some(true), depth_compare: Some(wgpu::CompareFunction::Always), stencil: Default::default(), bias: Default::default() }),
             multisample: Default::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
         let fill_bg = device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &fill.get_bind_group_layout(0), entries: &[wgpu::BindGroupEntry { binding: 0, resource: buf.as_entire_binding() }] });
@@ -277,6 +277,7 @@ mod tests {
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &depth_view, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }), stencil_ops: None }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             pass.set_pipeline(&fill);
             pass.set_bind_group(0, &fill_bg, &[]);
@@ -290,8 +291,8 @@ mod tests {
         );
         queue.submit([e.finish()]);
         read.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-        device.poll(wgpu::Maintain::Wait);
-        let data = read.slice(..).get_mapped_range();
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let data = read.slice(..).get_mapped_range().unwrap();
         let texel = |x: u32, y: u32| -> [f32; 4] {
             // stored mirrored left-right, as materials read it
             let o = (y * row + (dw - 1 - x) * 8) as usize;

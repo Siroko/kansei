@@ -251,8 +251,8 @@ impl ProbeGrid {
 
         let trace_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("ProbeGrid/TracePL"),
-            bind_group_layouts: &[&trace_bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&trace_bgl)],
+            immediate_size: 0,
         });
 
         let trace_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -328,8 +328,8 @@ impl ProbeGrid {
 
         let update_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("ProbeGrid/UpdatePL"),
-            bind_group_layouts: &[&update_bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&update_bgl)],
+            immediate_size: 0,
         });
 
         let update_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {

@@ -151,7 +151,7 @@ impl ClipmapInjection {
         entries.extend(clipmap_layout_entries(compute));
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("VoxelClipmap/InjectBGL"), entries: &entries });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("VoxelClipmap/Inject"), source: wgpu::ShaderSource::Wgsl(CLIPMAP_INJECT_WGSL.into()) });
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("VoxelClipmap/Inject"), bind_group_layouts: &[&bgl], push_constant_ranges: &[] });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("VoxelClipmap/Inject"), bind_group_layouts: &[Some(&bgl)], immediate_size: 0 });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("VoxelClipmap/Inject"),
             layout: Some(&layout),

@@ -188,7 +188,7 @@ impl SdfProbes {
         entries.extend((40..47).map(|binding| entry(binding, texture_ty)));
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("VoxelGI/ProbesBGL"), entries: &entries });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("VoxelGI/Probes"), source: wgpu::ShaderSource::Wgsl(PROBE_UPDATE_WGSL.into()) });
-        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("VoxelGI/Probes"), bind_group_layouts: &[&bgl], push_constant_ranges: &[] });
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("VoxelGI/Probes"), bind_group_layouts: &[Some(&bgl)], immediate_size: 0 });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("VoxelGI/Probes"),
             layout: Some(&pl),

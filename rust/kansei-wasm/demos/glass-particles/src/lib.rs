@@ -992,13 +992,13 @@ impl Particles {
 
     /// Add up the readbacks that came back.
     fn collect(&mut self, device: &wgpu::Device) {
-        device.poll(wgpu::Maintain::Poll);
+        let _ = device.poll(wgpu::PollType::Poll);
         for r in &self.readbacks {
             if r.state.load(Ordering::Relaxed) != 2 {
                 continue;
             }
             {
-                let data = r.buffer.slice(..).get_mapped_range();
+                let data = r.buffer.slice(..).get_mapped_range().unwrap();
                 let words: &[u32] = bytemuck::cast_slice(&data);
                 for ((total, window), &w) in self.totals.iter_mut().zip(self.rates.counts.iter_mut()).zip(&words[..8]) {
                     *total += w as u64;

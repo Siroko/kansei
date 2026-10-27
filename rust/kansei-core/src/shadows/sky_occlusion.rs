@@ -226,7 +226,7 @@ impl SkyOcclusion {
         );
         let pipeline = |label: &str, entry_point: &str, layout: &wgpu::BindGroupLayout| {
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(BUILD_WGSL.into()) });
-            let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some(label), bind_group_layouts: &[layout], push_constant_ranges: &[] });
+            let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some(label), bind_group_layouts: &[Some(layout)], immediate_size: 0 });
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some(label), layout: Some(&pl), module: &module, entry_point: Some(entry_point), compilation_options: Default::default(), cache: None })
         };
         let mut camera = Camera::new(60.0, 0.1, 100.0, 1.0);
@@ -248,7 +248,7 @@ impl SkyOcclusion {
                 label: Some("SkyOcclusion/Sampler"),
                 mag_filter: wgpu::FilterMode::Linear,
                 min_filter: wgpu::FilterMode::Linear,
-                mipmap_filter: wgpu::FilterMode::Linear,
+                mipmap_filter: wgpu::MipmapFilterMode::Linear,
                 ..Default::default()
             }),
             top_pipeline: pipeline("SkyOcclusion/Top", "top", &top_bgl),
@@ -494,8 +494,8 @@ mod tests {
     #[test]
     fn a_rebuild_is_spread_over_tiles_then_slabs() {
         let instance = wgpu::Instance::default();
-        let Some(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
-        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default(), None)).unwrap();
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
         let shared = crate::renderers::SharedLayouts::new(&device);
         let light_buf = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 4096, usage: wgpu::BufferUsages::UNIFORM, mapped_at_creation: false });
         let options = SkyOcclusionOptions { extent_m: 64.0, resolution: 256, volume_size: (32, 16), frames: 4, depth_tiles: 3, ..Default::default() };
@@ -555,8 +555,8 @@ mod tests {
     #[test]
     fn visibility_follows_the_canopy_height_field() {
         let instance = wgpu::Instance::default();
-        let Some(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
-        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default(), None)).unwrap();
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
         let shared = crate::renderers::SharedLayouts::new(&device);
         let light_buf = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 4096, usage: wgpu::BufferUsages::UNIFORM, mapped_at_creation: false });
         let options = SkyOcclusionOptions { extent_m: 64.0, resolution: 512, volume_size: (64, 32), min_height_m: 0.0, max_height_m: 16.0, ..Default::default() };
@@ -590,9 +590,9 @@ mod tests {
             vertex: wgpu::VertexState { module: &module, entry_point: Some("vs"), buffers: &[], compilation_options: Default::default() },
             fragment: Some(wgpu::FragmentState { module: &module, entry_point: Some("fs"), targets: &[], compilation_options: Default::default() }),
             primitive: Default::default(),
-            depth_stencil: Some(wgpu::DepthStencilState { format: SkyOcclusion::FORMAT, depth_write_enabled: true, depth_compare: wgpu::CompareFunction::Always, stencil: Default::default(), bias: Default::default() }),
+            depth_stencil: Some(wgpu::DepthStencilState { format: SkyOcclusion::FORMAT, depth_write_enabled: Some(true), depth_compare: Some(wgpu::CompareFunction::Always), stencil: Default::default(), bias: Default::default() }),
             multisample: Default::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
         let bg = device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &pipeline.get_bind_group_layout(0), entries: &[wgpu::BindGroupEntry { binding: 0, resource: buf.as_entire_binding() }] });
@@ -604,6 +604,7 @@ mod tests {
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: sky.depth_view(), depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }), stencil_ops: None }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &bg, &[]);
@@ -623,8 +624,8 @@ mod tests {
         );
         queue.submit([e.finish()]);
         read.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-        device.poll(wgpu::Maintain::Wait);
-        let data = read.slice(..).get_mapped_range();
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let data = read.slice(..).get_mapped_range().unwrap();
         let voxel = |x: u32, y: u32, z: u32| data[((z * levels + y) * row + x * 4) as usize] as f32 / 255.0;
         // the same model integrated finely: cosine-weighted directions, dimmed by 0.3 per metre
         // below the crown's top inside its disc
@@ -682,8 +683,8 @@ mod tests {
     #[ignore]
     fn time_sky_occlusion_build() {
         let instance = wgpu::Instance::default();
-        let Some(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
-        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default(), None)).unwrap();
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
         let shared = crate::renderers::SharedLayouts::new(&device);
         let light_buf = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 4096, usage: wgpu::BufferUsages::UNIFORM, mapped_at_creation: false });
         let camera = Camera::new(60.0, 0.1, 100.0, 1.0);
@@ -692,7 +693,7 @@ mod tests {
             f(&mut e);
             let t = std::time::Instant::now();
             queue.submit([e.finish()]);
-            device.poll(wgpu::Maintain::Wait);
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
             t.elapsed().as_secs_f64() * 1e3
         };
         let mut empty: Vec<f64> = (0..60).map(|_| wall(&mut |_| {})).collect();

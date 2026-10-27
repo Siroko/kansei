@@ -779,8 +779,8 @@ impl VolumetricFogEffect {
             });
             let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some(label),
-                bind_group_layouts: &[bgl],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(bgl)],
+                immediate_size: 0,
             });
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(label),
@@ -1298,8 +1298,8 @@ mod tests {
         );
         queue.submit(std::iter::once(encoder.finish()));
         buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-        device.poll(wgpu::Maintain::Wait);
-        let data = buffer.slice(..).get_mapped_range();
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let data = buffer.slice(..).get_mapped_range().unwrap();
         let mut out = Vec::with_capacity((w * h * d) as usize);
         for z in 0..d {
             for y in 0..h {
@@ -1319,8 +1319,8 @@ mod tests {
     #[test]
     fn the_fog_ends_at_its_reach() {
         let instance = wgpu::Instance::default();
-        let Some(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
-        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default(), None)).unwrap();
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
         let (w, h) = (64u32, 32u32);
         let tex = |format, usage| {
             device
@@ -1378,8 +1378,8 @@ mod tests {
     #[test]
     fn the_reflection_fog_lies_only_above_the_mirror() {
         let instance = wgpu::Instance::default();
-        let Some(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
-        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default(), None)).unwrap();
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
         let (w, h) = (64u32, 32u32);
         let tex = |format, usage| {
             device
@@ -1435,8 +1435,8 @@ mod tests {
     #[test]
     fn the_sky_light_on_the_fog_follows_the_sky_occlusion() {
         let instance = wgpu::Instance::default();
-        let Some(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
-        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default(), None)).unwrap();
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
         let (w, h) = (64u32, 32u32);
         let tex = |format, usage| {
             device
@@ -1503,8 +1503,8 @@ mod tests {
     #[test]
     fn a_reflection_not_drawn_gets_no_fog_volume() {
         let instance = wgpu::Instance::default();
-        let Some(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
-        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default(), None)).unwrap();
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
         let (w, h) = (64u32, 32u32);
         let tex = |format, usage| {
             device
@@ -1600,9 +1600,9 @@ mod tests {
                 vertex: wgpu::VertexState { module: &module, entry_point: Some("vs"), buffers: &[], compilation_options: Default::default() },
                 fragment: Some(wgpu::FragmentState { module: &module, entry_point: Some("fs"), targets: &[], compilation_options: Default::default() }),
                 primitive: Default::default(),
-                depth_stencil: Some(wgpu::DepthStencilState { format: SpotShadowAtlas::FORMAT, depth_write_enabled: true, depth_compare: wgpu::CompareFunction::Always, stencil: Default::default(), bias: Default::default() }),
+                depth_stencil: Some(wgpu::DepthStencilState { format: SpotShadowAtlas::FORMAT, depth_write_enabled: Some(true), depth_compare: Some(wgpu::CompareFunction::Always), stencil: Default::default(), bias: Default::default() }),
                 multisample: Default::default(),
-                multiview: None,
+                multiview_mask: None,
                 cache: None,
             });
             let bg = device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &pipeline.get_bind_group_layout(0), entries: &[wgpu::BindGroupEntry { binding: 0, resource: depth_buf.as_entire_binding() }] });
@@ -1614,6 +1614,7 @@ mod tests {
                     depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &layer_view, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }), stencil_ops: None }),
                     timestamp_writes: None,
                     occlusion_query_set: None,
+                    multiview_mask: None,
                 });
                 pass.set_pipeline(&pipeline);
                 pass.set_bind_group(0, &bg, &[]);
@@ -1628,7 +1629,7 @@ mod tests {
         let depth = texture(GBuffer::DEPTH_FORMAT, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT).create_view(&Default::default());
         {
             let mut e = device.create_command_encoder(&Default::default());
-            e.begin_render_pass(&wgpu::RenderPassDescriptor { label: None, color_attachments: &[], depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &depth, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }), stencil_ops: None }), timestamp_writes: None, occlusion_query_set: None });
+            e.begin_render_pass(&wgpu::RenderPassDescriptor { label: None, color_attachments: &[], depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &depth, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }), stencil_ops: None }), timestamp_writes: None, occlusion_query_set: None, multiview_mask: None });
             queue.submit([e.finish()]);
         }
         let gbuffer = GBuffer::new(device, w, h, 1);
@@ -1649,8 +1650,8 @@ mod tests {
     fn raymarched_spot_shafts_keep_thin_shadows() {
         use glam::Vec3 as V;
         let instance = wgpu::Instance::default();
-        let Some(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
-        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default(), None)).unwrap();
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
         let (w, h) = (256u32, 128u32);
         const DENSITY: f32 = 0.05;
         const G: f32 = 0.3;
@@ -1696,8 +1697,8 @@ mod tests {
             );
             queue.submit([e.finish()]);
             buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-            device.poll(wgpu::Maintain::Wait);
-            let data = buf.slice(..).get_mapped_range();
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            let data = buf.slice(..).get_mapped_range().unwrap();
             (0..w * h)
                 .map(|i| {
                     let o = ((i / w) * row + (i % w) * 8) as usize;
@@ -1763,8 +1764,8 @@ mod tests {
     #[ignore]
     fn time_spot_shafts() {
         let instance = wgpu::Instance::default();
-        let Some(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
-        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default(), None)).unwrap();
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
         let (w, h) = (1920u32, 803u32);
         let lamps: Vec<Light> = [-0.62f32, 0.62]
             .iter()
@@ -1782,7 +1783,7 @@ mod tests {
             encode(&mut e);
             let t = std::time::Instant::now();
             queue.submit([e.finish()]);
-            device.poll(wgpu::Maintain::Wait);
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
             t.elapsed().as_secs_f64() * 1e3
         };
         let mut empty: Vec<f64> = (0..100).map(|_| wall(&mut |_| {})).collect();

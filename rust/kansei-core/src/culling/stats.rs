@@ -141,7 +141,7 @@ impl StatsReadback {
         self.kinds = kinds;
         #[cfg(not(target_arch = "wasm32"))]
         if self.pending.is_some() {
-            device.poll(wgpu::Maintain::Poll);
+            let _ = device.poll(wgpu::PollType::Poll);
         }
         #[cfg(target_arch = "wasm32")]
         let _ = device;
@@ -151,7 +151,7 @@ impl StatsReadback {
         }
         let staging = self.staging.as_ref().unwrap();
         {
-            let bytes = staging.slice(..).get_mapped_range();
+            let bytes = staging.slice(..).get_mapped_range().unwrap();
             let words: &[u32] = bytemuck::cast_slice(&bytes);
             let mut views: Vec<(CullViewKind, CullStats)> = Vec::new();
             let mut at = 0;

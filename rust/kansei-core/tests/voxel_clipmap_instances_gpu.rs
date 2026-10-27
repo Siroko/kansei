@@ -22,7 +22,7 @@ const WORDS: usize = CLIP_SURFACE_WORDS as usize;
 
 fn renderer() -> Option<Renderer> {
     let instance = wgpu::Instance::default();
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?;
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
     let mut renderer = Renderer::new(RendererConfig { width: W, height: H, sample_count: 1, ..Default::default() });
     pollster::block_on(renderer.initialize_headless(&adapter));
     Some(renderer)
@@ -197,7 +197,7 @@ fn card_clusters_voxelize_by_their_cut() {
     let mut areas = Vec::new();
     for _ in 0..16 {
         renderer.render_scene_offscreen(&mut scene, &mut camera, &gbuffer);
-        renderer.device().poll(wgpu::Maintain::Wait);
+        let _ = renderer.device().poll(wgpu::PollType::wait_indefinitely());
         areas.push(occupied(&renderer).iter().map(|(_, a)| *a as f32 / 256.0).sum::<f32>() * 0.125 * 0.125);
     }
     let voxels = occupied(&renderer);
@@ -233,7 +233,7 @@ fn a_region_is_voxelized_again_once_its_cut_has_grown() {
     let mut areas = Vec::new();
     for _ in 0..24 {
         renderer.render_scene_offscreen(&mut scene, &mut camera, &gbuffer);
-        renderer.device().poll(wgpu::Maintain::Wait);
+        let _ = renderer.device().poll(wgpu::PollType::wait_indefinitely());
         areas.push(occupied(&renderer).iter().map(|(_, a)| *a as f32 / 256.0).sum::<f32>() * 0.25);
     }
     eprintln!("area per frame {:?} m^2 of {want} m^2", areas.iter().map(|a| a.round()).collect::<Vec<_>>());

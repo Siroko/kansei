@@ -172,7 +172,7 @@ impl ClipmapVoxelizer {
             ],
         });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("VoxelClipmap/Clear"), source: wgpu::ShaderSource::Wgsl(CLEAR_WGSL.into()) });
-        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("VoxelClipmap/Clear"), bind_group_layouts: &[&clear_bgl], push_constant_ranges: &[] });
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("VoxelClipmap/Clear"), bind_group_layouts: &[Some(&clear_bgl)], immediate_size: 0 });
         let clear_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("VoxelClipmap/Clear"),
             layout: Some(&pl),
@@ -393,6 +393,7 @@ impl ClipmapVoxelizer {
             label: Some(label),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: &self.target,
+                depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Discard },
             })],

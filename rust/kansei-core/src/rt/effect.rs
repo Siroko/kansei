@@ -534,7 +534,7 @@ impl RtReflectionsEffect {
         );
         let pipeline = |label: &str, code: String, layouts: &[&wgpu::BindGroupLayout]| {
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(code.into()) });
-            let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some(label), bind_group_layouts: layouts, push_constant_ranges: &[] });
+            let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some(label), bind_group_layouts: &layouts.iter().copied().map(Some).collect::<Vec<_>>(), immediate_size: 0 });
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some(label), layout: Some(&pl), module: &module, entry_point: Some("main"), compilation_options: Default::default(), cache: None })
         };
         let covered = format!(
@@ -836,14 +836,14 @@ impl RtReflectionsEffect {
         let Some(gpu) = self.gpu.as_ref() else { return };
         #[cfg(not(target_arch = "wasm32"))]
         if self.mapping.is_some() {
-            device.poll(wgpu::Maintain::Poll);
+            let _ = device.poll(wgpu::PollType::Poll);
         }
         #[cfg(target_arch = "wasm32")]
         let _ = device;
         if let Some(state) = self.mapping.take_if(|s| s.load(Ordering::Acquire) != MAPPING) {
             if state.load(Ordering::Acquire) == MAPPED {
                 {
-                    let bytes = gpu.staging.slice(..).get_mapped_range();
+                    let bytes = gpu.staging.slice(..).get_mapped_range().unwrap();
                     let w: &[u32] = bytemuck::cast_slice(&bytes);
                     self.stats = Some(RtReflectionStats { rays: w[0], hits: w[1], cells: w[2], tests: w[3], max_cost: w[4], glass_pixels: w[5], glass_cost: w[6] });
                 }

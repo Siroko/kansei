@@ -41,9 +41,9 @@ fn shaders_validate_and_the_uniform_matches() {
 }
 
 fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-    let adapter = pollster::block_on(instance.request_adapter(&Default::default()))?;
-    pollster::block_on(adapter.request_device(&Default::default(), None)).ok()
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let adapter = pollster::block_on(instance.request_adapter(&Default::default())).ok()?;
+    pollster::block_on(adapter.request_device(&Default::default())).ok()
 }
 
 fn read_back(device: &wgpu::Device, queue: &wgpu::Queue, buffer: &wgpu::Buffer) -> Vec<f32> {
@@ -52,8 +52,8 @@ fn read_back(device: &wgpu::Device, queue: &wgpu::Queue, buffer: &wgpu::Buffer) 
     encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, buffer.size());
     queue.submit(Some(encoder.finish()));
     staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-    device.poll(wgpu::Maintain::Wait);
-    let floats = bytemuck::cast_slice(&staging.slice(..).get_mapped_range()).to_vec();
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    let floats = bytemuck::cast_slice(&staging.slice(..).get_mapped_range().unwrap()).to_vec();
     floats
 }
 
@@ -251,8 +251,8 @@ fn read_targets(renderer: &Renderer, gbuffer: &GBuffer) -> (Vec<bool>, Vec<[f32;
         );
         queue.submit(Some(encoder.finish()));
         buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-        device.poll(wgpu::Maintain::Wait);
-        let bytes = buffer.slice(..).get_mapped_range().to_vec();
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let bytes = buffer.slice(..).get_mapped_range().unwrap().to_vec();
         (0..SIZE * SIZE).map(move |i| bytes[((i / SIZE) * row + (i % SIZE) * bytes_per_texel) as usize..][..bytes_per_texel as usize].to_vec()).collect::<Vec<_>>()
     };
     let half = |b: &[u8]| half_to_f32(u16::from_le_bytes([b[0], b[1]]));
@@ -280,8 +280,8 @@ fn pixel(view_proj: glam::Mat4, p: Vec3) -> (u32, u32) {
 
 #[test]
 fn the_renderer_draws_the_skinned_pose_and_its_motion() {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-    let Some(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
         eprintln!("no GPU adapter: skipped");
         return;
     };

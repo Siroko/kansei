@@ -33,8 +33,8 @@ impl ComputePass {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some(&format!("{}/PipelineLayout", self.label)),
-            bind_group_layouts: &[&bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
         });
 
         self.pipeline = Some(device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {

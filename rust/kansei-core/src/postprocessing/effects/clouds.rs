@@ -332,7 +332,7 @@ impl VolumetricCloudsEffect {
         );
         let noise_pipeline = |entry: &str| {
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("Clouds/Noise"), source: wgpu::ShaderSource::Wgsl(NOISE_WGSL.into()) });
-            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("Clouds/Noise"), bind_group_layouts: &[&noise_bgl], push_constant_ranges: &[] });
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("Clouds/Noise"), bind_group_layouts: &[Some(&noise_bgl)], immediate_size: 0 });
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("Clouds/Noise"),
                 layout: Some(&layout),
@@ -393,7 +393,7 @@ impl VolumetricCloudsEffect {
         );
         let sky_map = {
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("Clouds/SkyMap"), source: wgpu::ShaderSource::Wgsl(march_source().into()) });
-            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("Clouds/SkyMap"), bind_group_layouts: &[&sky_map_bgl], push_constant_ranges: &[] });
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("Clouds/SkyMap"), bind_group_layouts: &[Some(&sky_map_bgl)], immediate_size: 0 });
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("Clouds/SkyMap"),
                 layout: Some(&layout),
@@ -419,7 +419,7 @@ impl VolumetricCloudsEffect {
         );
         let shadow_map = {
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("Clouds/ShadowMap"), source: wgpu::ShaderSource::Wgsl(march_source().into()) });
-            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("Clouds/ShadowMap"), bind_group_layouts: &[&shadow_map_bgl], push_constant_ranges: &[] });
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("Clouds/ShadowMap"), bind_group_layouts: &[Some(&shadow_map_bgl)], immediate_size: 0 });
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("Clouds/ShadowMap"),
                 layout: Some(&layout),
@@ -725,8 +725,8 @@ mod tests {
 
     fn gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
         let instance = wgpu::Instance::default();
-        let adapter = pollster::block_on(instance.request_adapter(&Default::default()))?;
-        pollster::block_on(adapter.request_device(&Default::default(), None)).ok()
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).ok()?;
+        pollster::block_on(adapter.request_device(&Default::default())).ok()
     }
 
     /// The generated noises use their whole range, so coverage and erosion thresholds carve them
@@ -762,8 +762,8 @@ mod tests {
             );
             queue.submit([e.finish()]);
             buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-            device.poll(wgpu::Maintain::Wait);
-            let data = buf.slice(..).get_mapped_range();
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            let data = buf.slice(..).get_mapped_range().unwrap();
             for c in 0..channels {
                 let mut v: Vec<u8> = Vec::new();
                 for z in 0..d {
@@ -811,6 +811,7 @@ mod tests {
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &depth, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }), stencil_ops: None }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             queue.submit([e.finish()]);
         }
@@ -841,8 +842,8 @@ mod tests {
             );
             queue.submit([e.finish()]);
             buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-            device.poll(wgpu::Maintain::Wait);
-            let data = buf.slice(..).get_mapped_range();
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            let data = buf.slice(..).get_mapped_range().unwrap();
             let half = |o: usize| {
                 let h = u16::from_le_bytes([data[o], data[o + 1]]);
                 let e = ((h >> 10) & 0x1f) as i32;
@@ -863,8 +864,8 @@ mod tests {
             e.copy_buffer_to_buffer(&sky.bindings().sky_lighting, 0, &buf, 0, size);
             queue.submit([e.finish()]);
             buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-            device.poll(wgpu::Maintain::Wait);
-            let v = bytemuck::cast_slice::<u8, f32>(&buf.slice(..).get_mapped_range()).to_vec();
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            let v = bytemuck::cast_slice::<u8, f32>(&buf.slice(..).get_mapped_range().unwrap()).to_vec();
             v
         };
         let lighting = |sky: &mut crate::atmosphere::SkyAtmosphere| lighting_at(sky, &camera);
@@ -937,7 +938,7 @@ mod tests {
         let depth = depth_tex.create_view(&Default::default());
         {
             let mut e = device.create_command_encoder(&Default::default());
-            e.begin_render_pass(&wgpu::RenderPassDescriptor { label: None, color_attachments: &[], depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &depth, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }), stencil_ops: None }), timestamp_writes: None, occlusion_query_set: None });
+            e.begin_render_pass(&wgpu::RenderPassDescriptor { label: None, color_attachments: &[], depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &depth, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }), stencil_ops: None }), timestamp_writes: None, occlusion_query_set: None, multiview_mask: None });
             queue.submit([e.finish()]);
         }
         let gbuffer = GBuffer::new(&device, w, h, 1);
@@ -961,8 +962,8 @@ mod tests {
             e.copy_buffer_to_buffer(&sky.bindings().sky_lighting, 0, &buf, 0, size);
             queue.submit([e.finish()]);
             buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-            device.poll(wgpu::Maintain::Wait);
-            let v = bytemuck::cast_slice::<u8, f32>(&buf.slice(..).get_mapped_range()).to_vec();
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            let v = bytemuck::cast_slice::<u8, f32>(&buf.slice(..).get_mapped_range().unwrap()).to_vec();
             v
         };
         let eval = |l: &[f32], d: glam::Vec3, band: [f32; 3]| -> glam::Vec3 {
@@ -1054,9 +1055,9 @@ mod tests {
             queue.submit([e.finish()]);
             map_buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
             params_buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-            device.poll(wgpu::Maintain::Wait);
-            let map = map_buf.slice(..).get_mapped_range().chunks_exact(4).map(|t| t[0] as f32 / 255.0).collect();
-            let params = *bytemuck::from_bytes::<CloudShadowParamsGpu>(&params_buf.slice(..).get_mapped_range());
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            let map = map_buf.slice(..).get_mapped_range().unwrap().chunks_exact(4).map(|t| t[0] as f32 / 255.0).collect();
+            let params = *bytemuck::from_bytes::<CloudShadowParamsGpu>(&params_buf.slice(..).get_mapped_range().unwrap());
             (map, params)
         };
         let mean = |m: &[f32]| m.iter().sum::<f32>() / m.len() as f32;
@@ -1088,8 +1089,8 @@ mod tests {
         e.copy_buffer_to_buffer(&sky.bindings().cloud_shadow_params, 0, &buf, 0, size);
         queue.submit([e.finish()]);
         buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-        device.poll(wgpu::Maintain::Wait);
-        let gone = *bytemuck::from_bytes::<CloudShadowParamsGpu>(&buf.slice(..).get_mapped_range());
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let gone = *bytemuck::from_bytes::<CloudShadowParamsGpu>(&buf.slice(..).get_mapped_range().unwrap());
         assert!(gone.enabled < 0.5, "clouds no longer drawn still cast shadows");
     }
 
@@ -1129,8 +1130,8 @@ mod tests {
             e.copy_buffer_to_buffer(&sky.bindings().sky_lighting, 0, &buf, 0, size);
             queue.submit([e.finish()]);
             buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-            device.poll(wgpu::Maintain::Wait);
-            let l: Vec<f32> = bytemuck::cast_slice(&buf.slice(..).get_mapped_range()).to_vec();
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            let l: Vec<f32> = bytemuck::cast_slice(&buf.slice(..).get_mapped_range().unwrap()).to_vec();
             let e = |k: usize| l[k] * 0.282095 * 3.141593 + l[4 + k] * 0.488603 * 2.094395 - l[24 + k] * 0.315392 * 0.785398 - l[32 + k] * 0.546274 * 0.785398;
             glam::Vec3::new(e(0), e(1), e(2))
         };
@@ -1158,7 +1159,7 @@ mod tests {
         let depth = depth_tex.create_view(&Default::default());
         {
             let mut e = device.create_command_encoder(&Default::default());
-            e.begin_render_pass(&wgpu::RenderPassDescriptor { label: None, color_attachments: &[], depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &depth, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }), stencil_ops: None }), timestamp_writes: None, occlusion_query_set: None });
+            e.begin_render_pass(&wgpu::RenderPassDescriptor { label: None, color_attachments: &[], depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &depth, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }), stencil_ops: None }), timestamp_writes: None, occlusion_query_set: None, multiview_mask: None });
             queue.submit([e.finish()]);
         }
         let gbuffer = GBuffer::new(&device, w, h, 1);
@@ -1173,7 +1174,7 @@ mod tests {
             f(&mut e);
             let t = std::time::Instant::now();
             queue.submit([e.finish()]);
-            device.poll(wgpu::Maintain::Wait);
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
             t.elapsed().as_secs_f64() * 1e3
         };
         // the sky's LUTs, frame and lighting, once
