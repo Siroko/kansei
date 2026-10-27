@@ -10,11 +10,11 @@ use kansei_core::loaders::GLTFLoader;
 use kansei_core::materials::Material;
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
-use kansei_core::pathtracer::{BVHBuilder, GPUBVHData, PathTracer, PathTracerMaterial, TLASBuilder};
+use kansei_core::pathtracer::{BVHBuilder, GPUBVHData, PathTracer, PathTracerDenoise, PathTracerDenoiseKernel, PathTracerDenoiseMode, PathTracerDenoiseView, PathTracerMaterial, TLASBuilder};
 use kansei_core::postprocessing::effects::{ToneMapEffect, ToneMapOptions, ToneMapper};
 use kansei_core::postprocessing::PostProcessingVolume;
 use kansei_core::renderers::{Renderer, RendererConfig};
-use kansei_wasm::{fetch_bytes, Canvas};
+use kansei_wasm::{fetch_bytes, param, param_or, Canvas, Keys};
 
 
 fn make_basic_material(name: &str, color: [f32; 4]) -> Material {
@@ -27,6 +27,10 @@ struct State {
     camera: Camera,
     controls: CameraControls,
     path_tracer: PathTracer,
+    /// SVGF over the tracer's guide buffers; mode `Off` shows the tracer's own frames,
+    /// accumulated while nothing changes
+    denoise: PathTracerDenoise,
+    keys: Keys,
     bvh: BVHBuilder,
     bvh_data: GPUBVHData,
     tlas: TLASBuilder,
@@ -186,6 +190,21 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     // each renderable's material, and the scene's lights
     pt.set_materials(&BVHBuilder::scene_materials(&scene));
     let light_count = pt.set_lights_from_scene(&scene);
+    pt.set_guides(true);
+
+    // the denoiser, on by default (?denoise=off|temporal|svgf, ?view=, ?kernel=3x3|5x5,
+    // ?iterations=)
+    let mut denoise = PathTracerDenoise::new(&renderer);
+    if let Some(mode) = param("denoise").and_then(|m| PathTracerDenoiseMode::from_name(&m)) {
+        denoise.mode = mode;
+    }
+    if let Some(view) = param("view").and_then(|v| PathTracerDenoiseView::from_name(&v)) {
+        denoise.view = view;
+    }
+    if let Some(kernel) = param("kernel").and_then(|k| PathTracerDenoiseKernel::from_name(&k)) {
+        denoise.kernel = kernel;
+    }
+    denoise.iterations = param_or("iterations", denoise.iterations);
 
     // shown through the engine's tonemapper: a neutral curve, a stop down (the old local blit's
     // Reinhard curve kept about that much headroom)
@@ -206,6 +225,8 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         camera,
         controls,
         path_tracer: pt,
+        denoise,
+        keys: Keys::listen(),
         bvh,
         bvh_data: gpu_data,
         tlas,
@@ -229,6 +250,8 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
                 ref mut camera,
                 ref mut controls,
                 ref mut path_tracer,
+                ref mut denoise,
+                ref keys,
                 ref mut bvh,
                 ref bvh_data,
                 ref mut tlas,
@@ -269,8 +292,19 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
                 *scene_dirty = false;
             }
 
+            // d: the denoiser on or off (the panel's Denoiser folder has the rest)
+            if keys.take_pressed().iter().any(|k| k == "d") {
+                denoise.mode = if denoise.mode == PathTracerDenoiseMode::Off { PathTracerDenoiseMode::Svgf } else { PathTracerDenoiseMode::Off };
+                denoise.reset();
+            }
+
             path_tracer.trace_frame(renderer, bvh_data, tlas, camera, light_count);
-            path_tracer.present(renderer, camera, volume);
+            if denoise.mode == PathTracerDenoiseMode::Off {
+                path_tracer.present(renderer, camera, volume);
+            } else {
+                denoise.denoise_frame(renderer, path_tracer, camera);
+                denoise.present(renderer, camera, volume);
+            }
         }
     });
 
@@ -292,6 +326,7 @@ fn update_sun(s: &mut State, change: impl FnOnce(&mut DirectionalLight)) {
     }
     s.light_count = s.path_tracer.set_lights_from_scene(&s.scene);
     s.path_tracer.reset_accumulation();
+    s.denoise.reset();
 }
 
 #[wasm_bindgen]
@@ -346,3 +381,48 @@ pub fn set_animate(v: bool) {
         if let Some(ref rc) = *gs.borrow() { rc.borrow().path_tracer.frame_index() } else { 0 }
     })
 }
+
+// ── Denoiser ──
+
+/// The denoiser's mode: `off` (the tracer's frames, accumulated while nothing changes),
+/// `temporal` or `svgf`.
+#[wasm_bindgen]
+pub fn set_denoise(mode: &str) {
+    with_state(|s| {
+        if let Some(m) = PathTracerDenoiseMode::from_name(mode) {
+            s.denoise.mode = m;
+            s.denoise.reset();
+        }
+    });
+}
+
+/// What the screen shows: `final`, `noisy`, a guide buffer (`diffuse-albedo`,
+/// `specular-albedo`, `normal`, `depth`, `motion`, `diffuse`, `specular`), `variance`,
+/// `history` or `temporal`.
+#[wasm_bindgen]
+pub fn set_denoise_view(view: &str) {
+    with_state(|s| {
+        if let Some(v) = PathTracerDenoiseView::from_name(view) {
+            s.denoise.view = v;
+        }
+    });
+}
+
+#[wasm_bindgen]
+pub fn set_denoise_kernel(kernel: &str) {
+    with_state(|s| {
+        if let Some(k) = PathTracerDenoiseKernel::from_name(kernel) {
+            s.denoise.kernel = k;
+        }
+    });
+}
+
+#[wasm_bindgen] pub fn set_denoise_iterations(v: u32) { with_state(|s| s.denoise.iterations = v); }
+#[wasm_bindgen] pub fn set_denoise_alpha(v: f32) { with_state(|s| { s.denoise.alpha_color = v; s.denoise.alpha_moments = v; }); }
+#[wasm_bindgen] pub fn set_denoise_phi_color(v: f32) { with_state(|s| s.denoise.phi_color = v); }
+#[wasm_bindgen] pub fn set_denoise_phi_normal(v: f32) { with_state(|s| s.denoise.phi_normal = v); }
+#[wasm_bindgen] pub fn set_denoise_phi_depth(v: f32) { with_state(|s| s.denoise.phi_depth = v); }
+#[wasm_bindgen] pub fn set_denoise_clamp(v: f32) { with_state(|s| s.denoise.clamp_sigma = v); }
+#[wasm_bindgen] pub fn set_denoise_taa(v: bool) { with_state(|s| s.denoise.taa = v); }
+#[wasm_bindgen] pub fn set_denoise_heat_scale(v: f32) { with_state(|s| s.denoise.heat_scale = v); }
+#[wasm_bindgen] pub fn set_jitter(v: bool) { with_state(|s| { s.path_tracer.set_jitter(v); s.path_tracer.reset_accumulation(); }); }

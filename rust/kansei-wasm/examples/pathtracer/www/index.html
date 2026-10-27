@@ -31,6 +31,18 @@
             set_light_intensity,
             set_object_position,
             set_animate,
+            set_denoise,
+            set_denoise_view,
+            set_denoise_kernel,
+            set_denoise_iterations,
+            set_denoise_alpha,
+            set_denoise_phi_color,
+            set_denoise_phi_normal,
+            set_denoise_phi_depth,
+            set_denoise_clamp,
+            set_denoise_taa,
+            set_denoise_heat_scale,
+            set_jitter,
         } from '../pkg/kansei_wasm_pathtracer.js';
 
         await init();
@@ -41,10 +53,61 @@
             spp: 1,
             maxBounces: 8,
             blueNoise: true,
+            jitter: true,
             frameIndex: 0,
         };
 
         const pane = new Pane({ title: 'Path Tracer' });
+
+        // ── Denoiser ───────────────────────────────────────────────
+        // (the URL's ?denoise=, ?view=, ?kernel= and ?iterations= start it otherwise)
+        const query = new URLSearchParams(location.search);
+        const denoise = {
+            mode: query.get('denoise') ?? 'svgf',
+            view: query.get('view') ?? 'final',
+            kernel: query.get('kernel') ?? '3x3',
+            iterations: Number(query.get('iterations') ?? 5),
+            alpha: 0.2,
+            phiColor: 4,
+            phiNormal: 128,
+            phiDepth: 1,
+            clamp: 0,
+            taa: true,
+            heatScale: 1,
+        };
+        const options = (names) => Object.fromEntries(names.map((n) => [n, n]));
+        const denoiseFolder = pane.addFolder({ title: 'Denoiser' });
+        denoiseFolder.addBinding(denoise, 'mode', { label: 'Mode (d)', options: options(['svgf', 'temporal', 'off']) })
+            .on('change', (ev) => set_denoise(ev.value));
+        denoiseFolder.addBinding(denoise, 'view', {
+            label: 'View',
+            options: options(['final', 'noisy', 'temporal', 'diffuse-albedo', 'specular-albedo', 'normal', 'depth', 'motion', 'diffuse', 'specular', 'variance', 'history']),
+        }).on('change', (ev) => set_denoise_view(ev.value));
+        denoiseFolder.addBinding(denoise, 'kernel', { label: 'Kernel', options: options(['3x3', '5x5']) })
+            .on('change', (ev) => set_denoise_kernel(ev.value));
+        denoiseFolder.addBinding(denoise, 'iterations', { label: 'Iterations', min: 0, max: 8, step: 1 })
+            .on('change', (ev) => set_denoise_iterations(ev.value));
+        denoiseFolder.addBinding(denoise, 'alpha', { label: 'Temporal alpha', min: 0.02, max: 1, step: 0.01 })
+            .on('change', (ev) => set_denoise_alpha(ev.value));
+        denoiseFolder.addBinding(denoise, 'phiColor', { label: 'Phi colour', min: 0.5, max: 16, step: 0.1 })
+            .on('change', (ev) => set_denoise_phi_color(ev.value));
+        denoiseFolder.addBinding(denoise, 'phiNormal', { label: 'Phi normal', min: 1, max: 256, step: 1 })
+            .on('change', (ev) => set_denoise_phi_normal(ev.value));
+        denoiseFolder.addBinding(denoise, 'phiDepth', { label: 'Phi depth', min: 0.1, max: 8, step: 0.1 })
+            .on('change', (ev) => set_denoise_phi_depth(ev.value));
+        denoiseFolder.addBinding(denoise, 'clamp', { label: 'History clamp (σ)', min: 0, max: 4, step: 0.1 })
+            .on('change', (ev) => set_denoise_clamp(ev.value));
+        denoiseFolder.addBinding(denoise, 'taa', { label: 'TAA resolve' })
+            .on('change', (ev) => set_denoise_taa(ev.value));
+        denoiseFolder.addBinding(denoise, 'heatScale', { label: 'Debug scale', min: 0.05, max: 20, step: 0.05 })
+            .on('change', (ev) => set_denoise_heat_scale(ev.value));
+        // the d key toggles the denoiser from the page too
+        addEventListener('keydown', (e) => {
+            if (e.key.toLowerCase() === 'd' && !(e.target instanceof HTMLInputElement)) {
+                denoise.mode = denoise.mode === 'off' ? 'svgf' : 'off';
+                pane.refresh();
+            }
+        });
 
         pane.addBinding(params, 'spp', { min: 1, max: 16, step: 1, label: 'SPP' })
             .on('change', (ev) => set_spp(ev.value));
@@ -54,6 +117,9 @@
 
         pane.addBinding(params, 'blueNoise', { label: 'Blue Noise' })
             .on('change', (ev) => set_use_blue_noise(ev.value));
+
+        pane.addBinding(params, 'jitter', { label: 'Jitter' })
+            .on('change', (ev) => set_jitter(ev.value));
 
         pane.addButton({ title: 'Reset Accumulation' })
             .on('click', () => reset_accumulation());
