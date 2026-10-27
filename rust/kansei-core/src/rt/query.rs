@@ -71,7 +71,6 @@ pub(crate) struct TlasState {
     pending: Option<wgpu::SubmissionIndex>,
     /// wait for that submit first (Metal, #9215)
     wait: bool,
-    mark: wgpu::ComputePipeline,
 }
 
 impl RtQuery {
@@ -117,7 +116,6 @@ impl RtQuery {
                 }),
                 pending: None,
                 wait: metal,
-                mark: pipeline("mark_main", Some(&empty_layout)),
             })),
             built: false,
             positions_pipeline: pipeline("positions_main", Some(&pipeline_layout)),
@@ -194,12 +192,9 @@ impl RtQuery {
     /// TLAS waits for this encoder's submit (`submitted`), then for `build_tlas`.
     pub(crate) fn record_blas(&mut self, encoder: &mut wgpu::CommandEncoder) {
         let (Some((shape, blas)), Some(group)) = (self.blas[self.next].as_ref(), self.group.as_ref()) else { panic!("RtQuery::prepare first") };
-        let stamp = crate::profiling::gpu_pass("Rt/BlasBuild");
+        let stamp = crate::profiling::gpu_pass("Rt/BlasInput");
         {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("Rt/BlasBuild"),
-                timestamp_writes: stamp.as_ref().map(|s| wgpu::ComputePassTimestampWrites { end_of_pass_write_index: None, ..s.compute() }),
-            });
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("Rt/BlasInput"), timestamp_writes: stamp.as_ref().map(crate::profiling::PassStamp::compute) });
             pass.set_pipeline(&self.positions_pipeline);
             pass.set_bind_group(0, group, &[]);
             let groups = shape.capacity.div_ceil(64).max(1);
@@ -221,7 +216,6 @@ impl RtQuery {
             })
             .collect();
         encoder.build_acceleration_structures(std::iter::once(&wgpu::BlasBuildEntry { blas, geometry: wgpu::BlasGeometries::TriangleGeometries(geometries) }), std::iter::empty());
-        mark(&self.mark, encoder, stamp.as_ref());
         self.built = true;
         self.next = (self.next + 1) % self.blas.len();
     }
@@ -265,31 +259,10 @@ impl TlasState {
             let _t = crate::profiling::cpu_scope("rt/tlas wait");
             let _ = device.poll(wgpu::PollType::Wait { submission_index: Some(blas_submit), timeout: None });
         }
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("RtQuery/Tlas") });
-        let stamp = crate::profiling::gpu_pass("Rt/TlasBuild");
-        if let Some(s) = &stamp {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("Rt/TlasBuild"),
-                timestamp_writes: Some(wgpu::ComputePassTimestampWrites { end_of_pass_write_index: None, ..s.compute() }),
-            });
-            pass.set_pipeline(&self.mark);
-            pass.dispatch_workgroups(1, 1, 1);
-        }
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Rt/TlasBuild") });
         encoder.build_acceleration_structures(std::iter::empty(), std::iter::once(&self.tlas));
-        mark(&self.mark, &mut encoder, stamp.as_ref());
         queue.submit(Some(encoder.finish()));
     }
-}
-
-/// End a build's timed span: a pass after it writing the span's end.
-fn mark(pipeline: &wgpu::ComputePipeline, encoder: &mut wgpu::CommandEncoder, stamp: Option<&crate::profiling::PassStamp>) {
-    let Some(s) = stamp else { return };
-    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: Some("RtQuery/Mark"),
-        timestamp_writes: Some(wgpu::ComputePassTimestampWrites { beginning_of_pass_write_index: None, ..s.compute() }),
-    });
-    pass.set_pipeline(pipeline);
-    pass.dispatch_workgroups(1, 1, 1);
 }
 
 /// Whether `backend` traces with hardware ray queries on `device`, for `RtBackend::Auto` (which

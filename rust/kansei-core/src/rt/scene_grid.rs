@@ -130,8 +130,7 @@ impl SceneRtGrid {
         let moved = self.grid.follow(eye);
         let changed = self.key.as_ref() != Some(&key);
         self.key = Some(key);
-        let s = self.grid.stats();
-        let overflowed = s.triangles > s.triangle_capacity || s.references > s.reference_capacity;
+        let overflowed = self.grid.overflowed();
         let moving = moved || any_dynamic || self.options.rebuild_every_frame;
         self.rebuild = moving || changed || overflowed || std::mem::take(&mut self.force);
         if self.grid.backend() == super::RtBackend::Hardware {

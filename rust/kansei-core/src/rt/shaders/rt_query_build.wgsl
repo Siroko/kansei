@@ -71,8 +71,7 @@ fn positions_main(@builtin(global_invocation_id) gid: vec3u, @builtin(num_workgr
     }
 }
 
-// Nothing: a pass after an acceleration structure build, for its timestamp (Metal resolves an
-// empty pass's to 0), or a submit to wait for.
+// Nothing: a submit to wait for.
 @compute @workgroup_size(1)
 fn mark_main() {
 }

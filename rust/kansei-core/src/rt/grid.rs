@@ -212,6 +212,10 @@ pub struct RtGridStats {
     pub reference_capacity: u32,
     /// Builds recorded.
     pub builds: u64,
+    /// The triangles the hardware backend's BLAS held at the build read back (sized from the
+    /// readback before, with room to grow): those gathered past it were left out, and
+    /// `SceneRtGrid` rebuilds. 0 in software.
+    pub accel_triangles: u32,
 }
 
 /// The buffers a pass traces an `RtGrid` through, which follow the grid when its buffers are made
@@ -469,6 +473,10 @@ type SourceKey = (wgpu::Buffer, Option<wgpu::Buffer>, Option<wgpu::Buffer>, Opti
 struct Readback {
     staging: wgpu::Buffer,
     pending: Option<Arc<AtomicU8>>,
+    /// the hardware BLAS's triangles at the build in flight
+    accel_triangles: u32,
+    /// readbacks taken
+    taken: u64,
 }
 
 const MAPPING: u8 = 0;
@@ -529,6 +537,8 @@ pub struct RtGrid {
     /// the last gather held non-opaque sources (its second geometry)
     fast_build: bool,
     split: bool,
+    /// the BLAS's triangles this build
+    accel_slots: u32,
 }
 
 impl RtGrid {
@@ -632,6 +642,8 @@ impl RtGrid {
             readback: Readback {
                 staging: device.create_buffer(&wgpu::BufferDescriptor { label: Some("RtGrid/Readback"), size: 16, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }),
                 pending: None,
+                accel_triangles: 0,
+                taken: 0,
             },
             stats: RtGridStats::default(),
             generation: 0,
@@ -654,6 +666,7 @@ impl RtGrid {
             backend,
             fast_build: false,
             split: false,
+            accel_slots: 0,
         };
         grid.tlas = grid.query.as_ref().map(|q| q.tlas().lock().unwrap().tlas().clone());
         grid.resize(device, options.triangle_capacity.max(64), options.reference_capacity.max(1024));
@@ -689,6 +702,13 @@ impl RtGrid {
     /// What the last readback said, and the room the buffers have.
     pub fn stats(&self) -> RtGridStats {
         RtGridStats { triangle_capacity: self.triangle_capacity, reference_capacity: self.reference_capacity, ..self.stats }
+    }
+
+    /// Whether the build read back gathered more triangles than it had room for (the buffers', or
+    /// the hardware BLAS's): rebuild.
+    pub fn overflowed(&self) -> bool {
+        let s = self.stats();
+        s.triangles > s.triangle_capacity || s.references > s.reference_capacity || (self.query.is_some() && s.triangles > s.accel_triangles)
     }
 
     /// Changes whenever the buffers `bind_group_entries` binds are made anew: bind groups made
@@ -790,6 +810,13 @@ impl RtGrid {
     /// Room for `triangles` this build (call between `begin` and `gather`, when the sources know
     /// how many they hold at most): no frame then loses triangles to a readback still in flight.
     pub fn reserve_triangles(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, triangles: u32) {
+        if self.query.is_some() && self.gathered.is_some() && triangles > self.accel_slots {
+            // the BLAS holds them all this build
+            self.accel_slots = triangles;
+            if triangles <= self.triangle_capacity {
+                self.prepare_query(device, queue);
+            }
+        }
         if triangles > self.triangle_capacity {
             self.resize(device, grow(triangles), self.reference_capacity);
             self.ensure_bind_groups(device);
@@ -803,9 +830,10 @@ impl RtGrid {
     /// Ready the hardware backend's BLAS for this build.
     fn prepare_query(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
         if let Some(q) = self.query.as_mut() {
+            self.accel_slots = self.accel_slots.clamp(64.min(self.triangle_capacity), self.triangle_capacity);
             // the filler under the box, a metre clear of it
             let below = (self.origin - Vec3::Y).to_array();
-            q.prepare(device, queue, &self.triangles, &self.counters, self.triangle_capacity, self.split, self.fast_build, below);
+            q.prepare(device, queue, &self.triangles, &self.counters, self.accel_slots, self.split, self.fast_build, below);
         }
     }
 
@@ -847,6 +875,19 @@ impl RtGrid {
         }
         self.ensure_bind_groups(device);
         self.write_uniform(queue);
+        if self.query.is_some() {
+            // the BLAS from what the last readback gathered, with room to grow (grown past it, or
+            // shrunk under half); the whole capacity before any readback. A BLAS's cost grows with
+            // its triangles, and Metal's builds lost the real ones among many filler triangles.
+            let need = self.stats.triangles;
+            self.accel_slots = if self.readback.taken == 0 {
+                self.triangle_capacity
+            } else if need > self.accel_slots || need.saturating_mul(2) < self.accel_slots {
+                grow(need)
+            } else {
+                self.accel_slots
+            };
+        }
         let (_, big_base, _) = self.cells_layout();
         encoder.clear_buffer(&self.counters, 0, Some(16));
         if self.query.is_none() {
@@ -1101,6 +1142,7 @@ impl RtGrid {
             encoder.copy_buffer_to_buffer(&self.cells, big_base as u64 * 4, &self.readback.staging, 8, 4);
         }
         queue.submit(Some(encoder.finish()));
+        self.readback.accel_triangles = self.accel_slots;
         let state = Arc::new(AtomicU8::new(MAPPING));
         let done = state.clone();
         self.readback.staging.slice(..).map_async(wgpu::MapMode::Read, move |r| done.store(if r.is_ok() { MAPPED } else { FAILED }, Ordering::Release));
@@ -1131,6 +1173,8 @@ impl RtGrid {
             self.stats.references = words[1];
             self.stats.big_triangles = words[2];
         }
+        self.stats.accel_triangles = self.readback.accel_triangles;
+        self.readback.taken += 1;
         self.readback.staging.unmap();
     }
 
