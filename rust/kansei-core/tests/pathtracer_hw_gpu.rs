@@ -15,10 +15,11 @@ use kansei_core::pathtracer::{BVHBuilder, GPUBVHData, PathTracer, PathTracerMate
 use kansei_core::renderers::{Renderer, RendererConfig};
 use kansei_core::rt::RtBackend;
 
-/// A headless renderer whose device has hardware ray queries.
+/// A headless renderer whose device has hardware ray queries (the fast adapter, `WGPU_BACKEND`'s
+/// backend: DX12 too, where `Auto` would trace in software).
 fn renderer() -> Option<Renderer> {
-    let instance = wgpu::Instance::default();
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, ..Default::default() })).ok()?;
     let mut renderer = Renderer::new(RendererConfig::default());
     pollster::block_on(renderer.initialize_headless(&adapter));
     let info = renderer.device().adapter_info();
