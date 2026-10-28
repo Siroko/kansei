@@ -133,25 +133,31 @@ fn composite(@builtin(global_invocation_id) gid : vec3u) {
         let view = cc.invProj * vec4f(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
         let world = (cc.invView * vec4f(view.xyz / view.w, 1.0)).xyz;
         let n = normalize(textureLoad(normalTex, px, 0).xyz * 2.0 - 1.0);
-        if (cc.weighted != 0u) {
-            // each light's change where that light reaches (its shadow's own visibility, read
-            // only where some light changes anything)
-            var changes = array<vec3f, 8>();
-            var any = false;
-            for (var l = 0u; l < min(lookup.lights, 8u); l++) {
-                changes[l] = kansei_rt_caustics_light(causticsMap, causticsSampler, lookup, world, n, l);
-                any = any || dot(abs(changes[l]), vec3f(1.0)) > 0.0;
-            }
-            if (any) {
-                let vis = visibility(px, -view.z / view.w, n);
-                for (var l = 0u; l < min(lookup.lights, 8u); l++) {
+        // each light's change (a layer of each tile covering the point), where that light reaches:
+        // RtShadowsEffect's visibility of it, read the first time a light changes anything
+        var vis = array<f32, 8>(1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0);
+        var read = cc.weighted == 0u;
+        if (lookup.enabled != 0u && n.y >= 0.3) {
+            for (var k = 0u; k < min(lookup.count, KANSEI_RT_CAUSTIC_TILES); k++) {
+                let t = lookup.tiles[k];
+                if (t.live == 0u) { continue; }
+                let uv = (world.xz - t.min) / t.size;
+                if (any(uv < vec2f(0.0)) || any(uv > vec2f(1.0))) { continue; }
+                let d = vec2f(t.dims);
+                let q = clamp(uv * d, vec2f(0.5), d - 0.5) / f32(lookup.texels);
+                for (var l = 0u; l < lookup.lights; l++) {
+                    let s = textureSampleLevel(causticsMap, causticsSampler, q, k * lookup.lights + l, 0.0);
+                    if (abs(s.a + t.refY - world.y) > t.tolerance || all(s.rgb == vec3f(0.0))) { continue; }
+                    if (!read) {
+                        vis = visibility(px, -view.z / view.w, n);
+                        read = true;
+                    }
                     let slot = kansei_rt_caustics_shadow_slot(lookup, l);
-                    white += changes[l] * select(1.0, saturate(vis[min(slot, 7u)]), slot < 8u);
+                    white += s.rgb * select(1.0, saturate(vis[min(slot, 7u)]), slot < 8u);
                 }
             }
-        } else {
-            white = kansei_rt_caustics_lookup(causticsMap, causticsSampler, lookup, world, n);
         }
+        white *= lookup.intensity;
         white /= 3.14159265;
         e = white * albedo.rgb;
     }
