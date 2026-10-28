@@ -37,7 +37,11 @@
 //! - [`RtShadowsEffect`] lights the surfaces that ask for it (`RT_SHADOWS_GBUFFER_WGSL`) by the
 //!   sun and the spot lights with ray-traced shadows: any-hit shadow rays through the grid toward
 //!   a point of each emitter (soft penumbrae, sharp contacts), screen-space contact rays, denoised.
+//! - [`RtCausticsEffect`] adds what glass changes of that direct light (its shadow rays pass
+//!   through glass): photons from the sun and the spot lights through each glass caster, into a
+//!   tile of texels round it, the light it focuses less the light that passes straight through.
 
+mod caustics;
 mod diffuse;
 mod effect;
 mod grid;
@@ -47,6 +51,7 @@ mod scene;
 mod scene_grid;
 mod shadows;
 
+pub use caustics::{RtCausticReceivers, RtCausticsEffect, RtCausticsOptions, RtCausticsView, RT_CAUSTICS_LOOKUP_WGSL, RT_CAUSTICS_MAX_CASTERS};
 pub use diffuse::{RtDiffuseGiEffect, RtDiffuseGiOptions, RtGiDenoise, RtGiHitLighting, RtGiKernel, RtGiMode, RtGiResolution, RtGiShadows, RtGiStats, RtGiView};
 pub use effect::{RtGlass, RtReflectionStats, RtReflectionsEffect, RtReflectionsOptions, RtReflectionsView, RtTraceResolution};
 pub use grid::{RtBackend, RtGrid, RtGridBindings, RtGridHandle, RtGridOptions, RtGridStats, RtPlacement, RtSource, RtSurface, RT_MAX_CELLS, RT_TRIANGLE_BYTES};
@@ -229,6 +234,8 @@ mod tests {
             }
             let shadows = metal_buffer_slots(&super::shadows::trace_layout_entries(backend));
             assert!(shadows <= 29, "{backend:?}: shadows trace {shadows} of 29");
+            let caustics = metal_buffer_slots(&super::caustics::photon_layout_entries(backend));
+            assert!(caustics <= 29, "{backend:?}: caustics photons {caustics} of 29");
         }
     }
 
@@ -312,6 +319,31 @@ mod tests {
             &format!(
                 "{}\n{RT_SHADOWS_GBUFFER_WGSL}\n@fragment fn main() -> KanseiGBufferOut {{ return kansei_gbuffer_out_rt_lit(vec3f(0.0), vec3f(0.0), vec3f(0.0, 1.0, 0.0), vec3f(0.5), 0.6, 0.04, false); }}",
                 crate::materials::GBUFFER_OUT_WGSL
+            ),
+        );
+    }
+
+    #[test]
+    fn shaders_validate_rt_caustics() {
+        let sizes = super::caustics::struct_sizes();
+        let check = |module: &naga::Module, names: &[&str]| {
+            for (name, size) in sizes.iter().filter(|(n, _)| names.contains(n)) {
+                assert_eq!(struct_span(module, name), *size, "{name}");
+            }
+        };
+        for backend in BACKENDS {
+            let photons = validate_for(backend, "caustics photons", &super::caustics::photons_wgsl(backend));
+            check(&photons, &["CausticsParams", "CausticTask", "KanseiRtCausticTile", "KanseiRtCaustics"]);
+            assert_eq!(struct_span(&photons, "KanseiRtGrid"), std::mem::size_of::<RtGridGpu>());
+        }
+        let resolve = validate("caustics resolve", &super::caustics::resolve_wgsl());
+        check(&resolve, &["KanseiRtCausticTile", "KanseiRtCaustics", "CompositeParams"]);
+        // the lookup as a pass that lights surfaces itself reads it
+        validate(
+            "caustics lookup",
+            &format!(
+                "{RT_CAUSTICS_LOOKUP_WGSL}\n@group(0) @binding(0) var map: texture_2d_array<f32>;\n@group(0) @binding(1) var smp: sampler;\n@group(0) @binding(2) var<uniform> c: KanseiRtCaustics;\n\
+                 @group(0) @binding(3) var<storage, read_write> out: array<vec4f>;\n@compute @workgroup_size(1) fn main() {{ out[0] = vec4f(kansei_rt_caustics_lookup(map, smp, c, out[1].xyz, vec3f(0.0, 1.0, 0.0)), 1.0); }}"
             ),
         );
     }
