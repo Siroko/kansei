@@ -1,6 +1,6 @@
 // rt::RtShadowsEffect, the denoiser: `temporal` blends this frame's visibility with last frame's
 // where the surface was (reprojected by the velocity target, else by depth), its taps kept only on
-// the same surface (depth and normal); `atrous` is one step of an a-trous wavelet (a 3 x 3 B-spline
+// the same surface (depth and normal), held near this frame's rays round it; `atrous` is one step of an a-trous wavelet (a 3 x 3 B-spline
 // spread `stepWidth` texels apart) with depth and normal edge stops, more of it where the history
 // is short.
 
@@ -71,6 +71,36 @@ fn temporal(@builtin(global_invocation_id) id: vec3u) {
     if (wsum > 1e-3) {
         ha /= wsum;
         hb /= wsum;
+        // the history held near this frame's rays round the texel (5 x 5, each lit or not), so a
+        // caster that moves leaves no trail of its shadow: within their mean give or take their
+        // spread (sqrt(v (1 - v)), and 2 / n, where the rays all agree but the light may not be
+        // quite whole); a history moved by more than 0.1 starts over (more of the frame, and of
+        // the wavelet). A still penumbra's history lies within its rays' spread and is kept.
+        var sumA = a;
+        var sumB = b;
+        var n = 1.0;
+        let last = vec2i(sp.traceSize) - 1;
+        for (var k = 0; k < 25; k++) {
+            let q = vec2i(t) + vec2i(k % 5 - 2, k / 5 - 2);
+            if (k == 12 || any(q < vec2i(0)) || any(q > last) || textureLoad(curGuide, q, 0).z <= 0.0) { continue; }
+            sumA += textureLoad(curA, q, 0);
+            if (sp.numLights > 4u) {
+                sumB += textureLoad(curB, q, 0);
+            }
+            n += 1.0;
+        }
+        let meanA = sumA / n;
+        let meanB = select(b, sumB / n, sp.numLights > 4u);
+        let boxA = sqrt(saturate(meanA * (1.0 - meanA))) + 2.0 / n;
+        let boxB = sqrt(saturate(meanB * (1.0 - meanB))) + 2.0 / n;
+        let heldA = clamp(ha, meanA - boxA, meanA + boxA);
+        let heldB = clamp(hb, meanB - boxB, meanB + boxB);
+        let da = abs(heldA - ha);
+        let db = abs(heldB - hb);
+        let moved = max(max(max(da.x, da.y), max(da.z, da.w)), max(max(db.x, db.y), max(db.z, db.w)));
+        len *= 1.0 - saturate((moved - 0.1) / 0.2);
+        ha = heldA;
+        hb = heldB;
         frames = min(len / wsum + 1.0, sp.maxHistory);
         let alpha = max(sp.temporalAlpha, 1.0 / frames);
         oa = mix(ha, a, alpha);

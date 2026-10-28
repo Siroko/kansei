@@ -58,7 +58,7 @@ pub use grid::{RtBackend, RtGrid, RtGridBindings, RtGridHandle, RtGridOptions, R
 pub use mesh::{split_large_triangles, transform_box, RtMesh};
 pub use scene::{RtInstance, RtScene};
 pub use scene_grid::{SceneRtGrid, SceneRtGridOptions, SceneRtGridStats};
-pub use shadows::{RtShadowsEffect, RtShadowsView, RT_SHADOWS_GBUFFER_WGSL, RT_SHADOW_MAX_LIGHTS};
+pub use shadows::{RtShadowVisibility, RtShadowsEffect, RtShadowsView, RT_SHADOWS_GBUFFER_WGSL, RT_SHADOW_MAX_LIGHTS};
 
 /// Ray tracing through an `RtGrid` from a compute pass: `KanseiRtGrid`, `KanseiRtHit` and
 /// `kansei_rt_trace(origin, dir, t_min, t_max, flags)`, the closest hit of a ray among the grid's
