@@ -12,11 +12,18 @@ pub struct BloomOptions {
     /// With a threshold, the gain of the bloom added on top of the scene.
     pub intensity: f32,
     pub radius: f32,
+    /// With a threshold, bloom only what surfaces emit: the first level reads the GBuffer's
+    /// emissive target instead of the chain's input, so lit surfaces and bright fog don't bloom
+    /// however bright (the TS effect's `useEmissive`). That light is the materials' own, before
+    /// the chain: what fog, glass or depth of field do to it doesn't reach the bloom. Physically
+    /// based bloom (no threshold) always reads the input, since it mixes the blur back in place
+    /// of the scene. Off by default.
+    pub use_emissive: bool,
 }
 
 impl Default for BloomOptions {
     fn default() -> Self {
-        Self { threshold: 1.0, knee: 0.1, intensity: 0.8, radius: 1.0 }
+        Self { threshold: 1.0, knee: 0.1, intensity: 0.8, radius: 1.0, use_emissive: false }
     }
 }
 
@@ -260,7 +267,7 @@ impl PostProcessingEffect for BloomEffect {
 
         // --- Pipelines ---
         let ds_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: None, bind_group_layouts: &[&downsample_bgl], push_constant_ranges: &[],
+            label: None, bind_group_layouts: &[Some(&downsample_bgl)], immediate_size: 0,
         });
         self.downsample_pipeline = Some(device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("Bloom/DownsamplePipeline"), layout: Some(&ds_layout), module: &ds_shader,
@@ -268,7 +275,7 @@ impl PostProcessingEffect for BloomEffect {
         }));
 
         let us_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: None, bind_group_layouts: &[&upsample_bgl], push_constant_ranges: &[],
+            label: None, bind_group_layouts: &[Some(&upsample_bgl)], immediate_size: 0,
         });
         self.upsample_pipeline = Some(device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("Bloom/UpsamplePipeline"), layout: Some(&us_layout), module: &us_shader,
@@ -276,7 +283,7 @@ impl PostProcessingEffect for BloomEffect {
         }));
 
         let comp_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: None, bind_group_layouts: &[&composite_bgl], push_constant_ranges: &[],
+            label: None, bind_group_layouts: &[Some(&composite_bgl)], immediate_size: 0,
         });
         self.composite_pipeline = Some(device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("Bloom/CompositePipeline"), layout: Some(&comp_layout), module: &comp_shader,
@@ -288,7 +295,7 @@ impl PostProcessingEffect for BloomEffect {
             label: Some("Bloom/LinearSampler"),
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             ..Default::default()
@@ -321,7 +328,7 @@ impl PostProcessingEffect for BloomEffect {
 
     fn render(
         &mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder,
-        _gbuffer: &GBuffer, input: &wgpu::TextureView, _depth: &wgpu::TextureView, output: &wgpu::TextureView,
+        gbuffer: &GBuffer, input: &wgpu::TextureView, _depth: &wgpu::TextureView, output: &wgpu::TextureView,
         _camera: &Camera, width: u32, height: u32,
     ) {
         if !self.initialized { return; }
@@ -342,6 +349,8 @@ impl PostProcessingEffect for BloomEffect {
         let sampler = self.linear_sampler.as_ref().unwrap();
 
         let o = &self.options;
+        // the first level's source: what surfaces emit, or the scene's light
+        let source = if o.use_emissive && o.threshold > 0.0 { &gbuffer.emissive_view } else { input };
 
         // ---- Downsample (6 passes) ----
         {
@@ -359,7 +368,7 @@ impl PostProcessingEffect for BloomEffect {
                 ];
                 queue.write_buffer(&self.downsample_params[level], 0, bytemuck::cast_slice(&data));
 
-                let src_view = if level == 0 { input } else { &self.mip_views[level - 1] };
+                let src_view = if level == 0 { source } else { &self.mip_views[level - 1] };
                 let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: None, layout: ds_bgl,
                     entries: &[

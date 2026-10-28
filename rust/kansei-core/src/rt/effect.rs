@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
 
-use super::grid::{RtGrid, RtGridHandle};
+use super::grid::{RtBackend, RtGridHandle};
 use crate::cameras::Camera;
 use crate::gi::{VoxelClipmap, VoxelVolume};
 use crate::lights::Light;
@@ -105,13 +105,15 @@ fn srcIrradiance(p: vec3f, n: vec3f) -> vec3f {
 /// The alpha test's texture and sampler (group 1 bindings 3 and 4), and the default
 /// `kansei_rt_covered`: the texture's alpha at the uv, at least a half.
 const ALPHA_BINDINGS_WGSL: &str = "@group(1) @binding(3) var kansei_rt_alpha_texture : texture_2d<f32>;\n@group(1) @binding(4) var kansei_rt_alpha_sampler : sampler;\n";
-/// The reflections' textured albedo (`set_albedo_texture`, `RtSurface::with_albedo_layer`):
-/// rt_reflect_hit.wgsl's `kansei_rt_hit_albedo`, the triangle's albedo times its layer's texel
-/// over the layer's mean (its last mip), so the albedo word keeps the level (the GI's hits, which
-/// read no texture, see the same) and the texture brings the detail; sampled two mips down (a
-/// hit's footprint in a mirror is many texels).
-const ALBEDO_WGSL: &str = "@group(1) @binding(6) var kansei_rt_albedo_texture : texture_2d_array<f32>;
-fn kansei_rt_hit_albedo(triangle: u32, bary: vec2f) -> vec3f {
+/// The albedo texture array (`set_albedo_texture`, group 1 binding 6) the default
+/// `kansei_rt_hit_albedo` reads.
+const ALBEDO_BINDINGS_WGSL: &str = "@group(1) @binding(6) var kansei_rt_albedo_texture : texture_2d_array<f32>;\n";
+/// The reflections' textured albedo (`set_albedo_texture`, `RtSurface::with_albedo_layer`), the
+/// effect's `kansei_rt_hit_albedo` unless `RtReflectionsOptions::albedo_wgsl` replaces it: the
+/// triangle's albedo times its layer's texel over the layer's mean (its last mip), so the albedo
+/// word keeps the level (the GI's hits, which read no texture, see the same) and the texture brings
+/// the detail; sampled two mips down (a hit's footprint in a mirror is many texels).
+const TEXTURED_HIT_ALBEDO_WGSL: &str = "fn kansei_rt_hit_albedo(triangle: u32, p: vec3f, bary: vec2f) -> vec3f {
     let base = kansei_rt_albedo(triangle);
     let surface = bitcast<u32>(kansei_rt_triangles[triangle * 4u].w);
     if ((surface & KANSEI_RT_ALBEDO_TEX) == 0u || (surface & KANSEI_RT_SMOOTH) != 0u) {
@@ -126,21 +128,20 @@ fn kansei_rt_hit_albedo(triangle: u32, bary: vec2f) -> vec3f {
 ";
 /// The caustics at the hits (`set_caustics`): rt_reflect_hit.wgsl's `kansei_rt_hit_caustics`,
 /// RtCausticsEffect's map (group 1 bindings 7 and 8) read at a hit the camera doesn't see.
-const CAUSTICS_WGSL: &str = "@group(1) @binding(7) var kansei_rt_caustics_map : texture_2d<f32>;
+const CAUSTICS_WGSL: &str = "@group(1) @binding(7) var kansei_rt_caustics_map : texture_2d_array<f32>;
 @group(1) @binding(8) var<uniform> kansei_rt_caustics : KanseiRtCaustics;
 fn kansei_rt_hit_caustics(p: vec3f, n: vec3f) -> vec3f {
     return kansei_rt_caustics_lookup(kansei_rt_caustics_map, kansei_rt_alpha_sampler, kansei_rt_caustics, p, n);
 }
-fn kansei_rt_hit_caustic_focus(p: vec3f) -> f32 {
-    return kansei_rt_caustics_focus(kansei_rt_caustics, p);
-}
 ";
 /// A hit on a self-lit surface (`RtSurface::with_self_lit`) the camera sees only through the
 /// refractive pass (water): rt_reflect_hit.wgsl's `kansei_rt_hit_background`, the GBuffer's
-/// background image (group 0 bindings 16 and 17, its colour and depth) where it shows the point:
-/// its direct light, plus the caustics there and a wide voxel cone for its indirect light.
-const BACKGROUND_WGSL: &str = "@group(0) @binding(16) var kansei_rt_background : texture_2d<f32>;
-@group(0) @binding(17) var kansei_rt_background_depth : texture_depth_2d;
+/// background image (group 0 bindings 18 and 19, its colour and depth) where it shows the point:
+/// its direct light, plus the caustics there and a wide voxel cone for its indirect light. The
+/// glass pass's over a volume alone: WebGPU's 16 sampled textures a stage leave no room for it in
+/// the trace (beside the anisotropic mips) or beside a clipmap's levels (`NO_BACKGROUND_WGSL`).
+const BACKGROUND_WGSL: &str = "@group(0) @binding(18) var kansei_rt_background : texture_2d<f32>;
+@group(0) @binding(19) var kansei_rt_background_depth : texture_depth_2d;
 fn kansei_rt_hit_background(p: vec3f, n: vec3f, triangle: u32, bary: vec2f) -> vec4f {
     if ((bitcast<u32>(kansei_rt_triangles[triangle * 4u].w) & KANSEI_RT_SELF_LIT) == 0u) {
         return vec4f(0.0);
@@ -171,43 +172,102 @@ fn kansei_rt_hit_background(p: vec3f, n: vec3f, triangle: u32, bary: vec2f) -> v
         // (a 45 degree cone's solid angle, weighed by the cosine: about 2 of the hemisphere's pi)
         e += (c.rgb + c.a * rp.skyScale * skyRadiance(sky, n)) * 2.0 * rp.indirectScale;
     }
-    // its light focused by the water's ripples above it (all of it: the shimmer a pool's bed shows,
-    // though the sky's light, from all over, would focus less)
-    let light = textureLoad(kansei_rt_background, q, 0).rgb + e * kansei_rt_hit_albedo(triangle, bary) / 3.14159265;
-    return vec4f(max(light * kansei_rt_hit_caustic_focus(p), vec3f(0.0)), 1.0);
+    let light = textureLoad(kansei_rt_background, q, 0).rgb + e * kansei_rt_hit_albedo(triangle, p, bary) / 3.14159265;
+    return vec4f(max(light, vec3f(0.0)), 1.0);
 }
 ";
+/// The trace's `kansei_rt_hit_background`: none.
+const NO_BACKGROUND_WGSL: &str = "fn kansei_rt_hit_background(p: vec3f, n: vec3f, triangle: u32, bary: vec2f) -> vec4f {\n    return vec4f(0.0);\n}\n";
 const DEFAULT_COVERED_WGSL: &str = "fn kansei_rt_covered(layer: u32, uv: vec2f) -> bool {\n    return textureSampleLevel(kansei_rt_alpha_texture, kansei_rt_alpha_sampler, uv, 0.0).a >= 0.5;\n}\n";
+
+/// The default `kansei_rt_hit_albedo`: the triangle's albedo.
+pub(crate) const DEFAULT_HIT_ALBEDO_WGSL: &str = "fn kansei_rt_hit_albedo(triangle: u32, p: vec3f, bary: vec2f) -> vec3f {\n    return kansei_rt_albedo(triangle);\n}\n";
 
 const COMMON_WGSL: &str = include_str!("shaders/rt_reflect_common.wgsl");
 
-/// The trace's WGSL over a clipmap or a volume, with `covered` (`kansei_rt_covered`).
-pub(crate) fn trace_wgsl(clipmap: bool, covered: &str) -> String {
-    traced_wgsl(clipmap, covered, include_str!("shaders/rt_reflect_trace.wgsl"), true)
+/// The trace's WGSL over a clipmap or a volume, through a grid traced by `backend`, with `surface`
+/// (`kansei_rt_covered`, then `kansei_rt_hit_albedo`).
+pub(crate) fn trace_wgsl(clipmap: bool, backend: RtBackend, surface: &str) -> String {
+    traced_wgsl(clipmap, backend, surface, include_str!("shaders/rt_reflect_trace.wgsl"), false)
 }
 
-/// The glass pass's WGSL, prefixed as the trace (but over a volume without its anisotropic mips).
-pub(crate) fn glass_wgsl(clipmap: bool, covered: &str) -> String {
-    traced_wgsl(clipmap, covered, include_str!("shaders/rt_glass.wgsl"), false)
+/// The glass pass's WGSL, prefixed as the trace (but over a volume without its anisotropic mips,
+/// and with the background image).
+pub(crate) fn glass_wgsl(clipmap: bool, backend: RtBackend, surface: &str) -> String {
+    traced_wgsl(clipmap, backend, surface, include_str!("shaders/rt_glass.wgsl"), true)
 }
 
-fn traced_wgsl(clipmap: bool, covered: &str, main: &str, anisotropic: bool) -> String {
+fn traced_wgsl(clipmap: bool, backend: RtBackend, covered: &str, main: &str, glass: bool) -> String {
     let source = if clipmap {
         format!("{}{CLIPMAP_SOURCE_WGSL}", crate::gi::CLIPMAP_WGSL)
-    } else if anisotropic {
+    } else if !glass {
         format!("{}{}{VOLUME_SOURCE_WGSL}", crate::gi::VOXEL_CONES_WGSL, include_str!("../gi/shaders/voxel_irradiance.wgsl"))
     } else {
         format!("{}{VOLUME_SOURCE_ISO_WGSL}", crate::gi::VOXEL_CONES_WGSL)
     };
-    format!(
-        "{}\n{}\n{COMMON_WGSL}\n{}\n{}\n{ALPHA_BINDINGS_WGSL}{ALBEDO_WGSL}{}\n{CAUSTICS_WGSL}{BACKGROUND_WGSL}{covered}\n{source}\n{}\n{main}",
+    super::hoist_wgsl_enables(&format!(
+        "{}\n{}\n{}\n{COMMON_WGSL}\n{}\n{}\n{ALPHA_BINDINGS_WGSL}{ALBEDO_BINDINGS_WGSL}{}\n{CAUSTICS_WGSL}{}{covered}\n{source}\n{}\n{}\n{main}",
         crate::atmosphere::SKY_LIGHTING_WGSL,
+        crate::atmosphere::SKY_ENVIRONMENT_WGSL,
         include_str!("../shaders/spot_light_types.wgsl"),
-        super::RT_GRID_WGSL,
-        RtGrid::bindings_wgsl(1, 0),
-        format!("{}\n{}", crate::simulations::fluid::WATER_RIPPLES_WGSL, super::RT_CAUSTICS_LOOKUP_WGSL),
+        backend.wgsl(),
+        backend.bindings_wgsl(1, 0),
+        super::RT_CAUSTICS_LOOKUP_WGSL,
+        if glass && !clipmap { BACKGROUND_WGSL } else { NO_BACKGROUND_WGSL },
+        include_str!("shaders/rt_reflect_sky.wgsl"),
         include_str!("shaders/rt_reflect_hit.wgsl"),
-    )
+    ))
+}
+
+/// The trace's bind group layouts (groups 0 and 1) over a clipmap or a volume, through a grid
+/// traced by `backend`.
+pub(crate) fn trace_layout_entries(clipmap: bool, backend: RtBackend) -> [Vec<wgpu::BindGroupLayoutEntry>; 2] {
+    layout_entries(clipmap, backend, false)
+}
+
+/// The glass pass's: as the trace's, less the anisotropic mips, plus its history and, over a
+/// volume, the background image (WebGPU's 16 sampled textures a stage leave room for one or the
+/// other).
+pub(crate) fn glass_layout_entries(clipmap: bool, backend: RtBackend) -> [Vec<wgpu::BindGroupLayoutEntry>; 2] {
+    layout_entries(clipmap, backend, true)
+}
+
+fn layout_entries(clipmap: bool, backend: RtBackend, glass: bool) -> [Vec<wgpu::BindGroupLayoutEntry>; 2] {
+    let compute = wgpu::ShaderStages::COMPUTE;
+    let entry = |binding, ty| wgpu::BindGroupLayoutEntry { binding, visibility: compute, ty, count: None };
+    let uniform = wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None };
+    let storage = |read_only| wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only }, has_dynamic_offset: false, min_binding_size: None };
+    let texture = |filterable, view_dimension| wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable }, view_dimension, multisampled: false };
+    let d2 = wgpu::TextureViewDimension::D2;
+    let depth = wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Depth, view_dimension: d2, multisampled: false };
+    let storage_tex = wgpu::BindingType::StorageTexture { access: wgpu::StorageTextureAccess::WriteOnly, format: wgpu::TextureFormat::Rgba16Float, view_dimension: d2 };
+    let filtering = wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering);
+    let mut entries = vec![entry(0, uniform), entry(1, depth), entry(2, texture(false, d2)), entry(3, texture(false, d2)), entry(4, storage_tex), entry(5, uniform), entry(10, texture(false, d2)), entry(11, storage(true)), entry(15, storage(true)), entry(16, texture(true, wgpu::TextureViewDimension::Cube)), entry(17, filtering)];
+    if clipmap {
+        entries.extend(crate::gi::clipmap_layout_entries(compute));
+    } else {
+        entries.extend([entry(6, uniform), entry(7, texture(true, wgpu::TextureViewDimension::D3)), entry(8, filtering)]);
+    }
+    if glass {
+        // its history (frosted glass) and, over a volume, the background image
+        entries.extend([entry(12, texture(true, d2)), entry(13, storage_tex), entry(14, filtering)]);
+        if !clipmap {
+            entries.extend([entry(18, texture(false, d2)), entry(19, depth)]);
+        }
+    } else if !clipmap {
+        // the anisotropic mips (the volume itself where it has none)
+        entries.extend((40..46).map(|b| entry(b, texture(true, wgpu::TextureViewDimension::D3))));
+    }
+    let mut grid_entries = backend.layout_entries(0, compute).to_vec();
+    grid_entries.extend([
+        entry(3, texture(true, d2)),
+        entry(4, filtering),
+        entry(5, storage(false)),
+        entry(6, texture(true, wgpu::TextureViewDimension::D2Array)),
+        entry(7, texture(true, wgpu::TextureViewDimension::D2Array)),
+        entry(8, uniform),
+    ]);
+    [entries, grid_entries]
 }
 
 pub(crate) fn resolve_wgsl() -> String {
@@ -265,6 +325,12 @@ pub struct RtReflectionsOptions {
     /// Alpha-test the grid's alpha-tested triangles (`RtSurface::with_alpha_layer`); off, they are
     /// solid.
     pub alpha_test: bool,
+    /// WGSL defining `fn kansei_rt_hit_albedo(triangle: u32, p: vec3f, bary: vec2f) -> vec3f`, the
+    /// albedo of a hit the rays light themselves (one the camera doesn't see) at world point `p`:
+    /// for a surface whose albedo varies across its triangles (a procedural or textured floor
+    /// seen in a mirror or through glass). It may tell the surfaces apart by `kansei_rt_source`
+    /// and read `rp` (the camera). None: `kansei_rt_albedo(triangle)`.
+    pub albedo_wgsl: Option<String>,
     /// WGSL defining `fn kansei_rt_covered(layer: u32, uv: vec2f) -> bool`, which may sample
     /// `kansei_rt_alpha_texture` with `kansei_rt_alpha_sampler` (`set_alpha_texture`). None: the
     /// texture's alpha is at least a half (a white texture until one is set: every hit).
@@ -273,7 +339,7 @@ pub struct RtReflectionsOptions {
 
 impl Default for RtReflectionsOptions {
     fn default() -> Self {
-        Self { resolution: RtTraceResolution::Half, intensity: 1.0, max_distance: 400.0, cone_tan: 0.04, cone_steps: 96, temporal_blend: 0.25, sky_scale: 1.0, alpha_test: true, covered_wgsl: None }
+        Self { resolution: RtTraceResolution::Half, intensity: 1.0, max_distance: 400.0, cone_tan: 0.04, cone_steps: 96, temporal_blend: 0.25, sky_scale: 1.0, alpha_test: true, albedo_wgsl: None, covered_wgsl: None }
     }
 }
 
@@ -376,6 +442,8 @@ struct Gpu {
     glass_checker: wgpu::ComputePipeline,
     resolve: wgpu::ComputePipeline,
     no_sky: wgpu::Buffer,
+    /// no environment cubemap (`set_environment_map`): black, never read
+    no_environment: wgpu::TextureView,
     /// no spot lights (a count of 0)
     no_spots: wgpu::Buffer,
     /// the directional and point lights (`update_lights`; rt_reflect_hit.wgsl's RtReflectLights)
@@ -401,7 +469,8 @@ struct Gpu {
 /// voxels as the surface cache; with `screen_hits`, by the lit image where the camera sees the
 /// same point, and with `set_spot_lights`, the hits it doesn't see by the spot lights (shadow rays
 /// through the grid) plus the voxels' irradiance. Rays leaving the grid's box go on as a narrow
-/// voxel cone, then the sky (`set_sky_lighting`). It needs the voxel GI running whatever GI the
+/// voxel cone, then the sky (`set_sky_lighting`; with `set_environment_map`, a prefiltered cubemap
+/// at the ray's lobe, sharp for a mirror and clear glass). It needs the voxel GI running whatever GI the
 /// image shows (`hit_indirect` off where that is none or screen space).
 ///
 /// It traces one pixel of each 2 x 2 (or 4 x 4) block a frame, each in turn, and accumulates them
@@ -412,6 +481,10 @@ struct Gpu {
 /// TAA.
 pub struct RtReflectionsEffect {
     pub enabled: bool,
+    /// Trace the reflections (on by default). Off, only the glass pass runs (`set_glass`), writing
+    /// the effect's output itself, and the reflections' trace and resolve are skipped: a toggle
+    /// for their cost that keeps the glass. Call `reset_history` when turning them back on.
+    pub reflections: bool,
     pub view: RtReflectionsView,
     pub intensity: f32,
     pub max_distance: f32,
@@ -447,9 +520,11 @@ pub struct RtReflectionsEffect {
     lights_dirty: bool,
     resolution: RtTraceResolution,
     covered_wgsl: Option<String>,
+    albedo_wgsl: Option<String>,
     grid: RtGridHandle,
     source: Source,
     sky_lighting: Option<wgpu::Buffer>,
+    environment: Option<crate::environment::EnvironmentMap>,
     alpha_texture: Option<wgpu::TextureView>,
     albedo_texture: Option<wgpu::TextureView>,
     /// RtCausticsEffect's map and its uniform (`set_caustics`)
@@ -484,6 +559,7 @@ impl RtReflectionsEffect {
     fn from_source(source: Source, grid: RtGridHandle, o: RtReflectionsOptions) -> Self {
         Self {
             enabled: true,
+            reflections: true,
             view: RtReflectionsView::Lit,
             intensity: o.intensity,
             max_distance: o.max_distance,
@@ -504,9 +580,11 @@ impl RtReflectionsEffect {
             lights_dirty: false,
             resolution: o.resolution,
             covered_wgsl: o.covered_wgsl,
+            albedo_wgsl: o.albedo_wgsl,
             grid,
             source,
             sky_lighting: None,
+            environment: None,
             alpha_texture: None,
             albedo_texture: None,
             caustics: None,
@@ -536,10 +614,19 @@ impl RtReflectionsEffect {
     }
 
     /// Light the hits the camera doesn't see (with `set_spot_lights`) by `RtCausticsEffect::map`
-    /// too, where they face up under it: the bed under ray-traced water, the floor in a mirror.
-    /// None: no caustics.
+    /// too, where they face up under it: the floor in a mirror, the bed under ray-traced water.
+    /// The map grows (a new texture) when casters or lights are added: set it each frame. None: no
+    /// caustics.
     pub fn set_caustics(&mut self, map: Option<(&wgpu::TextureView, &wgpu::Buffer)>) {
         self.caustics = map.map(|(v, b)| (v.clone(), b.clone()));
+    }
+
+    /// The sky past the voxels as a prefiltered cubemap (`environment::EnvironmentMap`: an
+    /// `HdrEnvironment`'s or the atmosphere's), read at each ray's lobe, sharp for mirrors and
+    /// clear glass, in place of the sky lighting's SH; None (the default): the SH. Polished hits'
+    /// own reflections keep the SH.
+    pub fn set_environment_map(&mut self, map: Option<&crate::environment::EnvironmentMap>) {
+        self.environment = map.cloned();
     }
 
     /// The texture `kansei_rt_covered` reads (`kansei_rt_alpha_texture`).
@@ -628,31 +715,12 @@ impl RtReflectionsEffect {
         let storage_tex = wgpu::BindingType::StorageTexture { access: wgpu::StorageTextureAccess::WriteOnly, format: wgpu::TextureFormat::Rgba16Float, view_dimension: d2 };
         let filtering = wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering);
         let layout = |label, entries: &[wgpu::BindGroupLayoutEntry]| device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some(label), entries });
-        let mut trace_entries = vec![entry(0, uniform), entry(1, depth), entry(2, texture(false, d2)), entry(3, texture(false, d2)), entry(4, storage_tex), entry(5, uniform), entry(10, texture(false, d2)), entry(11, wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }), entry(15, wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }), entry(16, texture(false, d2)), entry(17, depth)];
         let clipmap = matches!(self.source, Source::Clipmap { .. });
-        if clipmap {
-            trace_entries.extend(crate::gi::clipmap_layout_entries(compute));
-        } else {
-            trace_entries.extend([entry(6, uniform), entry(7, texture(true, wgpu::TextureViewDimension::D3)), entry(8, filtering)]);
-        }
-        // the glass's: its history (frosted glass), no anisotropic mips; the trace's: those mips
-        // (the volume itself where it has none), no history
-        let mut glass_entries = trace_entries.clone();
-        glass_entries.extend([entry(12, texture(true, d2)), entry(13, storage_tex), entry(14, filtering)]);
-        if !clipmap {
-            trace_entries.extend((40..46).map(|b| entry(b, texture(true, wgpu::TextureViewDimension::D3))));
-        }
+        let backend = self.grid.backend();
+        let [trace_entries, grid_entries] = trace_layout_entries(clipmap, backend);
+        let [glass_entries, _] = glass_layout_entries(clipmap, backend);
         let trace_bgl = layout("RtReflections/Trace", &trace_entries);
         let glass_bgl = layout("RtReflections/Glass", &glass_entries);
-        let mut grid_entries = RtGrid::layout_entries(0, compute).to_vec();
-        grid_entries.extend([
-            entry(3, texture(true, d2)),
-            entry(4, filtering),
-            entry(5, wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }),
-            entry(6, texture(true, wgpu::TextureViewDimension::D2Array)),
-            entry(7, texture(true, d2)),
-            entry(8, uniform),
-        ]);
         let grid_bgl = layout("RtReflections/Grid", &grid_entries);
         let resolve_bgl = layout(
             "RtReflections/Resolve",
@@ -671,14 +739,18 @@ impl RtReflectionsEffect {
         );
         let pipeline_at = |label: &str, code: String, entry: &str, layouts: &[&wgpu::BindGroupLayout]| {
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(code.into()) });
-            let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some(label), bind_group_layouts: layouts, push_constant_ranges: &[] });
+            let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some(label), bind_group_layouts: &layouts.iter().copied().map(Some).collect::<Vec<_>>(), immediate_size: 0 });
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some(label), layout: Some(&pl), module: &module, entry_point: Some(entry), compilation_options: Default::default(), cache: None })
         };
         let pipeline = |label: &str, code: String, layouts: &[&wgpu::BindGroupLayout]| pipeline_at(label, code, "main", layouts);
-        let covered = self.covered_wgsl.clone().unwrap_or_else(|| DEFAULT_COVERED_WGSL.into());
-        let trace = pipeline("RtReflections/Trace", trace_wgsl(clipmap, &covered), &[&trace_bgl, &grid_bgl]);
-        let glass = pipeline("RtReflections/Glass", glass_wgsl(clipmap, &covered), &[&glass_bgl, &grid_bgl]);
-        let glass_checker = pipeline_at("RtReflections/GlassChecker", glass_wgsl(clipmap, &covered), "main_checker", &[&glass_bgl, &grid_bgl]);
+        let covered = format!(
+            "{}{}",
+            self.covered_wgsl.as_deref().unwrap_or(DEFAULT_COVERED_WGSL),
+            self.albedo_wgsl.as_deref().unwrap_or(TEXTURED_HIT_ALBEDO_WGSL)
+        );
+        let trace = pipeline("RtReflections/Trace", trace_wgsl(clipmap, backend, &covered), &[&trace_bgl, &grid_bgl]);
+        let glass = pipeline("RtReflections/Glass", glass_wgsl(clipmap, backend, &covered), &[&glass_bgl, &grid_bgl]);
+        let glass_checker = pipeline_at("RtReflections/GlassChecker", glass_wgsl(clipmap, backend, &covered), "main_checker", &[&glass_bgl, &grid_bgl]);
         let resolve = pipeline("RtReflections/Resolve", resolve_wgsl(), &[&resolve_bgl]);
         use wgpu::util::DeviceExt;
         let white = device
@@ -726,8 +798,8 @@ impl RtReflectionsEffect {
                 usage: wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             })
-            .create_view(&Default::default());
-        let no_caustics = (no_caustics, device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("RtReflections/NoCaustics"), contents: &[0u8; 64], usage: wgpu::BufferUsages::UNIFORM }));
+            .create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
+        let no_caustics = (no_caustics, device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("RtReflections/NoCaustics"), contents: bytemuck::bytes_of(&super::caustics::LookupGpu::zeroed()), usage: wgpu::BufferUsages::UNIFORM }));
         let buffer = |label, size, usage| device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage, mapped_at_creation: false });
         let sampler = |label, address| device.create_sampler(&wgpu::SamplerDescriptor { label: Some(label), mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, address_mode_u: address, address_mode_v: address, ..Default::default() });
         self.gpu = Some(Gpu {
@@ -741,6 +813,23 @@ impl RtReflectionsEffect {
             glass_checker,
             resolve,
             no_sky: device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("RtReflections/NoSky"), contents: &[0u8; 256], usage: wgpu::BufferUsages::UNIFORM }),
+            no_environment: device
+                .create_texture_with_data(
+                    queue,
+                    &wgpu::TextureDescriptor {
+                        label: Some("RtReflections/NoEnvironment"),
+                        size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 6 },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                        view_formats: &[],
+                    },
+                    wgpu::util::TextureDataOrder::LayerMajor,
+                    &[0; 24],
+                )
+                .create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::Cube), ..Default::default() }),
             no_spots: device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("RtReflections/NoSpots"), contents: &[0u8; 256], usage: wgpu::BufferUsages::STORAGE }),
             lights: lights_buffer(device, 0),
             white,
@@ -759,10 +848,16 @@ impl RtReflectionsEffect {
 }
 
 impl PostProcessingEffect for RtReflectionsEffect {
+    /// Its SH for the sky, and its cubemap (where it has one) for the misses.
+    fn set_environment(&mut self, environment: &crate::environment::EnvironmentLighting) {
+        self.set_sky_lighting(Some(&environment.sky_lighting));
+        self.set_environment_map(environment.environment.as_ref());
+    }
+
     fn initialize(&mut self, _device: &wgpu::Device, _gbuffer: &GBuffer, _camera: &Camera) {}
 
     fn is_active(&self) -> bool {
-        self.enabled
+        self.enabled && (self.reflections || self.glass.is_some())
     }
 
     fn render(
@@ -781,6 +876,8 @@ impl PostProcessingEffect for RtReflectionsEffect {
         if self.gpu.is_none() {
             self.init_gpu(device, queue);
         }
+        // the hardware backend's TLAS over a rebuilt BLAS
+        self.grid.prepare_trace(device, queue);
         self.poll_stats(device);
         let downscale = self.resolution.downscale();
         let (tw, th) = (width.div_ceil(downscale), height.div_ceil(downscale));
@@ -831,7 +928,7 @@ impl PostProcessingEffect for RtReflectionsEffect {
         }
         let direct = self.spot_lights.is_some() || !self.lights.1.is_empty();
         let mut flags = 0;
-        for (on, flag) in [(self.alpha_test, 1), (self.collect_stats, 2), (self.prev_view_proj.is_some(), 4), (self.trace_grid, 8), (self.screen_hits, 16), (direct, 32), (matches!(&self.source, Source::Volume { anisotropic: Some(_), .. }), 64), (!self.hit_indirect, 128), (self.glass.is_some(), 256), (self.glass.is_some_and(|g| g.reflections_in_trace), 512), (self.glass.is_some_and(|g| g.checkerboard), 1024)] {
+        for (on, flag) in [(self.alpha_test, 1), (self.collect_stats, 2), (self.prev_view_proj.is_some(), 4), (self.trace_grid, 8), (self.screen_hits, 16), (direct, 32), (matches!(&self.source, Source::Volume { anisotropic: Some(_), .. }), 64), (!self.hit_indirect, 128), (self.glass.is_some(), 256), (self.environment.is_some(), 512), (self.glass.is_some_and(|g| g.reflections_in_trace), 1024), (self.glass.is_some_and(|g| g.checkerboard), 2048)] {
             if on {
                 flags |= flag;
             }
@@ -877,8 +974,8 @@ impl PostProcessingEffect for RtReflectionsEffect {
             wgpu::BindGroupEntry { binding: 5, resource: buf(sky) },
             wgpu::BindGroupEntry { binding: 11, resource: buf(self.spot_lights.as_ref().unwrap_or(&gpu.no_spots)) },
             wgpu::BindGroupEntry { binding: 15, resource: buf(&gpu.lights) },
-            wgpu::BindGroupEntry { binding: 16, resource: tex(&gbuffer.background_view) },
-            wgpu::BindGroupEntry { binding: 17, resource: tex(&gbuffer.background_depth_view) },
+            wgpu::BindGroupEntry { binding: 16, resource: tex(self.environment.as_ref().map_or(&gpu.no_environment, |e| &e.view)) },
+            wgpu::BindGroupEntry { binding: 17, resource: wgpu::BindingResource::Sampler(self.environment.as_ref().map_or(&gpu.linear, |e| &e.sampler)) },
         ];
         match &self.source {
             Source::Clipmap { uniform, levels, sampler } => {
@@ -893,7 +990,9 @@ impl PostProcessingEffect for RtReflectionsEffect {
                 entries.extend((0..6).map(|i| wgpu::BindGroupEntry { binding: 40 + i as u32, resource: tex(anisotropic.as_ref().map_or(view, |a| &a[i])) }));
             }
         }
-        // (the glass's group: its history, no anisotropic mips; the trace's the other way round)
+        // (the glass's group: its history and, over a volume, the background, no anisotropic mips;
+        // the trace's the other way round)
+        let volume = matches!(self.source, Source::Volume { .. });
         let group = |label, out: &wgpu::TextureView, screen: &wgpu::TextureView, glass: bool| {
             let mut e: Vec<wgpu::BindGroupEntry> = entries.iter().filter(|x| !glass || !(40..46).contains(&x.binding)).cloned().collect();
             e.push(wgpu::BindGroupEntry { binding: 4, resource: tex(out) });
@@ -902,25 +1001,31 @@ impl PostProcessingEffect for RtReflectionsEffect {
                 e.push(wgpu::BindGroupEntry { binding: 12, resource: tex(&t.glass_history[1 - current]) });
                 e.push(wgpu::BindGroupEntry { binding: 13, resource: tex(&t.glass_history[current]) });
                 e.push(wgpu::BindGroupEntry { binding: 14, resource: wgpu::BindingResource::Sampler(&gpu.linear) });
+                if volume {
+                    e.push(wgpu::BindGroupEntry { binding: 18, resource: tex(&gbuffer.background_view) });
+                    e.push(wgpu::BindGroupEntry { binding: 19, resource: tex(&gbuffer.background_depth_view) });
+                }
             }
             device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some(label), layout: if glass { &gpu.glass_bgl } else { &gpu.trace_bgl }, entries: &e })
         };
         let trace_group = group("RtReflections/Trace", &t.trace, lit, false);
-        let glass_group = glass_on.then(|| group("RtReflections/Glass", &t.glassed, input, true));
-        // the grid's group, made anew when the grid's buffers or the alpha texture change
-        let (buffers, generation) = self.grid.buffers();
+        // without the reflections the glass pass writes the output itself
+        let glass_group = glass_on.then(|| group("RtReflections/Glass", if self.reflections { &t.glassed } else { output }, input, true));
+        // the grid's group, made anew when the grid's buffers or its textures change
+        let (bindings, generation) = self.grid.bindings();
         let textures = (self.alpha_texture.clone(), self.albedo_texture.clone(), self.caustics.as_ref().map(|c| c.0.clone()));
         if gpu.grid_group.as_ref().is_none_or(|(g, t, _)| *g != generation || *t != textures) {
             let alpha = self.alpha_texture.as_ref().unwrap_or(&gpu.white);
             let albedo = self.albedo_texture.as_ref().unwrap_or(&gpu.white_array);
             let (caustics, caustics_uniform) = self.caustics.as_ref().map_or((&gpu.no_caustics.0, &gpu.no_caustics.1), |(v, b)| (v, b));
+            let [e0, e1, e2] = bindings.entries(0);
             let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("RtReflections/Grid"),
                 layout: &gpu.grid_bgl,
                 entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: buf(&buffers[0]) },
-                    wgpu::BindGroupEntry { binding: 1, resource: buf(&buffers[1]) },
-                    wgpu::BindGroupEntry { binding: 2, resource: buf(&buffers[2]) },
+                    e0,
+                    e1,
+                    e2,
                     wgpu::BindGroupEntry { binding: 3, resource: tex(alpha) },
                     wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&gpu.alpha_sampler) },
                     wgpu::BindGroupEntry { binding: 5, resource: buf(&gpu.stats) },
@@ -960,6 +1065,9 @@ impl PostProcessingEffect for RtReflectionsEffect {
             pass.set_bind_group(0, glass_group, &[]);
             pass.set_bind_group(1, &gpu.grid_group.as_ref().unwrap().2, &[]);
             pass.dispatch_workgroups(width.div_ceil(if checker { 16 } else { 8 }), height.div_ceil(8), 1);
+        }
+        if !self.reflections {
+            return;
         }
         {
             let stamp = crate::profiling::gpu_pass("Rt/Trace");
@@ -1015,14 +1123,14 @@ impl RtReflectionsEffect {
         let Some(gpu) = self.gpu.as_ref() else { return };
         #[cfg(not(target_arch = "wasm32"))]
         if self.mapping.is_some() {
-            device.poll(wgpu::Maintain::Poll);
+            let _ = device.poll(wgpu::PollType::Poll);
         }
         #[cfg(target_arch = "wasm32")]
         let _ = device;
         if let Some(state) = self.mapping.take_if(|s| s.load(Ordering::Acquire) != MAPPING) {
             if state.load(Ordering::Acquire) == MAPPED {
                 {
-                    let bytes = gpu.staging.slice(..).get_mapped_range();
+                    let bytes = gpu.staging.slice(..).get_mapped_range().unwrap();
                     let w: &[u32] = bytemuck::cast_slice(&bytes);
                     self.stats = Some(RtReflectionStats { rays: w[0], hits: w[1], cells: w[2], tests: w[3], max_cost: w[4], glass_pixels: w[5], glass_cost: w[6] });
                 }

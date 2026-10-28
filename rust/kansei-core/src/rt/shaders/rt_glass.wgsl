@@ -95,9 +95,11 @@ fn glassPath(g: Glass, p: vec3f, v: vec3f, n: vec3f, px: vec2u, k: u32, samples:
     var inside = true;
     var through = vec3f(0.0);
     let step = 0.05 * kansei_rt_grid.cell;
+    var ended = false;
     for (var i = 0u; i < rp.glassInterfaces; i++) {
         if ((rp.flags & RT_REFLECT_GRID) == 0u || !kansei_rt_contains(o)) {
             through = throughput * rtFarField(o, d, d, 0.0, 0.0);
+            ended = true;
             break;
         }
         // (the first leaves the surface the pixel shows: not through its coarse copy)
@@ -105,6 +107,7 @@ fn glassPath(g: Glass, p: vec3f, v: vec3f, n: vec3f, px: vec2u, k: u32, samples:
         out.cost += hit.cells + hit.tests;
         if (!hit.found) {
             through = throughput * rtFarField(o, d, d, 0.0, kansei_rt_exit(o, d));
+            ended = true;
             break;
         }
         let h = o + d * hit.t;
@@ -112,7 +115,8 @@ fn glassPath(g: Glass, p: vec3f, v: vec3f, n: vec3f, px: vec2u, k: u32, samples:
             throughput *= exp(-g.absorb * hit.t);
         }
         if (!rtIsGlass(hit.triangle)) {
-            through = throughput * rtHitRadiance(h, hit.normal, hit.triangle, hit.bary);
+            through = throughput * rtHitRadiance(h, hit.normal, hit.triangle, hit.bary, d);
+            ended = true;
             break;
         }
         // the coarse copy of the surface the path left (RtSurface::with_approximate): through it
@@ -140,6 +144,11 @@ fn glassPath(g: Glass, p: vec3f, v: vec3f, n: vec3f, px: vec2u, k: u32, samples:
         throughput *= 1.0 - f;
         o = h - hit.normal * step;
         inside = !inside;
+    }
+    // out of surfaces with light still to carry (a ray caught bouncing inside a slab, or through
+    // glass behind glass): the far field along where it was going, rather than black
+    if (!ended) {
+        through = throughput * rtFarField(o, d, d, 0.0, kansei_rt_exit(o, d));
     }
     out.radiance = fr * mirror.radiance + through;
     return out;

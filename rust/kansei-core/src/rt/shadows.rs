@@ -7,7 +7,7 @@ use crate::lights::Light;
 use crate::postprocessing::PostProcessingEffect;
 use crate::renderers::GBuffer;
 
-use super::{RtGrid, RtGridHandle, RT_GRID_WGSL, RT_OPAQUE_WGSL};
+use super::{RtBackend, RtGridHandle, RT_OPAQUE_WGSL};
 
 /// The most lights one `RtShadowsEffect` shades (the first directional and spot lights).
 pub const RT_SHADOW_MAX_LIGHTS: usize = 8;
@@ -18,15 +18,37 @@ pub const RT_SHADOWS_GBUFFER_WGSL: &str = include_str!("shaders/rt_shadows_gbuff
 
 const COMMON_WGSL: &str = include_str!("shaders/rt_shadows.wgsl");
 
-fn trace_wgsl() -> String {
-    format!("{RT_GRID_WGSL}\n{}\n{RT_OPAQUE_WGSL}\n{COMMON_WGSL}\n{}", RtGrid::bindings_wgsl(1, 0), include_str!("shaders/rt_shadows_trace.wgsl"))
+/// The trace's WGSL, through a grid traced by `backend` (its bindings in group 1): its shadow rays
+/// are any-hit traces, so on hardware they stop at the first opaque triangle the query finds.
+pub(crate) fn trace_wgsl(backend: RtBackend) -> String {
+    super::hoist_wgsl_enables(&format!(
+        "{}\n{}\n{RT_OPAQUE_WGSL}\n{COMMON_WGSL}\n{}",
+        backend.wgsl(),
+        backend.bindings_wgsl(1, 0),
+        include_str!("shaders/rt_shadows_trace.wgsl")
+    ))
 }
 
-fn filter_wgsl() -> String {
+/// The trace's bind group layouts (groups 0 and 1), through a grid traced by `backend`.
+pub(crate) fn trace_layout_entries(backend: RtBackend) -> [Vec<wgpu::BindGroupLayoutEntry>; 2] {
+    let compute = wgpu::ShaderStages::COMPUTE;
+    let entry = |binding, ty| wgpu::BindGroupLayoutEntry { binding, visibility: compute, ty, count: None };
+    let uniform = wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None };
+    let storage_ro = wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None };
+    let d2 = wgpu::TextureViewDimension::D2;
+    let tex = wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: false }, view_dimension: d2, multisampled: false };
+    let depth = wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Depth, view_dimension: d2, multisampled: false };
+    let storage = |format| wgpu::BindingType::StorageTexture { access: wgpu::StorageTextureAccess::WriteOnly, format, view_dimension: d2 };
+    let (f16, f32x4) = (wgpu::TextureFormat::Rgba16Float, wgpu::TextureFormat::Rgba32Float);
+    let trace = vec![entry(0, uniform), entry(1, storage_ro), entry(2, depth), entry(3, tex), entry(4, tex), entry(5, storage(f16)), entry(6, storage(f16)), entry(7, storage(f32x4)), entry(8, tex)];
+    [trace, backend.layout_entries(0, compute).to_vec()]
+}
+
+pub(crate) fn filter_wgsl() -> String {
     format!("{COMMON_WGSL}\n{}", include_str!("shaders/rt_shadows_filter.wgsl"))
 }
 
-fn composite_wgsl() -> String {
+pub(crate) fn composite_wgsl() -> String {
     format!("{COMMON_WGSL}\n{}", include_str!("shaders/rt_shadows_composite.wgsl"))
 }
 
@@ -88,6 +110,46 @@ struct LightGpu {
     radius: f32,
 }
 
+/// The WGSL structs' sizes, for the tests.
+#[cfg(test)]
+pub(crate) fn params_size() -> usize {
+    std::mem::size_of::<ParamsGpu>()
+}
+
+#[cfg(test)]
+pub(crate) fn light_size() -> usize {
+    std::mem::size_of::<LightGpu>()
+}
+
+/// `RtShadowsEffect`'s visibility of its lights as its last frame left it (`RtShadowsEffect::visibility`),
+/// for a pass after it in the same frame that weighs light by it: the caustics
+/// (`RtCausticsEffect::set_visibility`) add and take light only where the light reaches.
+#[derive(Clone, Default)]
+pub struct RtShadowVisibility {
+    shared: std::sync::Arc<std::sync::Mutex<Option<VisibilityFrame>>>,
+}
+
+/// One frame's visibility: lights 0-3 and 4-7 (rgba16float, 1 lit; directional lights first,
+/// then spot lights, as `update_lights` packs them), the guide (rgba32float: the normal
+/// octahedral-packed, the view depth; 0 where the effect lights nothing), at the trace resolution
+/// (`downscale` pixels a texel), for the camera's `frame`.
+#[derive(Clone)]
+pub(crate) struct VisibilityFrame {
+    pub vis: [wgpu::TextureView; 2],
+    pub guide: wgpu::TextureView,
+    pub trace_size: [u32; 2],
+    pub downscale: u32,
+    pub frame: u32,
+}
+
+impl RtShadowVisibility {
+    /// The visibility the effect left for the camera's `frame` (none when it didn't render that
+    /// frame).
+    pub(crate) fn frame(&self, frame: u32) -> Option<VisibilityFrame> {
+        self.shared.lock().unwrap().clone().filter(|f| f.frame == frame)
+    }
+}
+
 const FLAG_HISTORY: u32 = 1;
 const FLAG_CONTACT: u32 = 2;
 const ITERATIONS: usize = 3;
@@ -118,13 +180,17 @@ struct Gpu {
     composite: wgpu::ComputePipeline,
     grid_group: Option<(u64, wgpu::BindGroup)>,
     targets: Option<Targets>,
+    /// the grid's backend the trace was made for
+    backend: RtBackend,
 }
 
 /// Direct light with ray-traced shadows, for the surfaces whose material asks for it
 /// (`RT_SHADOWS_GBUFFER_WGSL`'s `kansei_gbuffer_out_rt_lit`: such a surface leaves the sun and the
 /// spot lights out of its own colour). For each pixel and light (the scene's directional and spot
 /// lights, `update_lights`, at most [`RT_SHADOW_MAX_LIGHTS`]) a shadow ray goes through the
-/// renderer's grid of triangles (`Renderer::enable_rt_grid`) toward a point of the emitter: a
+/// renderer's grid of triangles (`Renderer::enable_rt_grid`, through whichever backend it has:
+/// its cells, or hardware ray queries where the device has them), an any-hit trace toward a point
+/// of the emitter: a
 /// cone of `sun_angle` round a directional light, a disk of the spot light's `source_radius`, or a
 /// rectangle (`set_rect_emitter`); a new point every frame, so the penumbrae are soft where the
 /// emitter is large and sharpen at contacts. A short screen-space ray (`contact_length`) catches
@@ -166,6 +232,7 @@ pub struct RtShadowsEffect {
     frame: u32,
     prev_view_proj: Option<glam::Mat4>,
     last_camera_frame: Option<u32>,
+    visibility: RtShadowVisibility,
     gpu: Option<Gpu>,
 }
 
@@ -193,8 +260,15 @@ impl RtShadowsEffect {
             frame: 0,
             prev_view_proj: None,
             last_camera_frame: None,
+            visibility: RtShadowVisibility::default(),
             gpu: None,
         }
+    }
+
+    /// Its denoised visibility of each light, which it leaves each frame for the passes after it
+    /// (`RtCausticsEffect::set_visibility`).
+    pub fn visibility(&self) -> RtShadowVisibility {
+        self.visibility.clone()
     }
 
     /// The `index`th spot light (in `update_lights`' order, counting spot lights only) emits from a
@@ -208,44 +282,7 @@ impl RtShadowsEffect {
     /// then its spot lights, up to [`RT_SHADOW_MAX_LIGHTS`] in all; the slots' order is the
     /// visibility view's `debug_light`.
     pub fn update_lights<'a>(&mut self, lights: impl IntoIterator<Item = &'a Light>) {
-        let (mut dir, mut spot) = (Vec::new(), Vec::new());
-        for light in lights {
-            match light {
-                Light::Directional(l) => {
-                    let c = l.effective_color();
-                    let d = glam::Vec3::new(l.direction.x, l.direction.y, l.direction.z).normalize_or_zero();
-                    dir.push(LightGpu { kind: 0, direction: d.to_array(), color: [c.x, c.y, c.z], radius: self.sun_angle, ..Default::default() });
-                }
-                Light::Spot(l) => {
-                    let c = l.effective_color();
-                    let d = glam::Vec3::new(l.direction.x, l.direction.y, l.direction.z).normalize_or_zero();
-                    let (inner, outer) = l.cone();
-                    let mut g = LightGpu {
-                        position: [l.position.x, l.position.y, l.position.z],
-                        kind: 1,
-                        direction: d.to_array(),
-                        range: l.range.max(1e-3),
-                        color: [c.x, c.y, c.z],
-                        cos_outer: outer.cos(),
-                        cos_inner: inner.cos(),
-                        radius: l.source_radius.max(0.0),
-                        ..Default::default()
-                    };
-                    if let Some((_, [w, h])) = self.rects.iter().find(|r| r.0 == spot.len()) {
-                        let any = if d.y.abs() < 0.9 { glam::Vec3::Y } else { glam::Vec3::X };
-                        let u = d.cross(any).normalize();
-                        let v = d.cross(u).normalize();
-                        g.axis_u = (u * w * 0.5).to_array();
-                        g.axis_v = (v * h * 0.5).to_array();
-                    }
-                    spot.push(g);
-                }
-                Light::Point(_) | Light::Area(_) => {}
-            }
-        }
-        dir.extend(spot);
-        dir.truncate(RT_SHADOW_MAX_LIGHTS);
-        self.lights = dir;
+        self.lights = pack_lights(lights, self.sun_angle, &self.rects);
     }
 
     /// Start the accumulation over (after a cut).
@@ -264,11 +301,10 @@ impl RtShadowsEffect {
         let storage = |format| wgpu::BindingType::StorageTexture { access: wgpu::StorageTextureAccess::WriteOnly, format, view_dimension: d2 };
         let (f16, f32x4) = (wgpu::TextureFormat::Rgba16Float, wgpu::TextureFormat::Rgba32Float);
         let layout = |label, entries: &[wgpu::BindGroupLayoutEntry]| device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some(label), entries });
-        let trace_bgl = layout(
-            "RtShadows/Trace",
-            &[entry(0, uniform), entry(1, storage_ro), entry(2, depth), entry(3, tex), entry(4, tex), entry(5, storage(f16)), entry(6, storage(f16)), entry(7, storage(f32x4))],
-        );
-        let grid_bgl = layout("RtShadows/Grid", &RtGrid::layout_entries(0, compute));
+        let backend = self.grid.backend();
+        let [trace_entries, grid_entries] = trace_layout_entries(backend);
+        let trace_bgl = layout("RtShadows/Trace", &trace_entries);
+        let grid_bgl = layout("RtShadows/Grid", &grid_entries);
         let temporal_bgl = layout(
             "RtShadows/Temporal",
             &[
@@ -305,18 +341,18 @@ impl RtShadowsEffect {
         );
         let pipeline = |label: &str, code: &str, entry_point: &str, layouts: &[&wgpu::BindGroupLayout]| {
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(code.into()) });
-            let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some(label), bind_group_layouts: layouts, push_constant_ranges: &[] });
+            let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some(label), bind_group_layouts: &layouts.iter().copied().map(Some).collect::<Vec<_>>(), immediate_size: 0 });
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some(label), layout: Some(&pl), module: &module, entry_point: Some(entry_point), compilation_options: Default::default(), cache: None })
         };
         let filter = filter_wgsl();
-        let trace = pipeline("RtShadows/Trace", &trace_wgsl(), "main", &[&trace_bgl, &grid_bgl]);
+        let trace = pipeline("RtShadows/Trace", &trace_wgsl(backend), "main", &[&trace_bgl, &grid_bgl]);
         let temporal = pipeline("RtShadows/Temporal", &filter, "temporal", &[&temporal_bgl]);
         let atrous = pipeline("RtShadows/Atrous", &filter, "atrous", &[&atrous_bgl]);
         let composite = pipeline("RtShadows/Composite", &composite_wgsl(), "main", &[&composite_bgl]);
         let buffer = |label, size, usage| device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage, mapped_at_creation: false });
         let params = (0..=ITERATIONS).map(|_| buffer("RtShadows/Params", std::mem::size_of::<ParamsGpu>() as u64, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST)).collect();
         let lights = buffer("RtShadows/Lights", (RT_SHADOW_MAX_LIGHTS * std::mem::size_of::<LightGpu>()) as u64, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST);
-        self.gpu = Some(Gpu { params, lights, trace_bgl, grid_bgl, temporal_bgl, atrous_bgl, composite_bgl, trace, temporal, atrous, composite, grid_group: None, targets: None });
+        self.gpu = Some(Gpu { params, lights, trace_bgl, grid_bgl, temporal_bgl, atrous_bgl, composite_bgl, trace, temporal, atrous, composite, grid_group: None, targets: None, backend });
     }
 
     fn make_targets(device: &wgpu::Device, size: (u32, u32), trace_size: (u32, u32)) -> Targets {
@@ -366,9 +402,12 @@ impl PostProcessingEffect for RtShadowsEffect {
         width: u32,
         height: u32,
     ) {
-        if self.gpu.is_none() {
+        // made again for a grid whose backend changed (the effect's handle follows its grid)
+        if self.gpu.as_ref().is_none_or(|g| g.backend != self.grid.backend()) {
             self.init_gpu(device);
         }
+        // the hardware backend's TLAS over a rebuilt BLAS
+        self.grid.prepare_trace(device, queue);
         let downscale = if self.half_resolution { 2 } else { 1 };
         let (tw, th) = (width.div_ceil(downscale), height.div_ceil(downscale));
         {
@@ -427,13 +466,10 @@ impl PostProcessingEffect for RtShadowsEffect {
         lights.resize(RT_SHADOW_MAX_LIGHTS, LightGpu::default());
         queue.write_buffer(&gpu.lights, 0, bytemuck::cast_slice(&lights));
 
-        let (buffers, generation) = self.grid.buffers();
+        // the grid's group, made anew when its buffers (or its acceleration structure) are
+        let (bindings, generation) = self.grid.bindings();
         if gpu.grid_group.as_ref().is_none_or(|(g, _)| *g != generation) {
-            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("RtShadows/Grid"),
-                layout: &gpu.grid_bgl,
-                entries: &[b(0, buffers[0].as_entire_binding()), b(1, buffers[1].as_entire_binding()), b(2, buffers[2].as_entire_binding())],
-            });
+            let group = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("RtShadows/Grid"), layout: &gpu.grid_bgl, entries: &bindings.entries(0) });
             gpu.grid_group = Some((generation, group));
         }
         let cur = (self.frame % 2) as usize;
@@ -452,6 +488,7 @@ impl PostProcessingEffect for RtShadowsEffect {
                 b(5, tex(&t.raw[0])),
                 b(6, tex(&t.raw[1])),
                 b(7, tex(&t.raw[2])),
+                b(8, tex(&gbuffer.albedo_view)),
             ],
         });
         let temporal_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -515,6 +552,13 @@ impl PostProcessingEffect for RtShadowsEffect {
             ],
         });
         pass(encoder, "RtShadows/Composite", &gpu.composite, &[&composite_group], (width.div_ceil(8), height.div_ceil(8)));
+        *self.visibility.shared.lock().unwrap() = Some(VisibilityFrame {
+            vis: [source[0].clone(), source[1].clone()],
+            guide: t.history[cur][2].clone(),
+            trace_size: [tw, th],
+            downscale,
+            frame: camera_frame,
+        });
         self.frame = self.frame.wrapping_add(1);
         self.prev_view_proj = Some(view_proj);
     }
@@ -534,6 +578,49 @@ impl PostProcessingEffect for RtShadowsEffect {
     }
 }
 
+/// `lights`' directional lights then spot lights as the WGSL reads them, up to
+/// [`RT_SHADOW_MAX_LIGHTS`]: the sun's cone `sun_angle`, the spot lights `rects` names rectangles.
+fn pack_lights<'a>(lights: impl IntoIterator<Item = &'a Light>, sun_angle: f32, rects: &[(usize, [f32; 2])]) -> Vec<LightGpu> {
+    let (mut dir, mut spot) = (Vec::new(), Vec::new());
+    for light in lights {
+        match light {
+            Light::Directional(l) => {
+                let c = l.effective_color();
+                let d = glam::Vec3::new(l.direction.x, l.direction.y, l.direction.z).normalize_or_zero();
+                dir.push(LightGpu { kind: 0, direction: d.to_array(), color: [c.x, c.y, c.z], radius: sun_angle, ..Default::default() });
+            }
+            Light::Spot(l) => {
+                let c = l.effective_color();
+                let d = glam::Vec3::new(l.direction.x, l.direction.y, l.direction.z).normalize_or_zero();
+                let (outer, inner) = l.cone();
+                let mut g = LightGpu {
+                    position: [l.position.x, l.position.y, l.position.z],
+                    kind: 1,
+                    direction: d.to_array(),
+                    range: l.range.max(1e-3),
+                    color: [c.x, c.y, c.z],
+                    cos_outer: outer.cos(),
+                    cos_inner: inner.cos(),
+                    radius: l.source_radius.max(0.0),
+                    ..Default::default()
+                };
+                if let Some((_, [w, h])) = rects.iter().find(|r| r.0 == spot.len()) {
+                    let any = if d.y.abs() < 0.9 { glam::Vec3::Y } else { glam::Vec3::X };
+                    let u = d.cross(any).normalize();
+                    let v = d.cross(u).normalize();
+                    g.axis_u = (u * w * 0.5).to_array();
+                    g.axis_v = (v * h * 0.5).to_array();
+                }
+                spot.push(g);
+            }
+            Light::Point(_) | Light::Area(_) => {}
+        }
+    }
+    dir.extend(spot);
+    dir.truncate(RT_SHADOW_MAX_LIGHTS);
+    dir
+}
+
 fn tex(view: &wgpu::TextureView) -> wgpu::BindingResource<'_> {
     wgpu::BindingResource::TextureView(view)
 }
@@ -545,29 +632,25 @@ fn b(binding: u32, resource: wgpu::BindingResource<'_>) -> wgpu::BindGroupEntry<
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn validate(name: &str, code: &str) -> naga::Module {
-        let module = naga::front::wgsl::parse_str(code).unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(code)));
-        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty())
-            .validate(&module)
-            .unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(code)));
-        module
-    }
-
-    fn struct_span(module: &naga::Module, name: &str) -> usize {
-        module.types.iter().find(|(_, t)| t.name.as_deref() == Some(name)).map(|(_, t)| match &t.inner {
-            naga::TypeInner::Struct { span, .. } => *span as usize,
-            _ => panic!("{name} is not a struct"),
-        }).unwrap_or_else(|| panic!("no struct {name}"))
-    }
+    use crate::lights::SpotLight;
+    use crate::math::Vec3;
 
     #[test]
-    fn shaders_validate_rt_shadows() {
-        let trace = validate("rt_shadows_trace", &trace_wgsl());
-        assert_eq!(struct_span(&trace, "RtShadowParams"), std::mem::size_of::<ParamsGpu>());
-        assert_eq!(struct_span(&trace, "RtShadowLight"), std::mem::size_of::<LightGpu>());
-        validate("rt_shadows_filter", &filter_wgsl());
-        validate("rt_shadows_composite", &composite_wgsl());
-        validate("rt_shadows_gbuffer", &format!("{}\n{RT_SHADOWS_GBUFFER_WGSL}", crate::materials::GBUFFER_OUT_WGSL));
+    fn spot_lights_pack_their_cones_as_the_renderer_does() {
+        let spot = || {
+            let mut s = SpotLight::new(Vec3::new(0.0, 3.0, 0.0), Vec3::new(0.0, -2.0, 0.0), Vec3::new(1.0, 0.5, 0.25), 800.0, 10.0, 30f32.to_radians(), 60f32.to_radians());
+            s.source_radius = 0.2;
+            Light::Spot(s)
+        };
+        let packed = pack_lights([&spot()], 0.02, &[]);
+        let l = packed[0];
+        // full inside the inner cone, none past the outer (kansei_spot_sample's smoothstep)
+        assert!((l.cos_inner - 30f32.to_radians().cos()).abs() < 1e-6 && (l.cos_outer - 60f32.to_radians().cos()).abs() < 1e-6, "{l:?}");
+        assert_eq!((l.kind, l.direction, l.radius, l.color), (1, [0.0, -1.0, 0.0], 0.2, [800.0, 400.0, 200.0]));
+        assert_eq!(l.axis_u, [0.0; 3], "a disk");
+        // a rectangle facing along the axis
+        let rect = pack_lights([&spot()], 0.02, &[(0, [2.0, 1.0])])[0];
+        let (u, v) = (glam::Vec3::from(rect.axis_u), glam::Vec3::from(rect.axis_v));
+        assert!((u.length() - 1.0).abs() < 1e-5 && (v.length() - 0.5).abs() < 1e-5 && u.dot(v).abs() < 1e-5 && u.y.abs() < 1e-5 && v.y.abs() < 1e-5, "{u} {v}");
     }
 }

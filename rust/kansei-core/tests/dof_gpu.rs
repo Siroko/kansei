@@ -14,8 +14,8 @@ const FAR: f32 = 1000.0;
 
 fn gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
     let instance = wgpu::Instance::default();
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?;
-    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None)).ok()
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
+    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()
 }
 
 fn f16_to_f32(h: u16) -> f32 {
@@ -75,7 +75,7 @@ impl Harness {
                 count: None,
             }],
         });
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[&depth_bgl], push_constant_ranges: &[] });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&depth_bgl)], immediate_size: 0 });
         let depth_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: None,
             layout: Some(&layout),
@@ -84,13 +84,13 @@ impl Harness {
             primitive: Default::default(),
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: GBuffer::DEPTH_FORMAT,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Always,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Always),
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
             multisample: Default::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
         let gbuffer = GBuffer::new(&device, W, H, 1);
@@ -141,6 +141,7 @@ impl Harness {
                 }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             pass.set_pipeline(&self.depth_pipeline);
             pass.set_bind_group(0, &bg, &[]);
@@ -157,8 +158,8 @@ impl Harness {
         );
         q.submit(std::iter::once(encoder.finish()));
         readback.slice(..).map_async(wgpu::MapMode::Read, |r| r.unwrap());
-        d.poll(wgpu::Maintain::Wait);
-        let data = readback.slice(..).get_mapped_range();
+        let _ = d.poll(wgpu::PollType::wait_indefinitely());
+        let data = readback.slice(..).get_mapped_range().unwrap();
         let mut out = Vec::with_capacity((W * H) as usize);
         for y in 0..H {
             for x in 0..W {
@@ -342,6 +343,7 @@ fn dof_frame_cost_at_1080p() {
             }),
             timestamp_writes: None,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
         queue.submit(std::iter::once(encoder.finish()));
         view
@@ -357,7 +359,7 @@ fn dof_frame_cost_at_1080p() {
         for i in 0..60 {
             let t0 = std::time::Instant::now();
             f();
-            device.poll(wgpu::Maintain::Wait);
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
             if i >= 10 {
                 samples.push(t0.elapsed().as_secs_f64() * 1e3);
             }

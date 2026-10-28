@@ -44,11 +44,13 @@ const RT_REFLECT_ANISO : u32 = 64u;
 const RT_REFLECT_NO_INDIRECT : u32 = 128u;
 // glass is drawn (rt_glass.wgsl): the rays hit the grid's glass triangles too
 const RT_REFLECT_GLASS : u32 = 256u;
+// the sky past the voxels is the environment cubemap (bindings 16, 17), not the SH
+const RT_REFLECT_ENV : u32 = 512u;
 // the glass's reflections are traced here with the other surfaces' (RtGlass::reflections_in_trace):
 // the glass pass draws the light through it alone, and the resolve adds the reflection
-const RT_REFLECT_GLASS_SHARED : u32 = 512u;
+const RT_REFLECT_GLASS_SHARED : u32 = 1024u;
 // the glass pass traces half its pixels a frame, a checkerboard (RtGlass::checkerboard)
-const RT_REFLECT_GLASS_CHECKER : u32 = 1024u;
+const RT_REFLECT_GLASS_CHECKER : u32 = 2048u;
 
 fn rtViewPos(uv: vec2f, depth: f32) -> vec3f {
     let p = rp.invProj * vec4f(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);

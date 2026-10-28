@@ -16,6 +16,9 @@
 //   - Multiple Importance Sampling (MIS) for area lights + emissive geometry
 //   - Refraction / transmission with Beer's law absorption
 //   - Blue noise + PCG hybrid random number generation
+//   - Sub-pixel jittered primary rays, and (PT_GUIDES) the guide buffers a denoiser reads: the
+//     first hit's diffuse and specular light apart, each divided by its albedo, the albedos,
+//     the light that bypasses the filter (sky, emitters), linear depth, normal and motion
 
 // ── Structures ──────────────────────────────────────────────────────────────
 
@@ -35,7 +38,7 @@ struct MaterialData {
 struct TraceParams {
     inv_view_proj   : mat4x4f,  // bytes 0-63
     camera_pos      : vec3f,    // 64-75
-    frame_index     : u32,      // 76-79
+    frame_index     : u32,      // 76-79   frames accumulated before this one (0: none)
     width           : u32,      // 80-83
     height          : u32,      // 84-87
     light_count     : u32,      // 88-91
@@ -43,14 +46,18 @@ struct TraceParams {
     use_blue_noise  : u32,      // 96-99
     fixed_seed      : u32,      // 100-103
     max_bounces     : u32,      // 104-107
-    _pad0           : u32,      // 108-111
+    seed            : u32,      // 108-111 the sampler's frame: advances every trace, never reset
     ambient_color   : vec3f,    // 112-123
-    _pad1           : u32,      // 124-127
-    _pad2           : vec4f,    // 128-143
-    _pad3           : vec4f,    // 144-159
-    _pad4           : vec4f,    // 160-175
-    _pad5           : vec4f,    // 176-191
+    flags           : u32,      // 124-127 PT_*
+    jitter          : vec2f,    // 128-135 the primary rays' sub-pixel offset, pixels
+    _pad2           : vec2f,    // 136-143
+    prev_view_proj  : mat4x4f,  // 144-207 world -> last frame's clip space (PT_GUIDES' motion)
 }
+
+// write the guide buffers (bindings 20-22)
+const PT_GUIDES         = 1u;
+// prev_instances holds last frame's instance transforms (else surfaces moved with the camera only)
+const PT_PREV_INSTANCES = 2u;
 
 const LIGHT_DIRECTIONAL = 1u;
 const LIGHT_AREA        = 2u;
@@ -77,10 +84,22 @@ struct LightData {
 @group(0) @binding(4) var<storage, read> blue_noise   : array<f32>;
 @group(0) @binding(9) var prev_frame : texture_2d<f32>;
 
+// The guide buffers (PT_GUIDES), four f16 or two f32 per word:
+//   signal  (diffuse.rg, diffuse.b specular.r, specular.gb, bypass.rg): the first hit's diffuse
+//           and specular light, each over its albedo; the bypass is what the filter must not
+//           touch (sky, emitters seen directly)
+//   albedo  (diffuse.rg, diffuse.b specular.r, specular.gb, bypass.b roughness): what to multiply
+//           the filtered light by, and the specular lobe's roughness (how far it may be blurred)
+//   surface (linear depth f32, octahedral normal snorm16x2, motion uv f16x2, last frame's linear
+//           depth of the same point f32): depth 0 where no surface takes filtering
+@group(0) @binding(20) var guide_signal  : texture_storage_2d<rgba32uint, write>;
+@group(0) @binding(21) var guide_albedo  : texture_storage_2d<rgba32uint, write>;
+@group(0) @binding(22) var guide_surface : texture_storage_2d<rgba32uint, write>;
+@group(0) @binding(23) var<storage, read> prev_instances : array<Instance>;
+
 // ── RNG: Blue noise + PCG hybrid sampler ────────────────────────────────────
 
 const BN_SIZE      : u32 = 128u;
-const GOLDEN_RATIO : f32 = 0.6180339887;
 const PI           : f32 = 3.14159265;
 
 var<private> _bn_pixel  : vec2u;
@@ -109,7 +128,12 @@ fn next_random() -> f32 {
         let px = (_bn_pixel.x + dim * 17u) % BN_SIZE;
         let py = (_bn_pixel.y + dim * 31u) % BN_SIZE;
         let bn = blue_noise[py * BN_SIZE + px];
-        return fract(bn + f32(_bn_frame) * GOLDEN_RATIO);
+        // each dimension its own step over the frames, the R8 sequence's (Roberts 2018: the
+        // powers of 1 / phi_8, x^9 = x + 1), in 32-bit fixed point (exact however long the frames
+        // run): one step for all would keep each pixel's sample pairs on a line, and the paths on
+        // a slice of their directions; the blue noise rotates it per pixel
+        let steps = array<u32, 8>(3958238937u, 3647910312u, 3361911661u, 3098335500u, 2855423888u, 2631556713u, 2425240876u, 2235100341u);
+        return fract(bn + f32((_bn_frame * steps[dim]) >> 8u) / 16777216.0);
     }
 
     // PCG fallback for higher dimensions
@@ -120,15 +144,14 @@ fn next_random() -> f32 {
 // ── Orthonormal basis ───────────────────────────────────────────────────────
 // Robust ONB from normal (Duff et al. 2017, Frisvad 2012 revised).
 // Branchless, no cross products, numerically stable for all directions.
+// Written through pointers: naga 24's HLSL cannot return an array (FXC and DXC reject it).
 
-fn build_onb(n: vec3f) -> array<vec3f, 2> {
+fn build_onb(n: vec3f, tangent: ptr<function, vec3f>, bitangent: ptr<function, vec3f>) {
     let s = select(-1.0, 1.0, n.z >= 0.0);
     let a = -1.0 / (s + n.z);
     let b = n.x * n.y * a;
-    return array<vec3f, 2>(
-        vec3f(1.0 + s * n.x * n.x * a, s * b, -s * n.x),
-        vec3f(b, s + n.y * n.y * a, -n.y),
-    );
+    *tangent = vec3f(1.0 + s * n.x * n.x * a, s * b, -s * n.x);
+    *bitangent = vec3f(b, s + n.y * n.y * a, -n.y);
 }
 
 // ── Sampling functions ──────────────────────────────────────────────────────
@@ -138,9 +161,9 @@ fn cosine_sample_hemisphere(n: vec3f, r1: f32, r2: f32) -> vec3f {
     let cos_theta = sqrt(1.0 - r2);
     let sin_theta = sqrt(r2);
 
-    let tb = build_onb(n);
-    let tangent = tb[0];
-    let bitangent = tb[1];
+    var tangent: vec3f;
+    var bitangent: vec3f;
+    build_onb(n, &tangent, &bitangent);
 
     return normalize(
         tangent * cos(phi) * sin_theta +
@@ -155,9 +178,9 @@ fn sample_ggx(n: vec3f, roughness: f32, r1: f32, r2: f32) -> vec3f {
     let cos_theta = sqrt((1.0 - r2) / (1.0 + (a * a - 1.0) * r2));
     let sin_theta = sqrt(1.0 - cos_theta * cos_theta);
 
-    let tb = build_onb(n);
-    let tangent = tb[0];
-    let bitangent = tb[1];
+    var tangent: vec3f;
+    var bitangent: vec3f;
+    build_onb(n, &tangent, &bitangent);
 
     let h = normalize(
         tangent * cos(phi) * sin_theta +
@@ -536,6 +559,52 @@ fn trace_refraction(in_ray: Ray, first_hit: HitInfo, mat: MaterialData) -> vec3f
     return throughput * params.ambient_color;
 }
 
+// ── Guide buffers ───────────────────────────────────────────────────────────
+
+// The octahedral encoding of a unit vector in two snorm16 (Cigolle et al. 2014).
+fn oct_encode(n: vec3f) -> u32 {
+    var p = n.xy / (abs(n.x) + abs(n.y) + abs(n.z));
+    if (n.z < 0.0) {
+        p = (1.0 - abs(p.yx)) * select(vec2f(-1.0), vec2f(1.0), p >= vec2f(0.0));
+    }
+    return pack2x16snorm(p);
+}
+
+// Light over its albedo, per channel; 0 where the albedo is (the light is too).
+fn demodulate(light: vec3f, albedo: vec3f) -> vec3f {
+    return select(f16_range(light / max(albedo, vec3f(1e-4))), vec3f(0.0), albedo < vec3f(1e-4));
+}
+
+// Within f16's range (the guide words' precision), no less than zero.
+fn f16_range(c: vec3f) -> vec3f {
+    return clamp(c, vec3f(0.0), vec3f(60000.0));
+}
+
+// The surface word for the first hit along `dir` through `uv` (see binding 22).
+fn guide_surface_word(hit: HitInfo, uv: vec2f) -> vec4u {
+    let near = params.inv_view_proj * vec4f(0.0, 0.0, 0.0, 1.0);
+    let far = params.inv_view_proj * vec4f(0.0, 0.0, 1.0, 1.0);
+    let forward = normalize(far.xyz / far.w - near.xyz / near.w);
+    let world = hit.world_pos;
+    // where the point was last frame: its instance's last transform, then last frame's camera
+    var prev_world = world;
+    if ((params.flags & PT_PREV_INSTANCES) != 0u) {
+        let inst = instances[hit.instance_id];
+        let prev = prev_instances[hit.instance_id];
+        let p = vec4f(world, 1.0);
+        let local = vec4f(dot(inst.inv_transform0, p), dot(inst.inv_transform1, p), dot(inst.inv_transform2, p), 1.0);
+        prev_world = vec3f(dot(prev.transform0, local), dot(prev.transform1, local), dot(prev.transform2, local));
+    }
+    let clip = params.prev_view_proj * vec4f(prev_world, 1.0);
+    let prev_uv = vec2f(clip.x, -clip.y) / clip.w * 0.5 + 0.5;
+    return vec4u(
+        bitcast<u32>(dot(world - params.camera_pos, forward)),
+        oct_encode(hit.world_norm),
+        pack2x16float(uv - prev_uv),
+        bitcast<u32>(clip.w),
+    );
+}
+
 // ── Main compute entry point ────────────────────────────────────────────────
 
 @compute @workgroup_size(8, 8)
@@ -543,32 +612,47 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
     if (gid.x >= params.width || gid.y >= params.height) { return; }
 
     let coord = vec2u(gid.x, gid.y);
-
-    // UV in [0,1] with half-pixel offset for pixel center
-    let uv = (vec2f(coord) + 0.5) / vec2f(f32(params.width), f32(params.height));
-
-    // Reconstruct world-space ray from inverse view-projection
-    let ndc_near = vec4f(uv.x * 2.0 - 1.0, (1.0 - uv.y) * 2.0 - 1.0, 0.0, 1.0);
-    let ndc_far  = vec4f(uv.x * 2.0 - 1.0, (1.0 - uv.y) * 2.0 - 1.0, 1.0, 1.0);
-    let near_wp = params.inv_view_proj * ndc_near;
-    let far_wp  = params.inv_view_proj * ndc_far;
-    let near_pos = near_wp.xyz / near_wp.w;
-    let far_pos  = far_wp.xyz / far_wp.w;
+    let size = vec2f(f32(params.width), f32(params.height));
 
     let spp = params.spp;
-    var accumulated = vec3f(0.0);
+    // the light leaving the first hit, by lobe, and what each lobe's albedo was (sums over samples)
+    var diffuse = vec3f(0.0);
+    var specular = vec3f(0.0);
+    var diffuse_albedo = vec3f(0.0);
+    var specular_albedo = vec3f(0.0);
+    var roughness = 0.0;
+    // light no filter should touch: the sky and emitters seen directly
+    var bypass = vec3f(0.0);
+    var guide_hit: HitInfo;
+    var guide_uv = vec2f(0.0);
 
     for (var s = 0u; s < spp; s++) {
-        init_sampler(coord, params.frame_index, s);
+        init_sampler(coord, params.seed, s);
+
+        // the frame's sub-pixel offset, then an R2 step (Roberts 2018) for each further sample
+        let offset = fract(params.jitter + 0.5 + f32(s) * vec2f(0.7548776662, 0.5698402910));
+        let uv = (vec2f(coord) + offset) / size;
+
+        // Reconstruct world-space ray from inverse view-projection
+        let ndc_near = vec4f(uv.x * 2.0 - 1.0, (1.0 - uv.y) * 2.0 - 1.0, 0.0, 1.0);
+        let ndc_far  = vec4f(uv.x * 2.0 - 1.0, (1.0 - uv.y) * 2.0 - 1.0, 1.0, 1.0);
+        let near_wp = params.inv_view_proj * ndc_near;
+        let far_wp  = params.inv_view_proj * ndc_far;
+        let near_pos = near_wp.xyz / near_wp.w;
+        let far_pos  = far_wp.xyz / far_wp.w;
 
         var primary_ray: Ray;
         primary_ray.origin = params.camera_pos;
         primary_ray.dir = normalize(far_pos - near_pos);
 
         let primary_hit = trace_bvh(primary_ray);
+        if (s == 0u) {
+            guide_hit = primary_hit;
+            guide_uv = uv;
+        }
 
         if (!primary_hit.hit) {
-            accumulated += params.ambient_color;
+            bypass += params.ambient_color;
             continue;
         }
 
@@ -576,13 +660,16 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
 
         // Add emissive contribution directly
         if (mat.emissive_intensity > 0.0) {
-            accumulated += mat.emissive * mat.emissive_intensity;
+            bypass += mat.emissive * mat.emissive_intensity;
+            if (s == 0u) { guide_hit.hit = false; }
             continue;
         }
 
         // Handle transmissive surfaces via dedicated refraction tracing
         if (mat.transmission > 0.5) {
-            accumulated += trace_refraction(primary_ray, primary_hit, mat);
+            specular += trace_refraction(primary_ray, primary_hit, mat);
+            specular_albedo += vec3f(1.0);
+            roughness += mat.roughness;
             continue;
         }
 
@@ -599,6 +686,10 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
         let diff_w = (1.0 - spec_avg) * (1.0 - mat.metallic);
         let total_w = spec_w + diff_w;
         let spec_prob = clamp(spec_w / max(total_w, 0.001), 0.05, 0.95);
+        let kd = (vec3f(1.0) - f) * (1.0 - mat.metallic);
+        diffuse_albedo += mat.albedo * kd;
+        specular_albedo += f;
+        roughness += mat.roughness;
 
         let r = next_random();
         if (r < spec_prob) {
@@ -628,25 +719,25 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
                 if (spec_hit.hit) {
                     let spec_mat = materials[spec_hit.mat_index];
                     if (spec_mat.transmission > 0.5) {
-                        accumulated += trace_refraction(spec_ray, spec_hit, spec_mat) * f / spec_prob;
+                        specular += trace_refraction(spec_ray, spec_hit, spec_mat) * f / spec_prob;
                     } else {
-                        accumulated += trace_path(spec_hit.world_pos, spec_hit.world_norm, 0u,
+                        specular += trace_path(spec_hit.world_pos, spec_hit.world_norm, 0u,
                             -spec_ray.dir, spec_mat.roughness, spec_mat.metallic, spec_mat.albedo) * spec_mat.albedo * f / spec_prob;
                     }
                 } else {
-                    accumulated += params.ambient_color * f / spec_prob;
+                    specular += params.ambient_color * f / spec_prob;
                 }
             }
         } else {
             // -- Diffuse: multi-bounce path tracing with NEE --
             let diff_prob = 1.0 - spec_prob;
-            let kd = (vec3f(1.0) - f) * (1.0 - mat.metallic);
-            accumulated += trace_path(hit_pos, hit_norm, 0u,
+            diffuse += trace_path(hit_pos, hit_norm, 0u,
                 view_dir, mat.roughness, mat.metallic, mat.albedo) * mat.albedo * kd / max(diff_prob, 0.01);
         }
     }
 
-    let current = accumulated / f32(spp);
+    let inv_spp = 1.0 / f32(spp);
+    let current = (diffuse + specular + bypass) * inv_spp;
 
     // Temporal accumulation: running average over frames
     if (params.frame_index > 0u) {
@@ -655,5 +746,21 @@ fn trace_main(@builtin(global_invocation_id) gid: vec3u) {
         textureStore(output_tex, coord, vec4f(mix(prev, current, weight), 1.0));
     } else {
         textureStore(output_tex, coord, vec4f(current, 1.0));
+    }
+
+    if ((params.flags & PT_GUIDES) != 0u) {
+        // (sums over the samples: the ratios are the samples' light over their mean albedo)
+        let d = demodulate(diffuse, diffuse_albedo);
+        let sp = demodulate(specular, specular_albedo);
+        let b = f16_range(bypass * inv_spp);
+        let da = diffuse_albedo * inv_spp;
+        let sa = specular_albedo * inv_spp;
+        textureStore(guide_signal, coord, vec4u(pack2x16float(d.rg), pack2x16float(vec2f(d.b, sp.r)), pack2x16float(sp.gb), pack2x16float(b.rg)));
+        textureStore(guide_albedo, coord, vec4u(pack2x16float(da.rg), pack2x16float(vec2f(da.b, sa.r)), pack2x16float(sa.gb), pack2x16float(vec2f(b.b, roughness * inv_spp))));
+        var surface = vec4u(0u);
+        if (guide_hit.hit) {
+            surface = guide_surface_word(guide_hit, guide_uv);
+        }
+        textureStore(guide_surface, coord, surface);
     }
 }

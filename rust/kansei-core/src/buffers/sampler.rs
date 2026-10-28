@@ -33,7 +33,10 @@ impl Sampler {
             label: Some("Sampler"),
             mag_filter: self.mag_filter,
             min_filter: self.min_filter,
-            mipmap_filter: self.min_filter,
+            mipmap_filter: match self.min_filter {
+                wgpu::FilterMode::Nearest => wgpu::MipmapFilterMode::Nearest,
+                wgpu::FilterMode::Linear => wgpu::MipmapFilterMode::Linear,
+            },
             address_mode_u: self.address_mode,
             address_mode_v: self.address_mode,
             address_mode_w: self.address_mode,

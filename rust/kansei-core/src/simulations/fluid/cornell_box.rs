@@ -135,7 +135,7 @@ impl FluidCornellBox {
             mapped_at_creation: false,
         });
 
-        let vertex_layout = [wgpu::VertexBufferLayout {
+        let vertex_layout = [Some(wgpu::VertexBufferLayout {
             array_stride: 36,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &[
@@ -155,7 +155,7 @@ impl FluidCornellBox {
                     shader_location: 2,
                 },
             ],
-        }];
+        })];
         let primitive = wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,
             cull_mode: Some(wgpu::Face::Front),
@@ -177,8 +177,8 @@ impl FluidCornellBox {
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("CornellBox/Layout"),
-            bind_group_layouts: &[&bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
         });
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -203,8 +203,8 @@ impl FluidCornellBox {
             primitive,
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: depth_format,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
@@ -212,7 +212,7 @@ impl FluidCornellBox {
                 count: sample_count.max(1),
                 ..Default::default()
             },
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
         let depth_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -237,8 +237,8 @@ impl FluidCornellBox {
             primitive,
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: depth_format,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
@@ -246,7 +246,7 @@ impl FluidCornellBox {
                 count: 1,
                 ..Default::default()
             },
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {

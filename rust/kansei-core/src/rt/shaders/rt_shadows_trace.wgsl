@@ -8,6 +8,7 @@
 @group(0) @binding(5) var visOutA : texture_storage_2d<rgba16float, write>;
 @group(0) @binding(6) var visOutB : texture_storage_2d<rgba16float, write>;
 @group(0) @binding(7) var guideOut : texture_storage_2d<rgba32float, write>;
+@group(0) @binding(8) var albedoTex : texture_2d<f32>;
 
 // Off a surface by a little of a cell (more far from the eye: the depth's precision).
 fn shBias(p: vec3f) -> f32 {
@@ -15,7 +16,8 @@ fn shBias(p: vec3f) -> f32 {
 }
 
 // Whether a short ray from `o` along `d` passes in front of what the depth buffer holds: 0 where
-// it goes behind a surface within `contactThickness` (a contact the grid is too coarse for).
+// it goes behind a surface within `contactThickness` (a contact the grid is too coarse for). Glass
+// (its albedo's alpha 0.05-0.45, kansei_gbuffer_out_glass) lets it through, as the grid's rays.
 fn shContact(o: vec3f, d: vec3f, px: vec2u) -> f32 {
     let steps = 10u;
     let jitter = shHash(px.x, px.y, sp.frame * 3u + 1u);
@@ -30,6 +32,8 @@ fn shContact(o: vec3f, d: vec3f, px: vec2u) -> f32 {
         let texel = vec2u(uv * sp.fullSize);
         let sceneDepth = textureLoad(depthTex, texel, 0);
         if (sceneDepth >= 1.0) { continue; }
+        let albedoAlpha = textureLoad(albedoTex, texel, 0).a;
+        if (albedoAlpha > 0.025 && albedoAlpha < 0.475) { continue; }
         // compare view depths: the ray's (its clip w) and the surface's there
         let rayZ = clip.w;
         let sv = sp.invProj * vec4f(ndc.xy, sceneDepth, 1.0);

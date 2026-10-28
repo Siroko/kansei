@@ -20,7 +20,7 @@ const H: u32 = 120;
 
 fn renderer() -> Option<Renderer> {
     let instance = wgpu::Instance::default();
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?;
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
     let mut renderer = Renderer::new(RendererConfig { width: W, height: H, sample_count: 1, ..Default::default() });
     pollster::block_on(renderer.initialize_headless(&adapter));
     Some(renderer)
@@ -89,8 +89,8 @@ fn read_rgba16(renderer: &Renderer, texture: &wgpu::Texture) -> Vec<[f32; 4]> {
     );
     renderer.queue().submit(Some(encoder.finish()));
     buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-    renderer.device().poll(wgpu::Maintain::Wait);
-    let bytes = buffer.slice(..).get_mapped_range();
+    let _ = renderer.device().poll(wgpu::PollType::wait_indefinitely());
+    let bytes = buffer.slice(..).get_mapped_range().unwrap();
     let mut out = Vec::with_capacity((W * H) as usize);
     for y in 0..H {
         for x in 0..W {
@@ -148,6 +148,7 @@ fn the_floor_beside_a_red_wall_is_lit_red_and_the_hybrid_converges() {
     });
     let output_view = output.create_view(&Default::default());
     let handle = renderer.rt_grid().unwrap().handle();
+    eprintln!("rt grid backend: {:?}", handle.backend());
     let effect = |options: RtDiffuseGiOptions, renderer: &Renderer, scene: &Scene| {
         let mut e = RtDiffuseGiEffect::with_volume(renderer.voxel_gi().unwrap().volume(), handle.clone(), RtDiffuseGiOptions { max_distance: 10.0, ..options });
         e.update_lights(scene.lights());

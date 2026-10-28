@@ -19,7 +19,7 @@ const H: u32 = 96;
 
 fn renderer() -> Option<Renderer> {
     let instance = wgpu::Instance::default();
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?;
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
     let mut renderer = Renderer::new(RendererConfig { width: W, height: H, sample_count: 1, ..Default::default() });
     pollster::block_on(renderer.initialize_headless(&adapter));
     Some(renderer)
@@ -76,8 +76,8 @@ fn read_buffer(device: &wgpu::Device, queue: &wgpu::Queue, source: &wgpu::Buffer
     encoder.copy_buffer_to_buffer(source, 0, &buffer, 0, source.size());
     queue.submit(Some(encoder.finish()));
     buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-    device.poll(wgpu::Maintain::Wait);
-    let out = bytemuck::cast_slice(&buffer.slice(..).get_mapped_range()).to_vec();
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    let out = bytemuck::cast_slice(&buffer.slice(..).get_mapped_range().unwrap()).to_vec();
     out
 }
 
@@ -349,8 +349,8 @@ fn read_image(device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Textur
     );
     queue.submit(Some(encoder.finish()));
     buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-    device.poll(wgpu::Maintain::Wait);
-    let bytes = buffer.slice(..).get_mapped_range();
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    let bytes = buffer.slice(..).get_mapped_range().unwrap();
     (0..w * h)
         .map(|i| {
             let o = ((i / w) * row + (i % w) * 8) as usize;

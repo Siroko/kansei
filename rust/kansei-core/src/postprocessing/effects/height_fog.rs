@@ -183,7 +183,7 @@ impl HeightFogEffect {
             ],
         });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("HeightFog"), source: wgpu::ShaderSource::Wgsl(WGSL.into()) });
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("HeightFog"), bind_group_layouts: &[&bgl], push_constant_ranges: &[] });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("HeightFog"), bind_group_layouts: &[Some(&bgl)], immediate_size: 0 });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("HeightFog"),
             layout: Some(&layout),
@@ -216,6 +216,10 @@ impl HeightFogEffect {
 }
 
 impl PostProcessingEffect for HeightFogEffect {
+    fn set_environment(&mut self, environment: &crate::environment::EnvironmentLighting) {
+        self.set_sky_lighting(Some(&environment.sky_lighting));
+    }
+
     fn initialize(&mut self, device: &wgpu::Device, _gbuffer: &GBuffer, _camera: &Camera) {
         if self.gpu.is_none() {
             self.init_gpu(device);
@@ -371,8 +375,8 @@ mod tests {
     #[test]
     fn fog_starts_where_the_volumetric_fog_ends() {
         let instance = wgpu::Instance::default();
-        let Some(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
-        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default(), None)).unwrap();
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
         let (w, h) = (65u32, 9u32);
         let texture = |format, usage| device.create_texture(&wgpu::TextureDescriptor { label: None, size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format, usage, view_formats: &[] });
         let input = texture(wgpu::TextureFormat::Rgba16Float, wgpu::TextureUsages::TEXTURE_BINDING).create_view(&Default::default());
@@ -381,7 +385,7 @@ mod tests {
         // all sky
         let depth = texture(GBuffer::DEPTH_FORMAT, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT).create_view(&Default::default());
         let mut e = device.create_command_encoder(&Default::default());
-        e.begin_render_pass(&wgpu::RenderPassDescriptor { label: None, color_attachments: &[], depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &depth, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }), stencil_ops: None }), timestamp_writes: None, occlusion_query_set: None });
+        e.begin_render_pass(&wgpu::RenderPassDescriptor { label: None, color_attachments: &[], depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &depth, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }), stencil_ops: None }), timestamp_writes: None, occlusion_query_set: None, multiview_mask: None });
         queue.submit([e.finish()]);
         let gbuffer = GBuffer::new(&device, w, h, 1);
         // 90 degrees across, level
@@ -406,8 +410,8 @@ mod tests {
         );
         queue.submit([e.finish()]);
         buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-        device.poll(wgpu::Maintain::Wait);
-        let data = buf.slice(..).get_mapped_range();
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let data = buf.slice(..).get_mapped_range().unwrap();
         let half = |b: u16| -> f32 {
             let (s, e, m) = ((b >> 15) as i32, ((b >> 10) & 0x1f) as i32, (b & 0x3ff) as f32);
             (if s == 1 { -1.0 } else { 1.0 }) * if e == 0 { m / 1024.0 * 2f32.powi(-14) } else { (1.0 + m / 1024.0) * 2f32.powi(e - 15) }

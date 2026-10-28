@@ -9,7 +9,7 @@ use kansei_core::simulations::fluid::{
 
 fn renderer() -> Option<Renderer> {
     let instance = wgpu::Instance::default();
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?;
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
     let mut renderer = Renderer::new(RendererConfig::default());
     pollster::block_on(renderer.initialize_headless(&adapter));
     Some(renderer)
@@ -18,7 +18,7 @@ fn renderer() -> Option<Renderer> {
 /// The probe's measurement, polling until it lands.
 fn wait(probe: &mut FluidSpeedProbe, sim: &FluidSimulation) -> Option<FluidSpeed> {
     for _ in 0..1000 {
-        sim.gpu().0.poll(wgpu::Maintain::Wait);
+        let _ = sim.gpu().0.poll(wgpu::PollType::wait_indefinitely());
         if let Some(s) = probe.take(sim.gpu().0) {
             return Some(s);
         }
@@ -81,7 +81,7 @@ fn a_stepper_sleeps_once_settled_and_culls_out_of_view_reading_speeds_in_metres(
     velocities[0] = 1.0;
     sim.gpu().1.write_buffer(sim.velocities_buffer().unwrap(), 0, bytemuck::cast_slice(&velocities));
     let frame = |stepper: &mut FluidStepper, in_view: bool| {
-        sim.gpu().0.poll(wgpu::Maintain::Wait);
+        let _ = sim.gpu().0.poll(wgpu::PollType::wait_indefinitely());
         let state = stepper.update_rest(&sim, 1.0 / 60.0, in_view, false);
         let steps = stepper.advance(1.0 / 60.0);
         stepper.stepped(&sim, steps);

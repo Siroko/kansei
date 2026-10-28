@@ -2,6 +2,7 @@ use crate::renderers::Renderer;
 use bytemuck::{Pod, Zeroable};
 
 use super::bvh_builder::GPUBVHData;
+use crate::rt::RtBackend;
 
 /// Uniform parameters for the probe trace shader.
 ///
@@ -63,6 +64,64 @@ const SH_BYTES_PER_PROBE: u64 = 9 * 16;
 /// Ray result data per ray: 2 vec4f (32 bytes) = [radiance+dist, dir+pad].
 const RAY_RESULT_BYTES: u64 = 2 * 16;
 
+/// The probe trace shader for the scene's `backend`.
+pub(crate) fn trace_wgsl(backend: RtBackend) -> String {
+    super::accel::assemble(format!("{}\n{}", super::accel::traversal_wgsl(backend, 1, None), include_str!("shaders/probe-trace.wgsl")))
+}
+
+/// The probe trace's layout and pipeline for the scene's `backend`. Bindings:
+///  0: params (uniform)
+///  1-4: the scene (`GPUBVHData::layout_entries`: triangles, BLAS nodes, TLAS nodes or the
+///       acceleration structure, instances)
+///  5: materials (storage, read)
+///  6: scene_lights (storage, read)
+///  7: ray_results (storage, read_write)
+///  8: probe_sh_prev (storage, read)
+fn trace_pipeline(device: &wgpu::Device, backend: RtBackend) -> (wgpu::BindGroupLayout, wgpu::ComputePipeline) {
+    let trace_shader = super::accel::shader_module(device, backend, "ProbeGrid/TraceShader", &trace_wgsl(backend));
+    let buffer = |binding, ty| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer { ty, has_dynamic_offset: false, min_binding_size: None },
+        count: None,
+    };
+    let read = wgpu::BufferBindingType::Storage { read_only: true };
+    let mut entries = vec![
+        wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: wgpu::BufferSize::new(TRACE_PARAMS_SIZE),
+            },
+            count: None,
+        },
+        buffer(5, read),
+        buffer(6, read),
+        buffer(7, wgpu::BufferBindingType::Storage { read_only: false }),
+        buffer(8, read),
+    ];
+    entries.extend(super::accel::traversal_layout_entries(backend, 1));
+    let trace_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("ProbeGrid/TraceBGL"), entries: &entries });
+
+    let trace_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("ProbeGrid/TracePL"),
+        bind_group_layouts: &[Some(&trace_bgl)],
+        immediate_size: 0,
+    });
+
+    let trace_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("ProbeGrid/TracePipeline"),
+        layout: Some(&trace_pl),
+        module: &trace_shader,
+        entry_point: Some("probe_trace_main"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    (trace_bgl, trace_pipeline)
+}
+
 /// Irradiance probe grid for multi-bounce global illumination.
 ///
 /// A uniform 3D grid of probes that each store L2 spherical harmonics
@@ -77,9 +136,9 @@ const RAY_RESULT_BYTES: u64 = 2 * 16;
 /// SH buffers are double-buffered (ping-pong) so the trace shader can
 /// read the previous frame's SH while the update shader writes the new.
 pub struct ProbeGrid {
-    trace_pipeline: wgpu::ComputePipeline,
+    /// the trace's layout and pipeline for each backend traced so far
+    traces: Vec<(RtBackend, wgpu::BindGroupLayout, wgpu::ComputePipeline)>,
     update_pipeline: wgpu::ComputePipeline,
-    trace_bgl: wgpu::BindGroupLayout,
     update_bgl: wgpu::BindGroupLayout,
     sh_buf_a: Option<wgpu::Buffer>,
     sh_buf_b: Option<wgpu::Buffer>,
@@ -109,160 +168,6 @@ impl ProbeGrid {
     pub fn new(renderer: &Renderer) -> Self {
         let device = renderer.device().clone();
         let queue = renderer.queue().clone();
-
-        // ── Trace pipeline ───────────────────────────────────────────
-        let intersection_src = include_str!("shaders/intersection.wgsl");
-        let traversal_src = include_str!("shaders/traversal.wgsl");
-        let probe_trace_src = include_str!("shaders/probe-trace.wgsl");
-
-        // BVH bindings for probe trace: bindings 1-4
-        let trace_bvh_bindings = "\
-// ── BVH storage bindings (injected by ProbeGrid) ─────────────────────
-@group(0) @binding(1) var<storage, read> triangles       : array<f32>;
-@group(0) @binding(2) var<storage, read> bvh4_nodes      : array<vec4f>;
-@group(0) @binding(3) var<storage, read> tlas_bvh4_nodes : array<vec4f>;
-@group(0) @binding(4) var<storage, read> instances       : array<Instance>;
-";
-
-        let trace_shader_code = format!(
-            "{}\n{}\n{}\n{}",
-            intersection_src, traversal_src, trace_bvh_bindings, probe_trace_src,
-        );
-
-        let trace_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("ProbeGrid/TraceShader"),
-            source: wgpu::ShaderSource::Wgsl(trace_shader_code.into()),
-        });
-
-        // Trace BGL: bindings 0-8
-        //  0: params (uniform)
-        //  1: triangles (storage, read)
-        //  2: bvh4_nodes (storage, read)
-        //  3: tlas_bvh4_nodes (storage, read)
-        //  4: instances (storage, read)
-        //  5: materials (storage, read)
-        //  6: scene_lights (storage, read)
-        //  7: ray_results (storage, read_write)
-        //  8: probe_sh_prev (storage, read)
-        let trace_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("ProbeGrid/TraceBGL"),
-            entries: &[
-                // 0: params
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: wgpu::BufferSize::new(TRACE_PARAMS_SIZE),
-                    },
-                    count: None,
-                },
-                // 1: triangles
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // 2: bvh4_nodes
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // 3: tlas_bvh4_nodes
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // 4: instances
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // 5: materials
-                wgpu::BindGroupLayoutEntry {
-                    binding: 5,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // 6: scene_lights
-                wgpu::BindGroupLayoutEntry {
-                    binding: 6,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // 7: ray_results
-                wgpu::BindGroupLayoutEntry {
-                    binding: 7,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // 8: probe_sh_prev
-                wgpu::BindGroupLayoutEntry {
-                    binding: 8,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
-        });
-
-        let trace_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("ProbeGrid/TracePL"),
-            bind_group_layouts: &[&trace_bgl],
-            push_constant_ranges: &[],
-        });
-
-        let trace_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("ProbeGrid/TracePipeline"),
-            layout: Some(&trace_pl),
-            module: &trace_shader,
-            entry_point: Some("probe_trace_main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
 
         // ── Update pipeline ──────────────────────────────────────────
         let update_src = include_str!("shaders/probe-update.wgsl");
@@ -328,8 +233,8 @@ impl ProbeGrid {
 
         let update_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("ProbeGrid/UpdatePL"),
-            bind_group_layouts: &[&update_bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&update_bgl)],
+            immediate_size: 0,
         });
 
         let update_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -357,9 +262,8 @@ impl ProbeGrid {
         });
 
         Self {
-            trace_pipeline,
+            traces: Vec::new(),
             update_pipeline,
-            trace_bgl,
             update_bgl,
             sh_buf_a: None,
             sh_buf_b: None,
@@ -441,7 +345,7 @@ impl ProbeGrid {
     ///
     /// * `encoder`      - Active command encoder
     /// * `bvh_data`     - GPU BVH data from `BVHBuilder`
-    /// * `tlas_buf`     - TLAS BVH4 node buffer
+    /// * `tlas_buf`     - TLAS BVH4 node buffer (unused on the hardware backend)
     /// * `materials_buf`- Materials storage buffer
     /// * `lights_buf`   - Lights storage buffer
     /// * `light_count`  - Number of lights
@@ -494,47 +398,39 @@ impl ProbeGrid {
         self.queue
             .write_buffer(&self.trace_params_buf, 0, bytemuck::bytes_of(&trace_params));
 
+        let backend = bvh_data.backend();
+        if !self.traces.iter().any(|(b, ..)| *b == backend) {
+            let (layout, pipeline) = trace_pipeline(&self.device, backend);
+            self.traces.push((backend, layout, pipeline));
+        }
+        let (_, trace_bgl, trace_pipeline) = self.traces.iter().find(|(b, ..)| *b == backend).unwrap();
+        let mut entries = vec![
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: self.trace_params_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: materials_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: lights_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: ray_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 8,
+                resource: sh_prev.as_entire_binding(),
+            },
+        ];
+        entries.extend(bvh_data.bind_group_entries(tlas_buf, 1));
         let trace_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("ProbeGrid/TraceBG"),
-            layout: &self.trace_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.trace_params_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: bvh_data.triangles_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: bvh_data.bvh4_nodes_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: tlas_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: bvh_data.instances_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: materials_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: lights_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: ray_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 8,
-                    resource: sh_prev.as_entire_binding(),
-                },
-            ],
+            layout: trace_bgl,
+            entries: &entries,
         });
 
         let total_rays = self.probe_count * self.rays_per_frame;
@@ -545,7 +441,7 @@ impl ProbeGrid {
                 label: Some("ProbeGrid/Trace"),
                 timestamp_writes: crate::profiling::gpu_pass("ProbeGrid/Trace").as_ref().map(crate::profiling::PassStamp::compute),
             });
-            pass.set_pipeline(&self.trace_pipeline);
+            pass.set_pipeline(trace_pipeline);
             pass.set_bind_group(0, &trace_bg, &[]);
             pass.dispatch_workgroups(trace_wg, 1, 1);
         }

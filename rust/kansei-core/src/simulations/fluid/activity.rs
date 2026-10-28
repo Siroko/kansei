@@ -260,7 +260,7 @@ impl FluidSpeedProbe {
     pub fn take(&mut self, device: &wgpu::Device) -> Option<FluidSpeed> {
         #[cfg(not(target_arch = "wasm32"))]
         if self.pending.is_some() {
-            device.poll(wgpu::Maintain::Poll);
+            let _ = device.poll(wgpu::PollType::Poll);
         }
         #[cfg(target_arch = "wasm32")]
         let _ = device;
@@ -269,7 +269,7 @@ impl FluidSpeedProbe {
             return None;
         }
         let words: [u32; 2] = {
-            let bytes = self.staging.slice(..).get_mapped_range();
+            let bytes = self.staging.slice(..).get_mapped_range().unwrap();
             let w: &[u32] = bytemuck::cast_slice(&bytes);
             [w[0], w[1]]
         };

@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use bytemuck::{Pod, Zeroable};
 
-use super::grid::{RtGrid, RtGridHandle};
+use super::grid::{RtBackend, RtGridHandle};
 use crate::cameras::Camera;
 use crate::gi::{VoxelClipmap, VoxelVolume};
 use crate::lights::Light;
@@ -71,22 +71,49 @@ const DEFAULT_COVERED_WGSL: &str = "fn kansei_rt_covered(layer: u32, uv: vec2f) 
 const COMMON_WGSL: &str = include_str!("shaders/rt_gi_common.wgsl");
 const PARAMS_WGSL: &str = "@group(0) @binding(20) var<uniform> gp : RtGiParams;\n";
 
-/// The trace's WGSL over a clipmap or a volume, with `covered` (`kansei_rt_covered`).
-pub(crate) fn trace_wgsl(clipmap: bool, covered: &str) -> String {
+/// The trace's WGSL over a clipmap or a volume, through a grid traced by `backend`, with `covered`
+/// (`kansei_rt_covered`).
+pub(crate) fn trace_wgsl(clipmap: bool, backend: RtBackend, covered: &str) -> String {
     let source = if clipmap {
         format!("{}{CLIPMAP_SOURCE_WGSL}", crate::gi::CLIPMAP_WGSL)
     } else {
         format!("{}{}{VOLUME_SOURCE_WGSL}", crate::gi::VOXEL_CONES_WGSL, include_str!("../gi/shaders/voxel_irradiance.wgsl"))
     };
-    format!(
+    super::hoist_wgsl_enables(&format!(
         "{}\n{}\n{}\n{COMMON_WGSL}\n{PARAMS_WGSL}\n{}\n{}\n{ALPHA_BINDINGS_WGSL}{covered}\n{source}\n{}",
         crate::atmosphere::SKY_LIGHTING_WGSL,
         crate::lights::SPOT_LIGHT_TYPES_WGSL,
         include_str!("../shaders/compute_shadows.wgsl"),
-        super::RT_GRID_WGSL,
-        RtGrid::bindings_wgsl(1, 0),
+        backend.wgsl(),
+        backend.bindings_wgsl(1, 0),
         include_str!("shaders/rt_gi_trace.wgsl")
-    )
+    ))
+}
+
+/// The trace's bind group layouts (groups 0 and 1) over a clipmap or a volume, through a grid
+/// traced by `backend`.
+pub(crate) fn trace_layout_entries(clipmap: bool, backend: RtBackend) -> [Vec<wgpu::BindGroupLayoutEntry>; 2] {
+    let compute = wgpu::ShaderStages::COMPUTE;
+    let entry = |binding, ty| wgpu::BindGroupLayoutEntry { binding, visibility: compute, ty, count: None };
+    let uniform = wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None };
+    let storage_rw = wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None };
+    let d2 = wgpu::TextureViewDimension::D2;
+    let tex = |filterable| wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable }, view_dimension: d2, multisampled: false };
+    let depth = wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Depth, view_dimension: d2, multisampled: false };
+    let storage_tex = wgpu::BindingType::StorageTexture { access: wgpu::StorageTextureAccess::WriteOnly, format: wgpu::TextureFormat::Rgba16Float, view_dimension: d2 };
+    let filtering = wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering);
+    let mut trace_entries = ComputeShadows::layout_entries();
+    trace_entries.extend([entry(20, uniform), entry(21, depth), entry(22, tex(false)), entry(23, storage_tex), entry(24, uniform), entry(25, storage_rw)]);
+    if clipmap {
+        trace_entries.extend(crate::gi::clipmap_layout_entries(compute));
+    } else {
+        let d3 = wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D3, multisampled: false };
+        trace_entries.extend([entry(60, uniform), entry(61, d3), entry(62, filtering)]);
+        trace_entries.extend((40..46).map(|b| entry(b, d3)));
+    }
+    let mut grid_entries = backend.layout_entries(0, compute).to_vec();
+    grid_entries.extend([entry(3, tex(true)), entry(4, filtering), entry(5, storage_rw)]);
+    [trace_entries, grid_entries]
 }
 
 pub(crate) fn svgf_wgsl() -> String {
@@ -677,22 +704,12 @@ impl RtDiffuseGiEffect {
         let f16 = wgpu::TextureFormat::Rgba16Float;
         let guide_format = wgpu::TextureFormat::Rg32Uint;
         let uint = wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Uint, view_dimension: d2, multisampled: false };
-        let filtering = wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering);
         let layout = |label, entries: &[wgpu::BindGroupLayoutEntry]| device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some(label), entries });
 
         let clipmap = matches!(self.source, Source::Clipmap { .. });
-        let mut trace_entries = ComputeShadows::layout_entries();
-        trace_entries.extend([entry(20, uniform), entry(21, depth), entry(22, tex(false)), entry(23, storage_tex(f16)), entry(24, uniform), entry(25, storage_rw)]);
-        if clipmap {
-            trace_entries.extend(crate::gi::clipmap_layout_entries(compute));
-        } else {
-            let d3 = wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D3, multisampled: false };
-            trace_entries.extend([entry(60, uniform), entry(61, d3), entry(62, filtering)]);
-            trace_entries.extend((40..46).map(|b| entry(b, d3)));
-        }
+        let backend = self.grid.backend();
+        let [trace_entries, grid_entries] = trace_layout_entries(clipmap, backend);
         let trace_bgl = layout("RtGi/Trace", &trace_entries);
-        let mut grid_entries = RtGrid::layout_entries(0, compute).to_vec();
-        grid_entries.extend([entry(3, tex(true)), entry(4, filtering), entry(5, storage_rw)]);
         let grid_bgl = layout("RtGi/Grid", &grid_entries);
         let temporal_bgl = layout(
             "RtGi/Temporal",
@@ -731,11 +748,11 @@ impl RtDiffuseGiEffect {
         );
         let pipeline = |label: &str, code: &str, entry_point: &str, layouts: &[&wgpu::BindGroupLayout]| {
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(code.into()) });
-            let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some(label), bind_group_layouts: layouts, push_constant_ranges: &[] });
+            let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some(label), bind_group_layouts: &layouts.iter().copied().map(Some).collect::<Vec<_>>(), immediate_size: 0 });
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some(label), layout: Some(&pl), module: &module, entry_point: Some(entry_point), compilation_options: Default::default(), cache: None })
         };
         let covered = self.covered_wgsl.clone().unwrap_or_else(|| DEFAULT_COVERED_WGSL.into());
-        let trace = pipeline("RtGi/Trace", &trace_wgsl(clipmap, &covered), "main", &[&trace_bgl, &grid_bgl]);
+        let trace = pipeline("RtGi/Trace", &trace_wgsl(clipmap, backend, &covered), "main", &[&trace_bgl, &grid_bgl]);
         let svgf = svgf_wgsl();
         let temporal = pipeline("RtGi/Temporal", &svgf, "temporal", &[&temporal_bgl]);
         let variance = pipeline("RtGi/Variance", &svgf, "variance", &[&variance_bgl]);
@@ -855,6 +872,10 @@ impl RtDiffuseGiEffect {
 }
 
 impl PostProcessingEffect for RtDiffuseGiEffect {
+    fn set_environment(&mut self, environment: &crate::environment::EnvironmentLighting) {
+        self.set_sky_lighting(Some(&environment.sky_lighting));
+    }
+
     fn initialize(&mut self, _device: &wgpu::Device, _gbuffer: &GBuffer, _camera: &Camera) {}
 
     fn is_active(&self) -> bool {
@@ -877,6 +898,8 @@ impl PostProcessingEffect for RtDiffuseGiEffect {
         if self.gpu.is_none() {
             self.init_gpu(device, queue);
         }
+        // the hardware backend's TLAS over a rebuilt BLAS
+        self.grid.prepare_trace(device, queue);
         self.poll_stats(device);
         let downscale = self.resolution.downscale();
         let (tw, th) = (width.div_ceil(downscale), height.div_ceil(downscale));
@@ -996,13 +1019,14 @@ impl PostProcessingEffect for RtDiffuseGiEffect {
         }
         let trace_group = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("RtGi/Trace"), layout: &gpu.trace_bgl, entries: &entries });
         // the grid's group, made anew when the grid's buffers or the alpha texture change
-        let (buffers, generation) = self.grid.buffers();
+        let (bindings, generation) = self.grid.bindings();
         if gpu.grid_group.as_ref().is_none_or(|(g, alpha, _)| *g != generation || *alpha != self.alpha_texture) {
             let alpha = self.alpha_texture.as_ref().unwrap_or(&gpu.white);
+            let [e0, e1, e2] = bindings.entries(0);
             let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("RtGi/Grid"),
                 layout: &gpu.grid_bgl,
-                entries: &[b(0, buf(&buffers[0])), b(1, buf(&buffers[1])), b(2, buf(&buffers[2])), b(3, tex(alpha)), b(4, wgpu::BindingResource::Sampler(&gpu.alpha_sampler)), b(5, buf(&gpu.stats))],
+                entries: &[e0, e1, e2, b(3, tex(alpha)), b(4, wgpu::BindingResource::Sampler(&gpu.alpha_sampler)), b(5, buf(&gpu.stats))],
             });
             gpu.grid_group = Some((generation, self.alpha_texture.clone(), group));
         }
@@ -1158,14 +1182,14 @@ impl RtDiffuseGiEffect {
         let Some(gpu) = self.gpu.as_ref() else { return };
         #[cfg(not(target_arch = "wasm32"))]
         if self.mapping.is_some() {
-            device.poll(wgpu::Maintain::Poll);
+            let _ = device.poll(wgpu::PollType::Poll);
         }
         #[cfg(target_arch = "wasm32")]
         let _ = device;
         if let Some(state) = self.mapping.take_if(|s| s.load(Ordering::Acquire) != MAPPING) {
             if state.load(Ordering::Acquire) == MAPPED {
                 {
-                    let bytes = gpu.staging.slice(..).get_mapped_range();
+                    let bytes = gpu.staging.slice(..).get_mapped_range().unwrap();
                     let w: &[u32] = bytemuck::cast_slice(&bytes);
                     self.stats = Some(RtGiStats { rays: w[0], hits: w[1], cost: w[3], max_cost: w[4], shadow_rays: w[5] });
                 }

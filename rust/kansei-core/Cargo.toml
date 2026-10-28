@@ -14,8 +14,8 @@ gltf = { workspace = true }
 # Basis Universal transcoder (pure Rust, Apache-2.0); only loaders/ktx2/basis.rs uses it
 basisu = { workspace = true }
 optimesh = { workspace = true }
-egui = { version = "0.31", optional = true }
-egui-wgpu = { version = "0.31", optional = true }
+egui = { version = "0.37", optional = true }
+egui-wgpu = { version = "0.37", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 web-sys = { version = "0.3", features = [
@@ -24,9 +24,14 @@ web-sys = { version = "0.3", features = [
 ] }
 wasm-bindgen = "0.2"
 
+# DXC built in (wgpu's static-dxc, wherever wgpu offers it), so DX12 never compiles with FXC:
+# FXC works 20 minutes on the path tracer's trace shader, then fails (X4505)
+[target.'cfg(all(windows, target_env = "msvc", not(target_arch = "aarch64")))'.dependencies]
+wgpu = { workspace = true, features = ["static-dxc"] }
+
 [dev-dependencies]
-# validates the WGSL modules in unit tests (same naga as wgpu 24)
-naga = { version = "24", features = ["wgsl-in"] }
+# validates the WGSL modules in unit tests (same naga as wgpu 30)
+naga = { version = "30", features = ["wgsl-in"] }
 # headless GPU tests (skipped when there is no adapter)
 pollster = { workspace = true }
 

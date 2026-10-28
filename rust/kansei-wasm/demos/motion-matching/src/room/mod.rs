@@ -216,6 +216,7 @@ fn build_effects(renderer: &Renderer, surface: Option<FluidSurfaceEffect>, sky: 
     // the skylight is the first spot light: its emitter is the opening (the rectangle's width lies
     // along z for a light pointing down, `set_rect_emitter`'s axes)
     shadows.set_rect_emitter(0, rect_z, rect_x);
+    let visibility = shadows.visibility();
     effects.push(Box::new(Switch { effect: shadows, on: true }));
     let mut hybrid = RtDiffuseGiEffect::with_volume(scene_gi.volume(), grid.handle(), RtDiffuseGiOptions { max_distance: 60.0, ambient: 0.0, ..Default::default() });
     hybrid.set_spot_lights(Some(renderer.spot_lights_buffer()), renderer.spot_shadow_atlas());
@@ -234,13 +235,14 @@ fn build_effects(renderer: &Renderer, surface: Option<FluidSurfaceEffect>, sky: 
     let mut ssgi = ScreenSpaceGIEffect::new(near);
     ssgi.set_sky_lighting(Some(sky));
     effects.push(Box::new(ssgi));
-    // the dragon's and the water's caustics, over the floor round them (the glb's caustics area),
-    // 3 cm texels; the skylight emits from its opening
-    let (lo, hi) = layout.caustics;
-    let mut caustics = RtCausticsEffect::new(renderer.device(), grid.handle(), RtCausticsOptions { min: lo, max: hi, texel: 0.03, ..Default::default() });
+    // the dragon's and the water's caustics: a tile round each (their boxes, `set_casters`), the
+    // photons weighed by the shadows' visibility; the skylight emits from its opening; the tiles
+    // reach 1.2 m under the casters (from the water's surface to the tank's bed and the floor
+    // round its stand: further, the skylight's slant through the tank spreads its tile over the
+    // room, too coarse for the ripples' lines)
+    let mut caustics = RtCausticsEffect::new(renderer.device(), grid.handle(), RtCausticsOptions { reach: 1.2, ..Default::default() });
     caustics.set_rect_emitter(0, rect_z, rect_x);
-    let (map, lookup) = caustics.map();
-    let caustics_map = (map.clone(), lookup.clone());
+    caustics.set_visibility(Some(visibility));
     effects.push(Box::new(Switch { effect: caustics, on: true }));
     // the mirrors, the floor and the dragon's glass
     let mut reflections = RtReflectionsEffect::with_volume(scene_gi.volume(), grid.handle(), RtReflectionsOptions { resolution: RtTraceResolution::Half, max_distance: 60.0, ..Default::default() });
@@ -249,7 +251,6 @@ fn build_effects(renderer: &Renderer, surface: Option<FluidSurfaceEffect>, sky: 
     // (the glass's reflections traced with the floor's and the mirrors', at their resolution: the
     // water can fill much of the screen)
     reflections.set_glass(Some(RtGlass { reflections_in_trace: true, ..Default::default() }));
-    reflections.set_caustics(Some((&caustics_map.0, &caustics_map.1)));
     reflections.set_sky_lighting(Some(sky));
     effects.push(Box::new(Switch { effect: reflections, on: true }));
     // a faint, even haze filling the room (a box volume; none outside), lit by the sun through the
@@ -415,11 +416,12 @@ impl RoomState {
             dust.update(&self.renderer, &mut self.scene, eye, &capsules, dt, height, lens);
         }
         // the water's glass (its ripples) and its copy in the grid
-        let mut water = None;
+        // (whether the water throws caustics)
+        let mut water = false;
         if let Some(aquarium) = &mut self.aquarium {
             if let Some(surface) = self.volume.effect_mut::<FluidSurfaceEffect>() {
                 aquarium.update_surface(&mut self.scene, self.renderer.queue(), surface, self.time);
-                water = aquarium.caustic_water(surface);
+                water = aquarium.casts_caustics(surface);
             }
         }
         let RoomState { scene, volume, .. } = self;
@@ -444,21 +446,38 @@ impl RoomState {
         if let Some(e) = volume.effect_mut::<Switch<RtCausticsEffect>>() {
             let x = &mut e.effect;
             x.update_lights(lights.iter().copied());
-            x.set_time(self.time);
+            x.time = self.time;
+            x.ripples = self.aquarium.as_ref().map_or(0.0, Aquarium::ripples);
             let water_box = self.aquarium.as_ref().map(Aquarium::water_box);
+            // (the water's photons refract at its copy in the grid, glass)
             let mut casters: Vec<(GVec3, GVec3)> = self.dragon_box.into_iter().collect();
-            if let (Some(b), true) = (water_box, water.is_some() && x.water_photons) {
+            if let (Some(b), true) = (water_box, water) {
+                // (its photons bend at the glass material's ripples too, which move whether the
+                // water does or not: its tile never settles, blending the last eight feeds)
+                x.set_rippled(casters.len(), true);
+                x.set_changing(casters.len(), Some(1));
+                // (the tank's panes aren't in the grid: the light the surface would take from
+                // the floor beyond it comes in through them, so it only adds what it focuses)
+                x.set_add_only(casters.len(), true);
                 casters.push(b);
             }
             x.set_casters(&casters);
-            x.set_water(water);
-            // fed every `caustics_every` frames, four times as seldom with the tank and the dragon
-            // out of view (the mirrors may still show them)
+            // fed every `caustics_every` frames while they accumulate, four times as seldom with
+            // the tank and the dragon out of view (the mirrors may still show them)
             let boxes: Vec<(GVec3, GVec3)> = water_box.into_iter().chain(self.dragon_box).collect();
             let (lo, hi) = boxes.iter().fold((GVec3::splat(f32::MAX), GVec3::splat(f32::MIN)), |(lo, hi), (a, b)| (lo.min(*a), hi.max(*b)));
             let seen = kansei_core::culling::aabb_in_frustum(&kansei_core::culling::frustum_planes(view_proj), lo, hi);
             let every = self.settings.caustics_every.round().clamp(1.0, 16.0) as u32;
             x.interval = if seen { every } else { every * 4 };
+        }
+        // (the map grows, a new texture, when casters or lights are added: the reflections read it
+        // anew each frame)
+        let map = volume.effect::<Switch<RtCausticsEffect>>().map(|e| {
+            let (view, lookup) = e.effect.map();
+            (view.clone(), lookup.clone())
+        });
+        if let (Some((view, lookup)), Some(e)) = (map, volume.effect_mut::<Switch<RtReflectionsEffect>>()) {
+            e.effect.set_caustics(Some((&view, &lookup)));
         }
         drop(world_scope);
 
@@ -750,11 +769,8 @@ impl RoomState {
         if let Some(e) = self.volume.effect_mut::<Switch<RtCausticsEffect>>() {
             // (off, the reflections' and the water's lookups of it too)
             e.effect.set_enabled(self.renderer.queue(), s.caustics);
-            e.effect.photons = s.caustics_photons.round().clamp(8.0, 1024.0) as u32;
-            e.effect.blend = s.caustics_blend.clamp(0.01, 1.0);
             e.effect.intensity = s.caustics_intensity.max(0.0);
             e.effect.view = if s.caustics_view { RtCausticsView::Caustics } else { RtCausticsView::Lit };
-            e.effect.water_photons = s.caustics_water_photons;
             e.effect.area_emitters = s.caustics_area;
             e.effect.focus_gain = s.caustics_glass_gain.max(0.0);
             e.effect.focus_sharpen = s.caustics_sharpen.clamp(0.1, 1.0);
@@ -880,7 +896,7 @@ impl RoomState {
         let cpu: Vec<String> = self.stats.as_ref().map_or(Vec::new(), |s| s.cpu.iter().map(|(l, ms)| format!("[\"{l}\",{ms:.3}]")).collect());
         let grid = self.renderer.rt_grid().map(|g| g.stats());
         format!(
-            "{{\"settings\":{},\"camera\":\"{}\",\"character\":{},\"room_triangles\":{{{}}},\"aquarium\":{},\"fluid\":{},\"proxy_triangles\":{:?},\"grid_triangles\":{},\"grid_rebuilds\":{},\"dragon\":{},\"caustics\":[{},{}],\"size\":[{},{}],\"frame_ms\":{:.2},\"gpu_ms\":{:.3},\"gpu_span_ms\":{:.3},\"passes\":[{}],\"cpu\":[{}]}}",
+            "{{\"settings\":{},\"camera\":\"{}\",\"character\":{},\"room_triangles\":{{{}}},\"aquarium\":{},\"fluid\":{},\"proxy_triangles\":{:?},\"grid_triangles\":{},\"grid_rebuilds\":{},\"dragon\":{},\"caustics\":[{},{}],\"caustic_tiles\":[{}],\"size\":[{},{}],\"frame_ms\":{:.2},\"gpu_ms\":{:.3},\"gpu_span_ms\":{:.3},\"passes\":[{}],\"cpu\":[{}]}}",
             self.settings.json(),
             self.view_name().unwrap_or("follow"),
             self.player.character.is_some(),
@@ -900,6 +916,13 @@ impl RoomState {
             }),
             self.volume.effect::<Switch<RtCausticsEffect>>().map_or(0, |e| e.effect.photons_sent().0),
             self.volume.effect::<Switch<RtCausticsEffect>>().map_or(0, |e| e.effect.photons_sent().1),
+            // each caster's tile: its corner, texel (m), texels and frames of photons
+            self.volume.effect::<Switch<RtCausticsEffect>>().map_or(String::new(), |e| {
+                (0..2)
+                    .map(|k| e.effect.tile(k).map_or("null".into(), |(min, texel, dims, history)| format!("{{\"min\":[{:.2},{:.2}],\"texel\":{texel:.4},\"dims\":[{},{}],\"history\":{history}}}", min[0], min[1], dims[0], dims[1])))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            }),
             self.renderer.width(),
             self.renderer.height(),
             self.stats.as_ref().map_or(0.0, |s| s.frame_ms),

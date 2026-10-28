@@ -120,6 +120,12 @@ impl SceneVoxelGi {
         self.sky_source = sky_lighting.clone();
     }
 
+    /// Back to the gradient's sky (`set_sky_gradient`) after `use_sky_lighting`.
+    pub fn reset_sky_lighting(&mut self) {
+        let sky = self.sky.clone();
+        self.use_sky_lighting(&sky);
+    }
+
     /// Bytes on the GPU: the radiance with its mips (and anisotropic chains), the surface
     /// buffers, the distance field and the probes.
     pub fn memory_bytes(&self) -> u64 {

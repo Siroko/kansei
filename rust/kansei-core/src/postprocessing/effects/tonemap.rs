@@ -588,8 +588,8 @@ impl ToneMapEffect {
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("ToneMap/Layout"),
-            bind_group_layouts: &[&bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("ToneMap/Pipeline"),
@@ -795,8 +795,8 @@ mod tests {
     #[ignore]
     fn time_local_exposure() {
         let instance = wgpu::Instance::default();
-        let Some(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
-        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default(), None)).unwrap();
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
         let (w, h) = (1920u32, 1080u32);
         let texture = |format, usage| device.create_texture(&wgpu::TextureDescriptor { label: None, size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format, usage, view_formats: &[] });
         let input = texture(wgpu::TextureFormat::Rgba16Float, wgpu::TextureUsages::TEXTURE_BINDING).create_view(&Default::default());
@@ -812,7 +812,7 @@ mod tests {
             }
             let t = std::time::Instant::now();
             queue.submit([e.finish()]);
-            device.poll(wgpu::Maintain::Wait);
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
             t.elapsed().as_secs_f64() * 1e3 / 10.0
         };
         let mut times = [Vec::new(), Vec::new()];
@@ -838,8 +838,8 @@ mod tests {
     #[test]
     fn local_exposure_follows_unreal_s() {
         let instance = wgpu::Instance::default();
-        let Some(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
-        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default(), None)).unwrap();
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
         let (w, h) = (256u32, 128u32);
         // exposure 1: exposed light is scene light; the inputs as the half floats they are stored as
         let (sky, ground) = (f16_to_f32(f32_to_f16(0.18 * 4.0)), f16_to_f32(f32_to_f16(0.18 / 16.0)));
@@ -871,8 +871,8 @@ mod tests {
             );
             queue.submit([e.finish()]);
             buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-            device.poll(wgpu::Maintain::Wait);
-            let data = buf.slice(..).get_mapped_range();
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            let data = buf.slice(..).get_mapped_range().unwrap();
             // the green channel of each pixel
             bytemuck::cast_slice::<u8, u16>(&data).chunks(4).map(|px| f16_to_f32(px[1])).collect()
         };
@@ -984,8 +984,8 @@ mod tests {
     #[test]
     fn vignette_is_unreal_s() {
         let instance = wgpu::Instance::default();
-        let Some(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
-        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default(), None)).unwrap();
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
         // Unreal: the frame's viewport position in [-1, 1], height / width a
         let unreal = |x: f32, y: f32, a: f32, intensity: f32| {
             let scale = 2f32.sqrt() / (1.0 + a * a).sqrt();
@@ -1020,8 +1020,8 @@ mod tests {
             );
             queue.submit([e.finish()]);
             buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-            device.poll(wgpu::Maintain::Wait);
-            let data = buf.slice(..).get_mapped_range();
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            let data = buf.slice(..).get_mapped_range().unwrap();
             let px: &[u16] = bytemuck::cast_slice(&data);
             let frame_aspect = frame.unwrap_or(w as f32 / h as f32);
             let band = frame_aspect / (w as f32 / h as f32);
@@ -1080,8 +1080,8 @@ mod tests {
     #[test]
     fn unreal_filmic_matches_unreal_s_lut() {
         let instance = wgpu::Instance::default();
-        let Some(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
-        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default(), None)).unwrap();
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
         let inputs: [[f32; 3]; 10] = [
             [0.005; 3], [0.02; 3], [0.1; 3], [0.18; 3], [1.0; 3], [4.0; 3],
             [0.0, 0.0, 0.3], [0.3, 0.05, 0.02], [0.05, 0.2, 0.08], [2.0, 1.0, 0.3],
@@ -1146,8 +1146,8 @@ mod tests {
             );
             queue.submit([e.finish()]);
             buf.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-            device.poll(wgpu::Maintain::Wait);
-            let data = buf.slice(..).get_mapped_range();
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            let data = buf.slice(..).get_mapped_range().unwrap();
             let px: Vec<u16> = bytemuck::cast_slice(&data[..(w * 8) as usize]).to_vec();
             for (i, (input, want)) in inputs.iter().zip(want).enumerate() {
                 let got = [f16_to_f32(px[i * 4]), f16_to_f32(px[i * 4 + 1]), f16_to_f32(px[i * 4 + 2])];

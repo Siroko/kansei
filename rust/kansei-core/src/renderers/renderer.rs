@@ -66,6 +66,7 @@ impl Default for RendererConfig {
 /// was nothing to record.
 struct SceneBundles {
     opaque: Option<wgpu::RenderBundle>,
+    transmissive: Option<wgpu::RenderBundle>,
     transparent: Option<wgpu::RenderBundle>,
     late: Option<wgpu::RenderBundle>,
     /// The renderables recorded (`bundle_key`), and those culled in two phases; the bundles are
@@ -79,6 +80,9 @@ enum DrawSet {
     /// The opaque renderables: with occlusion culling, the first phase, whose depth the pyramid is
     /// built from.
     Opaque,
+    /// The transmissive renderables (`MaterialOptions::transmissive`), drawn after the GBuffer's
+    /// background copy (both phases' instances).
+    Transmissive,
     /// The transparent renderables (both phases' instances); they do not occlude.
     Transparent,
     /// Occlusion's second phase: the instances it found visible of the opaque renderables culled
@@ -89,9 +93,10 @@ enum DrawSet {
 impl DrawSet {
     fn includes(self, r: &crate::objects::Renderable) -> bool {
         match self {
-            DrawSet::Opaque => !r.is_transparent(),
+            DrawSet::Opaque => !r.is_transparent() && !r.is_transmissive(),
+            DrawSet::Transmissive => r.is_transmissive(),
             DrawSet::Transparent => r.is_transparent(),
-            DrawSet::Late => !r.is_transparent() && r.instance_culling.as_ref().is_some_and(|c| c.two_phase_in(MAIN_VIEW)),
+            DrawSet::Late => !r.is_transparent() && !r.is_transmissive() && r.instance_culling.as_ref().is_some_and(|c| c.two_phase_in(MAIN_VIEW)),
         }
     }
 
@@ -112,6 +117,7 @@ pub struct Renderer {
     pub config: RendererConfig,
     device: Option<wgpu::Device>,
     queue: Option<wgpu::Queue>,
+    adapter_info: Option<wgpu::AdapterInfo>,
     surface: Option<wgpu::Surface<'static>>,
     surface_config: Option<wgpu::SurfaceConfiguration>,
     presentation_format: wgpu::TextureFormat,
@@ -198,6 +204,29 @@ pub struct Renderer {
     // Voxel GI of an open scene's meshes, in a clipmap round the camera (`enable_voxel_clipmap`)
     voxel_clipmap: Option<crate::gi::SceneVoxelClipmap>,
     rt_grid: Option<crate::rt::SceneRtGrid>,
+    // The sky the voxel GI sees past its volume and clipmap (`set_environment`)
+    environment: Option<crate::environment::EnvironmentLighting>,
+}
+
+/// wgpu's environment variables with DX12 on DXC unless `WGPU_DX12_COMPILER` says otherwise.
+/// wgpu's own default (`auto`) falls back to FXC without a word when it finds no DXC, and FXC
+/// works 20 minutes on the path tracer's trace shader before failing (X4505); DXC takes 23 s.
+#[cfg(not(target_arch = "wasm32"))]
+fn native_instance_descriptor() -> wgpu::InstanceDescriptor {
+    let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
+    let compiler = &mut descriptor.backend_options.dx12.shader_compiler;
+    match wgpu::Dx12Compiler::from_env() {
+        None if cfg!(all(windows, target_env = "msvc", not(target_arch = "aarch64"))) => {
+            *compiler = wgpu::Dx12Compiler::StaticDxc;
+        }
+        None => *compiler = wgpu::Dx12Compiler::default_dynamic_dxc(),
+        Some(wgpu::Dx12Compiler::Fxc) if cfg!(windows) => log::warn!(
+            "WGPU_DX12_COMPILER=fxc: DX12 compiles with FXC, which can take many minutes on large \
+             shaders and fails on the path tracer's (X4505)"
+        ),
+        Some(_) => {}
+    }
+    descriptor
 }
 
 impl Renderer {
@@ -206,6 +235,7 @@ impl Renderer {
             config,
             device: None,
             queue: None,
+            adapter_info: None,
             surface: None,
             surface_config: None,
             presentation_format: wgpu::TextureFormat::Bgra8Unorm,
@@ -268,6 +298,7 @@ impl Renderer {
             voxel_gi: None,
             voxel_clipmap: None,
             rt_grid: None,
+            environment: None,
         }
     }
 
@@ -304,22 +335,37 @@ impl Renderer {
     ///
     /// Native: `renderer.initialize_with_target(window.clone()).await`
     /// WASM: `renderer.initialize_with_canvas(canvas).await`
+    ///
+    /// Natively it honours wgpu's environment variables: `WGPU_BACKEND` (for example `dx12`,
+    /// `vulkan`, `metal`, `gl`), `WGPU_DX12_COMPILER` (`fxc`, `dxc`, `staticdxc`, `auto`),
+    /// `WGPU_ADAPTER_NAME` and `WGPU_POWER_PREF`; unset, every backend, the default adapter and
+    /// DX12 on DXC: the one built into kansei-core on Windows MSVC x64, elsewhere `dxcompiler.dll`
+    /// beside the executable or on the PATH, without which DX12 is left out (logged as an error)
+    /// rather than falling back to FXC. [`Renderer::adapter_info`] says which adapter it chose.
     pub async fn initialize_with_target(&mut self, target: impl Into<wgpu::SurfaceTarget<'static>>) {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            #[cfg(target_arch = "wasm32")]
+        #[cfg(target_arch = "wasm32")]
+        let descriptor = wgpu::InstanceDescriptor {
             backends: wgpu::Backends::BROWSER_WEBGPU,
-            #[cfg(not(target_arch = "wasm32"))]
-            backends: wgpu::Backends::all(),
-            ..Default::default()
-        });
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let descriptor = native_instance_descriptor();
+        #[cfg(windows)]
+        let dynamic_dxc = descriptor.backends.contains(wgpu::Backends::DX12)
+            && matches!(descriptor.backend_options.dx12.shader_compiler, wgpu::Dx12Compiler::DynamicDxc { .. });
+        let instance = wgpu::Instance::new(descriptor);
+        // wgpu drops a backend that fails to start with only a debug log
+        #[cfg(windows)]
+        if dynamic_dxc && instance.enumerate_adapters(wgpu::Backends::DX12).await.is_empty() {
+            log::error!(
+                "DX12 is unavailable: no adapter, most likely because dxcompiler.dll did not load \
+                 (put it beside the executable, or set WGPU_DX12_COMPILER=fxc to accept FXC)"
+            );
+        }
         let surface = instance
             .create_surface(target)
             .expect("Failed to create surface");
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                compatible_surface: Some(&surface),
-                ..Default::default()
-            })
+        let adapter = wgpu::util::initialize_adapter_from_env_or_default(&instance, Some(&surface))
             .await
             .expect("No suitable GPU adapter found");
         self.initialize(surface, &adapter).await;
@@ -331,6 +377,7 @@ impl Renderer {
     /// creation automatically.
     #[doc(hidden)]
     pub async fn initialize(&mut self, surface: wgpu::Surface<'static>, adapter: &wgpu::Adapter) {
+        self.adapter_info = Some(adapter.get_info());
         let (device, queue) = self.request_device(adapter).await;
         let surface_caps = surface.get_capabilities(adapter);
         let format = surface_caps.formats.iter()
@@ -359,6 +406,7 @@ impl Renderer {
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
+            color_space: wgpu::SurfaceColorSpace::Auto,
         };
         surface.configure(&device, &surface_config);
 
@@ -372,24 +420,45 @@ impl Renderer {
     /// tests. `render` and `render_with_postprocessing` need a surface.
     #[doc(hidden)]
     pub async fn initialize_headless(&mut self, adapter: &wgpu::Adapter) {
+        self.adapter_info = Some(adapter.get_info());
         let (device, queue) = self.request_device(adapter).await;
         self.presentation_format = wgpu::TextureFormat::Rgba8UnormSrgb;
         self.initialize_resources(device, queue);
     }
 
     async fn request_device(&self, adapter: &wgpu::Adapter) -> (wgpu::Device, wgpu::Queue) {
+        let info = adapter.get_info();
+        log::info!("adapter: {} ({:?}, driver {} {})", info.name, info.backend, info.driver, info.driver_info);
         // Optional features: requested only where the adapter offers them, so devices without
         // them still initialize. TIMESTAMP_QUERY lets apps time GPU passes (perf HUDs); the
-        // texture compression features let KTX2 textures stay block-compressed on the GPU.
-        let optional_features =
-            adapter.features() & (wgpu::Features::TIMESTAMP_QUERY | crate::loaders::ktx2::CompressionSupport::FEATURES);
+        // texture compression features let KTX2 textures stay block-compressed on the GPU;
+        // EXPERIMENTAL_RAY_QUERY (native: Vulkan, Metal, DX12 with DXC) lets the ray tracing grid
+        // trace in hardware (`rt::RtBackend`).
+        let optional_features = adapter.features()
+            & (wgpu::Features::TIMESTAMP_QUERY | crate::loaders::ktx2::CompressionSupport::FEATURES | wgpu::Features::EXPERIMENTAL_RAY_QUERY);
+        let mut required_limits = self.config.required_limits.resolve(&adapter.limits());
+        let experimental_features = if optional_features.contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY) {
+            // the acceleration structures' limits are 0 unless raised
+            let a = adapter.limits();
+            required_limits.max_blas_primitive_count = a.max_blas_primitive_count;
+            required_limits.max_blas_geometry_count = a.max_blas_geometry_count;
+            required_limits.max_tlas_instance_count = a.max_tlas_instance_count;
+            required_limits.max_acceleration_structures_per_shader_stage = a.max_acceleration_structures_per_shader_stage;
+            // SAFETY: wgpu's ray queries are experimental (their API may change, and may have
+            // bugs); only the grid's hardware backend uses them, on the backends rt::RtBackend trusts
+            unsafe { wgpu::ExperimentalFeatures::enabled() }
+        } else {
+            wgpu::ExperimentalFeatures::disabled()
+        };
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("Kansei Device"),
                 required_features: wgpu::Features::FLOAT32_FILTERABLE | optional_features,
-                required_limits: self.config.required_limits.resolve(&adapter.limits()),
+                required_limits,
+                experimental_features,
                 memory_hints: wgpu::MemoryHints::default(),
-            }, None)
+                ..Default::default()
+            })
             .await
             .expect("Failed to create device");
         log::info!("texture compression: {:?}", crate::loaders::ktx2::CompressionSupport::of_device(&device));
@@ -818,6 +887,12 @@ impl Renderer {
         self.presentation_format
     }
 
+    /// The adapter the renderer runs on: its name, backend (Vulkan, DX12, Metal, BrowserWebGpu…),
+    /// device type and driver.
+    pub fn adapter_info(&self) -> &wgpu::AdapterInfo {
+        self.adapter_info.as_ref().expect("Renderer not initialized")
+    }
+
     pub fn surface(&self) -> Option<&wgpu::Surface<'static>> {
         self.surface.as_ref()
     }
@@ -1013,7 +1088,7 @@ impl Renderer {
     ) -> SceneBundles {
         let bundle = |set| self.build_render_bundle(scene, camera, color_formats, depth_format, sample_count, set);
         let late = if key.1.is_empty() { None } else { bundle(DrawSet::Late) };
-        SceneBundles { opaque: bundle(DrawSet::Opaque), transparent: bundle(DrawSet::Transparent), late, key }
+        SceneBundles { opaque: bundle(DrawSet::Opaque), transmissive: bundle(DrawSet::Transmissive), transparent: bundle(DrawSet::Transparent), late, key }
     }
 
     /// Pre-record the draws of the visible static renderables (`is_bundled`) of `set` into a
@@ -1182,6 +1257,7 @@ impl Renderer {
         for &set in sets {
             let bundle = match set {
                 DrawSet::Opaque => &bundles.opaque,
+                DrawSet::Transmissive => &bundles.transmissive,
                 DrawSet::Transparent => &bundles.transparent,
                 DrawSet::Late => &bundles.late,
             };
@@ -1324,8 +1400,8 @@ impl Renderer {
 
         let shadow_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Shadow/PipelineLayout"),
-            bind_group_layouts: &[&shadow_light_vp_bgl, &shared.camera_bgl, &shared.mesh_bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&shadow_light_vp_bgl), Some(&shared.camera_bgl), Some(&shared.mesh_bgl)],
+            immediate_size: 0,
         });
 
         let shadow_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -1339,7 +1415,7 @@ impl Renderer {
             vertex: wgpu::VertexState {
                 module: &shadow_shader,
                 entry_point: Some("shadow_vs"),
-                buffers: &[crate::geometries::Vertex::LAYOUT],
+                buffers: &[Some(crate::geometries::Vertex::LAYOUT)],
                 compilation_options: Default::default(),
             },
             fragment: None,
@@ -1350,13 +1426,13 @@ impl Renderer {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
             multisample: Default::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         }));
 
@@ -1621,11 +1697,46 @@ impl Renderer {
         log::info!("voxel GI: {:?}, {:?} voxels, {:.1} MiB", gi.quality(), gi.volume().dims(), gi.memory_bytes() as f64 / (1 << 20) as f64);
         self.voxel_gi = Some(gi);
         self.sync_voxel_gi_shadows();
+        self.sync_environment();
     }
 
     /// Turn voxel GI off and free its volume.
     pub fn disable_voxel_gi(&mut self) {
         self.voxel_gi = None;
+    }
+
+    /// The sky the scene's voxel GI (`enable_voxel_gi`'s volume and `enable_voxel_clipmap`'s
+    /// clipmap, now or enabled later) sees past them: an `environment::EnvironmentLighting` from a
+    /// `GradientEnvironment`, `SkyAtmosphere::lighting` or an `HdrEnvironment`, as
+    /// `SceneVoxelGi::use_sky_lighting` takes it; None: their own gradient again
+    /// (`set_sky_gradient`). Give the post-processing chain the same
+    /// (`PostProcessingVolume::set_environment`).
+    pub fn set_environment(&mut self, environment: Option<&crate::environment::EnvironmentLighting>) {
+        self.environment = environment.cloned();
+        self.sync_environment();
+        if environment.is_none() {
+            if let Some(gi) = &mut self.voxel_gi {
+                gi.reset_sky_lighting();
+            }
+            if let Some(gi) = &mut self.voxel_clipmap {
+                gi.reset_sky_lighting();
+            }
+        }
+    }
+
+    /// The environment `set_environment` gave.
+    pub fn environment(&self) -> Option<&crate::environment::EnvironmentLighting> {
+        self.environment.as_ref()
+    }
+
+    fn sync_environment(&mut self) {
+        let Some(environment) = &self.environment else { return };
+        if let Some(gi) = &mut self.voxel_gi {
+            gi.use_sky_lighting(&environment.sky_lighting);
+        }
+        if let Some(gi) = &mut self.voxel_clipmap {
+            gi.use_sky_lighting(&environment.sky_lighting);
+        }
     }
 
     pub fn voxel_gi(&self) -> Option<&crate::gi::SceneVoxelGi> {
@@ -1761,6 +1872,7 @@ impl Renderer {
         );
         self.voxel_clipmap = Some(gi);
         self.sync_voxel_gi_shadows();
+        self.sync_environment();
     }
 
     /// Turn the voxel clipmap off and free it.
@@ -2086,6 +2198,7 @@ impl Renderer {
         let mut attachments: [Option<wgpu::RenderPassColorAttachment>; GBuffer::VELOCITY_TARGET + 1] = Default::default();
         attachments[GBuffer::VELOCITY_TARGET] = Some(wgpu::RenderPassColorAttachment {
             view: &gbuffer.velocity_view,
+            depth_slice: None,
             resolve_target: None,
             ops: wgpu::Operations {
                 load: wgpu::LoadOp::Clear(wgpu::Color { r: no_velocity, g: no_velocity, b: 0.0, a: 0.0 }),
@@ -2695,6 +2808,7 @@ impl Renderer {
                     label: Some("CubemapShadow"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: &color_view,
+                        depth_slice: None,
                         resolve_target: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -2991,7 +3105,7 @@ impl Renderer {
 
         // Phase 2+3: Create render pass and execute bundle
         let surface = self.surface.as_ref().unwrap();
-        let output = surface.get_current_texture().expect("Failed to get surface texture");
+        let output = surface_texture(surface).expect("Failed to get surface texture");
         let canvas_view = output.texture.create_view(&Default::default());
 
         let device = self.device.as_ref().unwrap();
@@ -3013,6 +3127,7 @@ impl Renderer {
                 label: Some("Renderer/MainPass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: color_view,
+                    depth_slice: None,
                     resolve_target: resolve,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -3035,7 +3150,7 @@ impl Renderer {
             // Static renderables from the bundles, dynamic ones drawn live
             self.draw_scene_renderables(
                 &mut pass, self.render_bundle.as_ref().unwrap(), scene, camera,
-                &[format], depth_format, sample_count, &[DrawSet::Opaque, DrawSet::Transparent],
+                &[format], depth_format, sample_count, &[DrawSet::Opaque, DrawSet::Transmissive, DrawSet::Transparent],
             );
 
             // Draw GPU-driven indirect renderables in the same pass
@@ -3048,7 +3163,7 @@ impl Renderer {
         }
 
         self.queue.as_ref().unwrap().submit(std::iter::once(encoder.finish()));
-        output.present();
+        self.queue.as_ref().unwrap().present(output);
         camera.end_frame();
         crate::profiling::end_frame(self.device.as_ref().unwrap(), self.queue.as_ref().unwrap());
     }
@@ -3061,10 +3176,10 @@ impl Renderer {
         let (width, height) = (self.config.width, self.config.height);
         volume.ensure_gbuffer(width, height);
         let surface = self.surface.as_ref().unwrap();
-        let output = surface.get_current_texture().expect("Surface texture");
+        let output = surface_texture(surface).expect("Surface texture");
         let canvas_view = output.texture.create_view(&Default::default());
         volume.render_from(Some(input), camera, &canvas_view, width, height);
-        output.present();
+        self.queue.as_ref().unwrap().present(output);
         crate::profiling::end_frame(self.device.as_ref().unwrap(), self.queue.as_ref().unwrap());
     }
 
@@ -3099,15 +3214,20 @@ impl Renderer {
         // Get surface texture for blit
         let t = crate::profiling::cpu_scope("frame/surface");
         let surface = self.surface.as_ref().unwrap();
-        let output = surface.get_current_texture().expect("Surface texture");
+        let output = surface_texture(surface).expect("Surface texture");
         let canvas_view = output.texture.create_view(&Default::default());
         drop(t);
+
+        // the ray tracing grid ready for the effects' traces (the hardware backend's TLAS)
+        if let Some(rt) = &self.rt_grid {
+            rt.grid().prepare_trace(self.device.as_ref().unwrap(), self.queue.as_ref().unwrap());
+        }
 
         // Run post-processing chain + blit
         volume.render(camera, &canvas_view, width, height);
 
         let t = crate::profiling::cpu_scope("frame/present");
-        output.present();
+        self.queue.as_ref().unwrap().present(output);
         drop(t);
         camera.end_frame();
         crate::profiling::end_frame(self.device.as_ref().unwrap(), self.queue.as_ref().unwrap());
@@ -3337,25 +3457,28 @@ impl Renderer {
         let clear = wgpu::Color { r: cc.x as f64, g: cc.y as f64, b: cc.z as f64, a: cc.w as f64 };
         let black = wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 };
 
+        // the transmissive renderables split the pass: they draw after the background copy
+        let transmissive = scene.ordered_indices().filter_map(|i| scene.get_renderable(i)).any(|r| r.visible && r.geometry.initialized && r.is_transmissive());
+
         // Pass 1: Opaque objects (render bundle)
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Renderer/GBufferOpaquePass"),
                 color_attachments: &[
                     Some(wgpu::RenderPassColorAttachment {
-                        view: &gbuffer.color_view, resolve_target: None,
+                        view: &gbuffer.color_view, depth_slice: None, resolve_target: None,
                         ops: wgpu::Operations { load: wgpu::LoadOp::Clear(clear), store: wgpu::StoreOp::Store },
                     }),
                     Some(wgpu::RenderPassColorAttachment {
-                        view: &gbuffer.emissive_view, resolve_target: None,
+                        view: &gbuffer.emissive_view, depth_slice: None, resolve_target: None,
                         ops: wgpu::Operations { load: wgpu::LoadOp::Clear(black), store: wgpu::StoreOp::Store },
                     }),
                     Some(wgpu::RenderPassColorAttachment {
-                        view: &gbuffer.normal_view, resolve_target: None,
+                        view: &gbuffer.normal_view, depth_slice: None, resolve_target: None,
                         ops: wgpu::Operations { load: wgpu::LoadOp::Clear(black), store: wgpu::StoreOp::Store },
                     }),
                     Some(wgpu::RenderPassColorAttachment {
-                        view: &gbuffer.albedo_view, resolve_target: None,
+                        view: &gbuffer.albedo_view, depth_slice: None, resolve_target: None,
                         ops: wgpu::Operations { load: wgpu::LoadOp::Clear(black), store: wgpu::StoreOp::Store },
                     }),
                 ],
@@ -3367,8 +3490,9 @@ impl Renderer {
                 timestamp_writes: crate::profiling::gpu_pass("Renderer/GBufferOpaquePass").as_ref().map(crate::profiling::PassStamp::render), ..Default::default()
             });
             // Static renderables from the bundles, dynamic ones drawn live; with occlusion culling,
-            // only the opaque ones (the first phase)
-            let sets: &[DrawSet] = if self.two_phase.is_empty() { &[DrawSet::Opaque, DrawSet::Transparent] } else { &[DrawSet::Opaque] };
+            // only the opaque ones (the first phase); with transmissive ones, the transparent ones
+            // after them (pass 2)
+            let sets: &[DrawSet] = if self.two_phase.is_empty() && !transmissive { &[DrawSet::Opaque, DrawSet::Transparent] } else { &[DrawSet::Opaque] };
             self.draw_scene_renderables(
                 &mut pass, self.gbuffer_bundle.as_ref().unwrap(), scene, camera,
                 &GBuffer::MRT_FORMATS, GBuffer::DEPTH_FORMAT, gbuffer.sample_count, sets,
@@ -3380,7 +3504,7 @@ impl Renderer {
         if !self.two_phase.is_empty() {
             self.run_late_culling(&mut encoder, scene, gbuffer);
             let load = wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store };
-            let attachment = |view| Some(wgpu::RenderPassColorAttachment { view, resolve_target: None, ops: load });
+            let attachment = |view| Some(wgpu::RenderPassColorAttachment { view, depth_slice: None, resolve_target: None, ops: load });
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Renderer/GBufferLatePass"),
                 color_attachments: &[
@@ -3398,7 +3522,7 @@ impl Renderer {
             });
             self.draw_scene_renderables(
                 &mut pass, self.gbuffer_bundle.as_ref().unwrap(), scene, camera,
-                &GBuffer::MRT_FORMATS, GBuffer::DEPTH_FORMAT, gbuffer.sample_count, &[DrawSet::Late, DrawSet::Transparent],
+                &GBuffer::MRT_FORMATS, GBuffer::DEPTH_FORMAT, gbuffer.sample_count, if transmissive { &[DrawSet::Late] } else { &[DrawSet::Late, DrawSet::Transparent] },
             );
         }
 
@@ -3417,28 +3541,29 @@ impl Renderer {
             );
         }
 
-        // Pass 2: Indirect/refractive objects (Load existing MRT + depth), when there are any (an
-        // empty pass would still load and store every target)
+        // Pass 2: Indirect/refractive objects (Load existing MRT + depth), the transmissive ones
+        // and then the transparent ones, when there are any (an empty pass would still load and
+        // store every target)
         let indirect = scene.ordered_indices().filter_map(|i| scene.get_renderable(i)).any(|r| r.visible && r.geometry.initialized && r.geometry.is_indirect());
-        if indirect {
+        if indirect || transmissive {
             let load = wgpu::LoadOp::Load;
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Renderer/GBufferIndirectPass"),
                 color_attachments: &[
                     Some(wgpu::RenderPassColorAttachment {
-                        view: &gbuffer.color_view, resolve_target: None,
+                        view: &gbuffer.color_view, depth_slice: None, resolve_target: None,
                         ops: wgpu::Operations { load, store: wgpu::StoreOp::Store },
                     }),
                     Some(wgpu::RenderPassColorAttachment {
-                        view: &gbuffer.emissive_view, resolve_target: None,
+                        view: &gbuffer.emissive_view, depth_slice: None, resolve_target: None,
                         ops: wgpu::Operations { load, store: wgpu::StoreOp::Store },
                     }),
                     Some(wgpu::RenderPassColorAttachment {
-                        view: &gbuffer.normal_view, resolve_target: None,
+                        view: &gbuffer.normal_view, depth_slice: None, resolve_target: None,
                         ops: wgpu::Operations { load, store: wgpu::StoreOp::Store },
                     }),
                     Some(wgpu::RenderPassColorAttachment {
-                        view: &gbuffer.albedo_view, resolve_target: None,
+                        view: &gbuffer.albedo_view, depth_slice: None, resolve_target: None,
                         ops: wgpu::Operations { load, store: wgpu::StoreOp::Store },
                     }),
                 ],
@@ -3449,6 +3574,12 @@ impl Renderer {
                 }),
                 timestamp_writes: crate::profiling::gpu_pass("Renderer/GBufferIndirectPass").as_ref().map(crate::profiling::PassStamp::render), ..Default::default()
             });
+            if transmissive {
+                self.draw_scene_renderables(
+                    &mut pass, self.gbuffer_bundle.as_ref().unwrap(), scene, camera,
+                    &GBuffer::MRT_FORMATS, GBuffer::DEPTH_FORMAT, gbuffer.sample_count, &[DrawSet::Transmissive, DrawSet::Transparent],
+                );
+            }
             self.draw_indirect_renderables(
                 &mut pass, scene, camera,
                 &GBuffer::MRT_FORMATS, GBuffer::DEPTH_FORMAT, sample_count,
@@ -3488,21 +3619,25 @@ impl Renderer {
                 color_attachments: &[
                     Some(wgpu::RenderPassColorAttachment {
                         view: gbuffer.color_msaa_view.as_ref().unwrap(),
+                        depth_slice: None,
                         resolve_target: Some(&gbuffer.color_view),
                         ops: wgpu::Operations { load: wgpu::LoadOp::Clear(clear), store: wgpu::StoreOp::Discard },
                     }),
                     Some(wgpu::RenderPassColorAttachment {
                         view: gbuffer.emissive_msaa_view.as_ref().unwrap(),
+                        depth_slice: None,
                         resolve_target: Some(&gbuffer.emissive_view),
                         ops: wgpu::Operations { load: wgpu::LoadOp::Clear(black), store: wgpu::StoreOp::Discard },
                     }),
                     Some(wgpu::RenderPassColorAttachment {
                         view: gbuffer.normal_msaa_view.as_ref().unwrap(),
+                        depth_slice: None,
                         resolve_target: Some(&gbuffer.normal_view),
                         ops: wgpu::Operations { load: wgpu::LoadOp::Clear(black), store: wgpu::StoreOp::Discard },
                     }),
                     Some(wgpu::RenderPassColorAttachment {
                         view: gbuffer.albedo_msaa_view.as_ref().unwrap(),
+                        depth_slice: None,
                         resolve_target: Some(&gbuffer.albedo_view),
                         ops: wgpu::Operations { load: wgpu::LoadOp::Clear(black), store: wgpu::StoreOp::Discard },
                     }),
@@ -3521,21 +3656,25 @@ impl Renderer {
                 color_attachments: &[
                     Some(wgpu::RenderPassColorAttachment {
                         view: &gbuffer.color_view,
+                        depth_slice: None,
                         resolve_target: None,
                         ops: wgpu::Operations { load: wgpu::LoadOp::Clear(clear), store: wgpu::StoreOp::Store },
                     }),
                     Some(wgpu::RenderPassColorAttachment {
                         view: &gbuffer.emissive_view,
+                        depth_slice: None,
                         resolve_target: None,
                         ops: wgpu::Operations { load: wgpu::LoadOp::Clear(black), store: wgpu::StoreOp::Store },
                     }),
                     Some(wgpu::RenderPassColorAttachment {
                         view: &gbuffer.normal_view,
+                        depth_slice: None,
                         resolve_target: None,
                         ops: wgpu::Operations { load: wgpu::LoadOp::Clear(black), store: wgpu::StoreOp::Store },
                     }),
                     Some(wgpu::RenderPassColorAttachment {
                         view: &gbuffer.albedo_view,
+                        depth_slice: None,
                         resolve_target: None,
                         ops: wgpu::Operations { load: wgpu::LoadOp::Clear(black), store: wgpu::StoreOp::Store },
                     }),
@@ -3583,10 +3722,10 @@ impl Renderer {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             tx.send(result).ok();
         });
-        device.poll(wgpu::Maintain::Wait);
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
         rx.recv().unwrap().unwrap();
 
-        let data = slice.get_mapped_range();
+        let data = slice.get_mapped_range().unwrap();
         let result: Vec<T> = bytemuck::cast_slice(&data).to_vec();
         drop(data);
         staging.unmap();
@@ -3614,7 +3753,7 @@ impl Renderer {
             }],
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: None, bind_group_layouts: &[&bgl], push_constant_ranges: &[],
+            label: None, bind_group_layouts: &[Some(&bgl)], immediate_size: 0,
         });
         self.depth_copy_pipeline = Some(device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("DepthCopy"),
@@ -3624,13 +3763,13 @@ impl Renderer {
             primitive: Default::default(),
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Always,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Always),
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
             multisample: Default::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         }));
         self.depth_copy_bgl = Some(bgl);
@@ -3828,7 +3967,7 @@ fn draw_reflection(
     let late = phase == ReflectionPhase::Late;
     let targets = reflection.color_attachments();
     let load = |cleared| if late { wgpu::LoadOp::Load } else { wgpu::LoadOp::Clear(cleared) };
-    let attachment = |view, cleared| Some(wgpu::RenderPassColorAttachment { view, resolve_target: None, ops: wgpu::Operations { load: load(cleared), store: wgpu::StoreOp::Store } });
+    let attachment = |view, cleared| Some(wgpu::RenderPassColorAttachment { view, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: load(cleared), store: wgpu::StoreOp::Store } });
     let black = wgpu::Color::TRANSPARENT;
     let label = if late { "Renderer/PlanarReflectionLatePass" } else { "Renderer/PlanarReflectionPass" };
     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -3974,13 +4113,21 @@ fn draw_caster<'a>(enc: &mut impl wgpu::util::RenderEncoder<'a>, r: &'a crate::o
     if std::ptr::eq(g, &r.geometry) {
         return draw_geometry(enc, r, view);
     }
-    enc.set_vertex_buffer(0, g.active_vertex_buffer().unwrap().slice(..));
+    enc.set_vertex_buffer(0, Some(g.active_vertex_buffer().unwrap().slice(..)));
     enc.set_index_buffer(g.active_index_buffer().unwrap().slice(..), wgpu::IndexFormat::Uint32);
     enc.draw_indexed(0..g.index_count(), 0, 0..1);
 }
 
 fn draw_geometry<'a>(enc: &mut impl wgpu::util::RenderEncoder<'a>, r: &'a crate::objects::Renderable, view: usize) {
     bind_and_draw(enc, r, r.instance_culling.as_ref().and_then(|c| c.view(view)));
+}
+
+/// The surface's next texture, suboptimal or not; `None` when it is outdated, lost, occluded or timed out.
+pub fn surface_texture(surface: &wgpu::Surface) -> Option<wgpu::SurfaceTexture> {
+    match surface.get_current_texture() {
+        wgpu::CurrentSurfaceTexture::Success(texture) | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => Some(texture),
+        _ => None,
+    }
 }
 
 /// Draw the second phase of a renderable culled in two phases in cull view `view` this frame
@@ -3992,14 +4139,14 @@ fn draw_late_geometry<'a>(enc: &mut impl wgpu::util::RenderEncoder<'a>, r: &'a c
 }
 
 fn bind_and_draw<'a>(enc: &mut impl wgpu::util::RenderEncoder<'a>, r: &'a crate::objects::Renderable, culled: Option<crate::culling::CulledDraw<'a>>) {
-    enc.set_vertex_buffer(0, r.geometry.active_vertex_buffer().unwrap().slice(..));
+    enc.set_vertex_buffer(0, Some(r.geometry.active_vertex_buffer().unwrap().slice(..)));
     for (i, cb) in r.geometry.instance_buffers.iter().enumerate() {
         let buffer = match culled {
             Some(draw) if i == 0 => Some((draw.instances, draw.instances_offset)),
             _ => cb.gpu_buffer().map(|b| (b, 0)),
         };
         if let Some((buffer, offset)) = buffer {
-            enc.set_vertex_buffer(i as u32 + 1, buffer.slice(offset..));
+            enc.set_vertex_buffer(i as u32 + 1, Some(buffer.slice(offset..)));
         }
     }
     enc.set_index_buffer(r.geometry.active_index_buffer().unwrap().slice(..), wgpu::IndexFormat::Uint32);

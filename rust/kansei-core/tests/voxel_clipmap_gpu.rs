@@ -21,7 +21,7 @@ const WORDS: usize = CLIP_SURFACE_WORDS as usize;
 
 fn renderer() -> Option<Renderer> {
     let instance = wgpu::Instance::default();
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?;
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
     let mut renderer = Renderer::new(RendererConfig { width: W, height: H, sample_count: 1, ..Default::default() });
     pollster::block_on(renderer.initialize_headless(&adapter));
     Some(renderer)
@@ -125,8 +125,8 @@ fn read_radiance(renderer: &Renderer, texture: &wgpu::Texture) -> Vec<[f32; 4]> 
     );
     queue.submit(Some(encoder.finish()));
     buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-    device.poll(wgpu::Maintain::Wait);
-    let bytes = buffer.slice(..).get_mapped_range();
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    let bytes = buffer.slice(..).get_mapped_range().unwrap();
     let mut out = Vec::with_capacity((w * h * d) as usize);
     for z in 0..d {
         for y in 0..h {
@@ -389,8 +389,8 @@ fn read_radiance_2d(renderer: &Renderer, texture: &wgpu::Texture) -> Vec<[f32; 4
     );
     queue.submit(Some(encoder.finish()));
     buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-    device.poll(wgpu::Maintain::Wait);
-    let bytes = buffer.slice(..).get_mapped_range();
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    let bytes = buffer.slice(..).get_mapped_range().unwrap();
     let mut out = Vec::with_capacity((size.width * size.height) as usize);
     for y in 0..size.height {
         for x in 0..size.width {

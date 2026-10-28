@@ -1,6 +1,6 @@
 // rt::RtShadowsEffect, the denoiser: `temporal` blends this frame's visibility with last frame's
 // where the surface was (reprojected by the velocity target, else by depth), its taps kept only on
-// the same surface (depth and normal); `atrous` is one step of an a-trous wavelet (a 3 x 3 B-spline
+// the same surface (depth and normal), held near this frame's rays round it; `atrous` is one step of an a-trous wavelet (a 3 x 3 B-spline
 // spread `stepWidth` texels apart) with depth and normal edge stops, more of it where the history
 // is short.
 
@@ -18,8 +18,33 @@
 @group(0) @binding(11) var outB : texture_storage_2d<rgba16float, write>;
 @group(0) @binding(12) var outGuide : texture_storage_2d<rgba32float, write>;
 
+// this frame's rays round a workgroup (its 8 x 8 texels and two each side): each light's, and 1
+// where a lit surface holds them
+var<workgroup> nearA : array<vec4f, 144>;
+var<workgroup> nearB : array<vec4f, 144>;
+var<workgroup> nearLit : array<f32, 144>;
+
 @compute @workgroup_size(8, 8)
-fn temporal(@builtin(global_invocation_id) id: vec3u) {
+fn temporal(@builtin(global_invocation_id) id: vec3u, @builtin(workgroup_id) group: vec3u, @builtin(local_invocation_index) index: u32) {
+    let corner = vec2i(group.xy * 8u) - 2;
+    let last = vec2i(sp.traceSize) - 1;
+    for (var k = index; k < 144u; k += 64u) {
+        let q = corner + vec2i(i32(k % 12u), i32(k / 12u));
+        var lit = 0.0;
+        var qa = vec4f(0.0);
+        var qb = vec4f(0.0);
+        if (all(q >= vec2i(0)) && all(q <= last) && textureLoad(curGuide, q, 0).z > 0.0) {
+            lit = 1.0;
+            qa = textureLoad(curA, q, 0);
+            if (sp.numLights > 4u) {
+                qb = textureLoad(curB, q, 0);
+            }
+        }
+        nearA[k] = qa;
+        nearB[k] = qb;
+        nearLit[k] = lit;
+    }
+    workgroupBarrier();
     let t = id.xy;
     if (any(vec2f(t) >= sp.traceSize)) { return; }
     let g = textureLoad(curGuide, t, 0);
@@ -51,7 +76,6 @@ fn temporal(@builtin(global_invocation_id) id: vec3u) {
         let tp = (prevUv * sp.fullSize - 0.5) / f32(sp.downscale);
         let t0 = vec2i(floor(tp));
         let f = tp - floor(tp);
-        let last = vec2i(sp.traceSize) - 1;
         for (var k = 0; k < 4; k++) {
             let o = vec2i(k & 1, k >> 1u);
             let q = t0 + o;
@@ -71,6 +95,34 @@ fn temporal(@builtin(global_invocation_id) id: vec3u) {
     if (wsum > 1e-3) {
         ha /= wsum;
         hb /= wsum;
+        // the history held near this frame's rays round the texel (5 x 5, each lit or not), so a
+        // caster that moves leaves no trail of its shadow: within their mean give or take their
+        // spread (sqrt(v (1 - v)), and 2 / n, where the rays all agree but the light may not be
+        // quite whole); a history moved by more than 0.1 starts over (more of the frame, and of
+        // the wavelet). A still penumbra's history lies within its rays' spread and is kept.
+        var sumA = vec4f(0.0);
+        var sumB = vec4f(0.0);
+        var n = 0.0;
+        let here = vec2i(t) - corner;
+        for (var k = 0; k < 25; k++) {
+            let q = here + vec2i(k % 5 - 2, k / 5 - 2);
+            let at = q.y * 12 + q.x;
+            sumA += nearA[at];
+            sumB += nearB[at];
+            n += nearLit[at];
+        }
+        let meanA = sumA / n;
+        let meanB = select(b, sumB / n, sp.numLights > 4u);
+        let boxA = sqrt(saturate(meanA * (1.0 - meanA))) + 2.0 / n;
+        let boxB = sqrt(saturate(meanB * (1.0 - meanB))) + 2.0 / n;
+        let heldA = clamp(ha, meanA - boxA, meanA + boxA);
+        let heldB = clamp(hb, meanB - boxB, meanB + boxB);
+        let da = abs(heldA - ha);
+        let db = abs(heldB - hb);
+        let moved = max(max(max(da.x, da.y), max(da.z, da.w)), max(max(db.x, db.y), max(db.z, db.w)));
+        len *= 1.0 - saturate((moved - 0.1) / 0.2);
+        ha = heldA;
+        hb = heldB;
         frames = min(len / wsum + 1.0, sp.maxHistory);
         let alpha = max(sp.temporalAlpha, 1.0 / frames);
         oa = mix(ha, a, alpha);

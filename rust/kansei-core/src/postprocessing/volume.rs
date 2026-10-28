@@ -11,6 +11,8 @@ use crate::renderers::GBuffer;
 /// the result to the surface.
 pub struct PostProcessingVolume {
     pub effects: Vec<Box<dyn PostProcessingEffect>>,
+    /// The effect types skipped (`set_enabled`).
+    disabled: Vec<std::any::TypeId>,
     gbuffer: Option<GBuffer>,
     /// GBuffers a resize replaced, and the frames until they are destroyed (after the frames in
     /// flight that drew with them): on the web a dropped texture's memory waits for the
@@ -56,6 +58,7 @@ impl PostProcessingVolume {
     ) -> Self {
         Self {
             effects,
+            disabled: Vec::new(),
             gbuffer: None,
             retired: Vec::new(),
             display_targets: None,
@@ -80,8 +83,39 @@ impl PostProcessingVolume {
         self.effects.iter_mut().find_map(|e| e.as_any_mut().downcast_mut::<T>())
     }
 
+    /// Light every effect of the chain by `environment` (`PostProcessingEffect::set_environment`):
+    /// the reflections' and the glass's misses, the GI's, the fog's sky, the background. Give the
+    /// renderer the same (`Renderer::set_environment`, the voxel GI's sky).
+    pub fn set_environment(&mut self, environment: &crate::environment::EnvironmentLighting) {
+        for effect in &mut self.effects {
+            effect.set_environment(environment);
+        }
+    }
+
     pub fn wants_jitter(&self) -> bool {
-        self.effects.iter().any(|e| e.is_active() && e.wants_jitter())
+        self.effects.iter().any(|e| self.runs(e.as_ref()) && e.wants_jitter())
+    }
+
+    /// Run the chain's effects of type `T` (the default) or skip them: a skipped effect costs
+    /// nothing, the next one reading what it would have read, and keeps its place, state and
+    /// resources for when it runs again (reset a temporal one's history then). A toggle for any
+    /// effect, beside the ones whose `is_active` follows their own settings.
+    pub fn set_enabled<T: PostProcessingEffect + 'static>(&mut self, on: bool) {
+        let id = std::any::TypeId::of::<T>();
+        self.disabled.retain(|d| *d != id);
+        if !on {
+            self.disabled.push(id);
+        }
+    }
+
+    /// Whether the effects of type `T` run (`set_enabled`).
+    pub fn is_enabled<T: PostProcessingEffect + 'static>(&self) -> bool {
+        !self.disabled.contains(&std::any::TypeId::of::<T>())
+    }
+
+    /// Whether `effect` runs this frame: active, and its type not skipped.
+    fn runs(&self, effect: &dyn PostProcessingEffect) -> bool {
+        runs(&self.disabled, effect)
     }
 
     pub fn gbuffer(&self) -> Option<&GBuffer> {
@@ -146,8 +180,8 @@ impl PostProcessingVolume {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Blit PipelineLayout"),
-            bind_group_layouts: &[&bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
         });
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -175,7 +209,7 @@ impl PostProcessingVolume {
             },
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -254,7 +288,7 @@ impl PostProcessingVolume {
             (gbuffer.width, gbuffer.height)
         };
         let display_size = (width, height);
-        let upscaling = render_size != display_size && self.effects.iter().any(|e| e.is_active() && e.upscales_to_display());
+        let upscaling = render_size != display_size && self.effects.iter().any(|e| self.runs(e.as_ref()) && e.upscales_to_display());
         if upscaling {
             self.ensure_display_targets(display_size);
         }
@@ -286,7 +320,7 @@ impl PostProcessingVolume {
             });
 
             for effect in &mut self.effects {
-                if !effect.is_active() {
+                if !runs(&self.disabled, effect.as_ref()) {
                     continue;
                 }
                 let at_display = matches!(source, Slot::Display(_)) || (upscaling && effect.upscales_to_display());
@@ -350,6 +384,7 @@ impl PostProcessingVolume {
                 label: Some("Blit RenderPass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: surface_view,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -359,6 +394,7 @@ impl PostProcessingVolume {
                 depth_stencil_attachment: None,
                 timestamp_writes: crate::profiling::gpu_pass("Blit RenderPass").as_ref().map(crate::profiling::PassStamp::render),
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
 
             rpass.set_pipeline(pipeline);
@@ -367,5 +403,45 @@ impl PostProcessingVolume {
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
+    }
+}
+
+/// Whether `effect` runs: active, and its type not among `disabled`.
+fn runs(disabled: &[std::any::TypeId], effect: &dyn PostProcessingEffect) -> bool {
+    effect.is_active() && !disabled.contains(&effect.as_any().type_id())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Probe(bool);
+
+    impl PostProcessingEffect for Probe {
+        fn initialize(&mut self, _: &wgpu::Device, _: &GBuffer, _: &Camera) {}
+        #[allow(clippy::too_many_arguments)]
+        fn render(&mut self, _: &wgpu::Device, _: &wgpu::Queue, _: &mut wgpu::CommandEncoder, _: &GBuffer, _: &wgpu::TextureView, _: &wgpu::TextureView, _: &wgpu::TextureView, _: &Camera, _: u32, _: u32) {}
+        fn resize(&mut self, _: u32, _: u32, _: &GBuffer) {}
+        fn is_active(&self) -> bool {
+            self.0
+        }
+        fn destroy(&mut self) {}
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+    }
+
+    /// An effect runs while it is active and its type is not skipped; skipping one type leaves
+    /// the others.
+    #[test]
+    fn a_skipped_type_does_not_run() {
+        let probe = Probe(true);
+        assert!(runs(&[], &probe));
+        assert!(!runs(&[std::any::TypeId::of::<Probe>()], &probe));
+        assert!(runs(&[std::any::TypeId::of::<u32>()], &probe));
+        assert!(!runs(&[], &Probe(false)));
     }
 }

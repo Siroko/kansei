@@ -3,8 +3,9 @@
 //
 // A world triangle is four vec4 (64 bytes): v0 and the surface word (flags in the low byte, the
 // alpha layer in the next; the build sets KANSEI_RT_BIG), e1 = v1 - v0 and the albedo
-// (unorm4x8), e2 = v2 - v0 and where it came from (source << 20 | record), then the three
-// vertices' uvs (pack2x16float).
+// (unorm4x8, its alpha 1 - the surface's F0), e2 = v2 - v0 and where it came from (source << 20 | record), then the three
+// vertices' uvs (pack2x16float) and the light it emits (RGBE, as rt_emission.wgsl packs it; 0:
+// none).
 //
 // The cell words: each cell's end in the references (its start the previous cell's end), the
 // 4^3 macro cells (non-zero when any of their cells lists a triangle), the big triangles (a

@@ -17,8 +17,8 @@ const FRAMES: u32 = 256;
 
 fn gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
     let instance = wgpu::Instance::default();
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?;
-    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None)).ok()
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
+    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()
 }
 
 fn f16_to_f32(h: u16) -> f32 {
@@ -116,8 +116,8 @@ fn resolve(device: &wgpu::Device, queue: &wgpu::Queue, scene: fn(f32, f32) -> f3
     );
     queue.submit(std::iter::once(encoder.finish()));
     readback.slice(..).map_async(wgpu::MapMode::Read, |r| r.unwrap());
-    device.poll(wgpu::Maintain::Wait);
-    let data = readback.slice(..).get_mapped_range();
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    let data = readback.slice(..).get_mapped_range().unwrap();
     let mut out = Vec::with_capacity((W * H) as usize);
     for y in 0..H {
         for x in 0..W {

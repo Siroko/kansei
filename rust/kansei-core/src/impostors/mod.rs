@@ -205,8 +205,8 @@ pub(crate) mod tests_support {
         );
         queue.submit(Some(encoder.finish()));
         buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-        device.poll(wgpu::Maintain::Wait);
-        let bytes = buffer.slice(..).get_mapped_range();
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let bytes = buffer.slice(..).get_mapped_range().unwrap();
         (0..h).flat_map(|y| (0..w).map(move |x| (x, y))).map(|(x, y)| bytes[(y * row + x * 4) as usize..][..4].try_into().unwrap()).collect()
     }
 }

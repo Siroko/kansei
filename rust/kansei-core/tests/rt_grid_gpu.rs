@@ -3,16 +3,45 @@
 //! soup of small triangles, a sphere half out of the box, a ground too wide for the cells that
 //! goes to the big list, an alpha-tested quad), and rays find the closest hit (and any hit) the
 //! brute-force reference finds, with the big list overflowing, without macro-cell skipping, and
-//! after the buffers grew from a readback. Skipped (passes) when no adapter is available.
+//! after the buffers grew from a readback; instanced triangles take their albedo and emission from
+//! their instance records when their surface says so. The hardware backend (ray queries over the
+//! same triangles) finds the same hits: against the reference, and ray for ray against the grid.
+//! Skipped (passes) when no adapter is available, the hardware tests when it has no ray queries.
 
 use glam::{DMat4, DVec3, Mat4, Quat, Vec3};
 use kansei_core::geometries::{BoxGeometry, Geometry, IcosphereGeometry, Vertex};
-use kansei_core::rt::{RtGrid, RtGridOptions, RtInstance, RtMesh, RtScene, RtSurface, RT_GRID_WGSL};
+use kansei_core::rt::{hoist_wgsl_enables, pack_emission, unpack_emission, RtBackend, RtGrid, RtGridOptions, RtInstance, RtMesh, RtPlacement, RtScene, RtSource, RtSurface};
 
 fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
     let instance = wgpu::Instance::default();
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?;
-    Some(pollster::block_on(adapter.request_device(&Default::default(), None)).unwrap())
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
+    Some(pollster::block_on(adapter.request_device(&Default::default())).unwrap())
+}
+
+/// A device with hardware ray queries (wgpu's EXPERIMENTAL_RAY_QUERY), if the adapter has them.
+fn ray_query_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, ..Default::default() })).ok()?;
+    if !adapter.features().contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY) {
+        return None;
+    }
+    let info = adapter.get_info();
+    eprintln!("adapter: {} ({:?}, driver {} {})", info.name, info.backend, info.driver, info.driver_info);
+    let a = adapter.limits();
+    let descriptor = wgpu::DeviceDescriptor {
+        required_features: wgpu::Features::EXPERIMENTAL_RAY_QUERY,
+        required_limits: wgpu::Limits {
+            max_blas_primitive_count: a.max_blas_primitive_count,
+            max_blas_geometry_count: a.max_blas_geometry_count,
+            max_tlas_instance_count: a.max_tlas_instance_count,
+            max_acceleration_structures_per_shader_stage: a.max_acceleration_structures_per_shader_stage,
+            ..Default::default()
+        },
+        // SAFETY: the test exercises wgpu's experimental ray queries
+        experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
+        ..Default::default()
+    };
+    Some(pollster::block_on(adapter.request_device(&descriptor)).unwrap())
 }
 
 /// A small deterministic generator (xorshift).
@@ -223,6 +252,7 @@ fn build(device: &wgpu::Device, queue: &wgpu::Queue, grid: &mut RtGrid, scene: &
     queue.submit(Some(encoder.finish()));
     grid.read_back(device, queue);
     grid.wait_readback(device);
+    grid.prepare_trace(device, queue);
 }
 
 fn read_words(device: &wgpu::Device, queue: &wgpu::Queue, buffer: &wgpu::Buffer) -> Vec<u32> {
@@ -231,8 +261,8 @@ fn read_words(device: &wgpu::Device, queue: &wgpu::Queue, buffer: &wgpu::Buffer)
     encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, buffer.size());
     queue.submit(Some(encoder.finish()));
     staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-    device.poll(wgpu::Maintain::Wait);
-    let words = bytemuck::cast_slice(&staging.slice(..).get_mapped_range()).to_vec();
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    let words = bytemuck::cast_slice(&staging.slice(..).get_mapped_range().unwrap()).to_vec();
     words
 }
 
@@ -262,12 +292,14 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
 }
 "#;
 
-/// (t, found, cells, tests) and the normal of each ray's hit, traced with `flags`.
+/// (t, found, cells, tests) and the normal and triangle of each ray's hit, traced with `flags`
+/// through the grid's backend.
 fn trace(device: &wgpu::Device, queue: &wgpu::Queue, grid: &RtGrid, rays: &[Ray], flags: u32) -> Vec<[f32; 8]> {
     use wgpu::util::DeviceExt;
-    let code = format!("{RT_GRID_WGSL}\n{}\n{COVERED_WGSL}\n{TRACE_WGSL}", RtGrid::bindings_wgsl(0, 0));
+    let backend = grid.backend();
+    let code = hoist_wgsl_enables(&format!("{}\n{}\n{COVERED_WGSL}\n{TRACE_WGSL}", backend.wgsl(), backend.bindings_wgsl(0, 0)));
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("trace"), source: wgpu::ShaderSource::Wgsl(code.into()) });
-    let mut entries = RtGrid::layout_entries(0, wgpu::ShaderStages::COMPUTE).to_vec();
+    let mut entries = backend.layout_entries(0, wgpu::ShaderStages::COMPUTE).to_vec();
     let storage = |binding, read_only| wgpu::BindGroupLayoutEntry {
         binding,
         visibility: wgpu::ShaderStages::COMPUTE,
@@ -280,7 +312,7 @@ fn trace(device: &wgpu::Device, queue: &wgpu::Queue, grid: &RtGrid, rays: &[Ray]
         wgpu::BindGroupLayoutEntry { binding: 5, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
     ]);
     let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &entries });
-    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[&bgl], push_constant_ranges: &[] });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&bgl)], immediate_size: 0 });
     let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: Some(&layout), module: &module, entry_point: Some("main"), compilation_options: Default::default(), cache: None });
     let ray_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(rays), usage: wgpu::BufferUsages::STORAGE });
     let hits = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: (rays.len() * 32) as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
@@ -400,7 +432,7 @@ fn every_triangle_is_listed_in_every_cell_it_overlaps() {
     };
     let mut rng = Rng(0x2545f4914f6cdd1d);
     let mut scene = scene(&mut rng);
-    let options = options();
+    let options = RtGridOptions { backend: RtBackend::Software, ..options() };
     let mut grid = RtGrid::new(&device, options);
     build(&device, &queue, &mut grid, &mut scene);
     let stats = grid.stats();
@@ -539,6 +571,178 @@ fn a_box_that_follows_the_eye_moves_in_steps() {
     assert!(grid.follow(Vec3::new(5.0, 1.7, 0.0)));
 }
 
+#[test]
+fn hardware_rays_find_what_the_reference_finds() {
+    let Some((device, queue)) = ray_query_device() else {
+        eprintln!("no adapter with hardware ray queries: skipped");
+        return;
+    };
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    let mut scene = scene(&mut rng);
+    let tris = world_triangles(&scene);
+    let options = RtGridOptions { backend: RtBackend::Hardware, ..options() };
+    let mut grid = RtGrid::new(&device, options);
+    assert_eq!(grid.backend(), RtBackend::Hardware);
+    build(&device, &queue, &mut grid, &mut scene);
+    let (lo, hi) = grid.bounds();
+    let rays = rays(&mut rng, &tris, lo.as_dvec3(), hi.as_dvec3());
+    let (compared, hitting) = check_rays(&device, &queue, &grid, &tris, &rays, "hardware");
+    assert!(hitting * 2 > compared, "most rays hit something ({hitting} of {compared})");
+    // the alpha test's holes, through the non-opaque geometry's candidates
+    let solid = trace(&device, &queue, &grid, &rays, 2);
+    let cut = trace(&device, &queue, &grid, &rays, 0);
+    assert!(solid.iter().zip(&cut).filter(|(s, c)| s[1] == 1.0 && (c[1] == 0.0 || c[0] > s[0] + 1e-4)).count() > 10, "the quad's holes let rays through");
+    // a second build after the buffers grew (the BLAS made anew at the new capacity)
+    let mut small = RtGrid::new(&device, RtGridOptions { triangle_capacity: 64, ..options });
+    build(&device, &queue, &mut small, &mut scene);
+    build(&device, &queue, &mut small, &mut scene);
+    check_rays(&device, &queue, &small, &tris, &rays, "hardware, grown");
+}
+
+/// The hardware BLAS is sized from what the last build gathered: a gather that outgrows it says so
+/// (`overflowed`, which `SceneRtGrid` rebuilds on), and the next build holds it all.
+#[test]
+fn the_hardware_blas_follows_what_the_gather_needs() {
+    let Some((device, queue)) = ray_query_device() else {
+        eprintln!("no adapter with hardware ray queries: skipped");
+        return;
+    };
+    let mut rng = Rng(0x7f4a_7c15_9e37_79b9);
+    let (small, large) = (soup(&mut rng, 200, 1.5), soup(&mut rng, 3000, 1.5));
+    let buffers = [&small, &large].map(|g| RtMesh::from_geometry(g).create_buffer(&device));
+    let placement = RtPlacement::None;
+    let source = |k: usize, triangles: u32| RtSource {
+        mesh: &buffers[k],
+        triangles,
+        records: None,
+        first_record: 0,
+        record_count: 1,
+        world: Mat4::IDENTITY,
+        placement: &placement,
+        surface: RtSurface::new([0.5; 3]),
+        id: k as u32,
+    };
+    let mut grid = RtGrid::new(&device, RtGridOptions { backend: RtBackend::Hardware, ..options() });
+    // (no reserve_triangles, as the renderer's grid: the readback sizes the BLAS)
+    let mut rebuild = |grid: &mut RtGrid, sources: &[RtSource]| {
+        let mut encoder = device.create_command_encoder(&Default::default());
+        grid.begin(&device, &queue, &mut encoder);
+        grid.gather(&device, &queue, &mut encoder, sources);
+        grid.finish(&mut encoder);
+        queue.submit(Some(encoder.finish()));
+        grid.read_back(&device, &queue);
+        grid.wait_readback(&device);
+        grid.prepare_trace(&device, &queue);
+    };
+    // before any readback, the whole capacity; then what was gathered, with room to grow
+    rebuild(&mut grid, &[source(0, 200)]);
+    assert_eq!(grid.stats().accel_triangles, grid.stats().triangle_capacity);
+    rebuild(&mut grid, &[source(0, 200)]);
+    let sized = grid.stats().accel_triangles;
+    assert!((200..400).contains(&sized), "{:?}", grid.stats());
+    assert!(!grid.overflowed());
+    // a gather past it: the triangles past the BLAS are left out, and it says so
+    let both = [source(0, 200), source(1, 3000)];
+    rebuild(&mut grid, &both);
+    assert!(grid.overflowed(), "{:?}", grid.stats());
+    rebuild(&mut grid, &both);
+    assert!(!grid.overflowed() && grid.stats().accel_triangles >= 3200, "{:?}", grid.stats());
+    // and every triangle of both is found
+    let tris: Vec<Tri> = [&small, &large]
+        .iter()
+        .flat_map(|g| g.indices.chunks(3).map(|k| {
+            let v = |i: u32| DVec3::from(<[f32; 3]>::try_from(&g.vertices[i as usize].position[..3]).unwrap().map(|x| x as f64));
+            let uv = |i: u32| g.vertices[i as usize].uv.map(|x| x as f64);
+            Tri { v: [v(k[0]), v(k[1]), v(k[2])], uv: [uv(k[0]), uv(k[1]), uv(k[2])], layer: None }
+        }))
+        .collect();
+    let (lo, hi) = grid.bounds();
+    let rays = rays(&mut rng, &tris, lo.as_dvec3(), hi.as_dvec3());
+    let (compared, hitting) = check_rays(&device, &queue, &grid, &tris, &rays, "hardware, grown to the gather");
+    assert!(hitting * 4 > compared, "{hitting} of {compared} rays hit");
+}
+
+/// The software grid's and the hardware backend's hits ray for ray, on the reference's scene with
+/// a glass sphere added, for each trace flag: rtbench's comparison (the scout's), inside Kansei.
+#[test]
+fn hardware_hits_match_the_grid() {
+    let Some((device, queue)) = ray_query_device() else {
+        eprintln!("no adapter with hardware ray queries: skipped");
+        return;
+    };
+    let mut rng = Rng(0x51_7cc1_b727_220a);
+    let mut scene = scene(&mut rng);
+    let glass = scene.add_mesh(RtMesh::from_geometry(&IcosphereGeometry::new(0.6, 3)));
+    scene.add_instance(RtInstance { mesh: glass, transform: Mat4::from_translation(Vec3::new(-2.0, 1.0, 1.5)), surface: RtSurface::glass([0.9, 0.95, 1.0]) });
+    let tris = world_triangles(&scene);
+    let mut software = RtGrid::new(&device, RtGridOptions { backend: RtBackend::Software, ..options() });
+    let mut hardware = RtGrid::new(&device, RtGridOptions { backend: RtBackend::Hardware, ..options() });
+    build(&device, &queue, &mut software, &mut scene);
+    build(&device, &queue, &mut hardware, &mut scene);
+    assert_eq!(software.stats().triangles, hardware.stats().triangles, "one gather, one id space");
+    let (lo, hi) = software.bounds();
+    let rays = rays(&mut rng, &tris, lo.as_dvec3(), hi.as_dvec3());
+    // each gather numbers its triangles in its own (atomic) order: a hit names the same triangle
+    // when their records are the same (but for the flag the grid's build sets on big ones)
+    let (sw_records, hw_records) = (read_words(&device, &queue, software.triangles_buffer()), read_words(&device, &queue, hardware.triangles_buffer()));
+    let record = |words: &[u32], id: u32| {
+        let mut r = words[id as usize * 16..][..16].to_vec();
+        r[3] &= 0x7fff_ffff;
+        r
+    };
+    // rays whose verdict doesn't hang on rounding (the reference's, solid and glass both counted:
+    // not grazing an edge, nor lying in a face's plane as the rays along cell faces may); either
+    // backend may go either way on the rest
+    let (lo, hi) = (lo.as_dvec3(), hi.as_dvec3());
+    // (and, where the alpha test counts, clear of the checker's lines)
+    let robust_for = |solid: bool| -> Vec<bool> {
+        rays.iter()
+            .map(|r| {
+                let (o, d) = (DVec3::new(r.o[0] as f64, r.o[1] as f64, r.o[2] as f64), DVec3::new(r.d[0] as f64, r.d[1] as f64, r.d[2] as f64));
+                robust_hit(&tris, o, d, exit_distance(o, d, lo, hi), solid).is_some() && (solid || robust_hit(&tris, o, d, exit_distance(o, d, lo, hi), true).is_some())
+            })
+            .collect()
+    };
+    let (robust_solid, robust_alpha) = (robust_for(true), robust_for(false));
+    for (what, flags) in [("closest", 0), ("any", 1), ("solid", 2), ("glass hits", 4), ("solid glass hits", 6), ("any, glass hits", 5)] {
+        let sw = trace(&device, &queue, &software, &rays, flags);
+        let hw = trace(&device, &queue, &hardware, &rays, flags);
+        let robust = if flags & 2 != 0 { &robust_solid } else { &robust_alpha };
+        let compared = robust.iter().filter(|r| **r).count();
+        assert!(compared * 10 >= rays.len() * 9, "{what}: only {compared} of {} rays robust", rays.len());
+        let (mut hits, mut wrong, mut other_triangle, mut grazing) = (0, Vec::new(), 0, 0);
+        for (k, (a, b)) in sw.iter().zip(&hw).enumerate() {
+            if !robust[k] {
+                grazing += (a[1] != b[1] || (flags & 1 == 0 && a[1] == 1.0 && (a[0] - b[0]).abs() > 1e-4 * (1.0 + a[0]))) as usize;
+                continue;
+            }
+            hits += (a[1] == 1.0) as usize;
+            let same = if flags & 1 != 0 {
+                // any hit: whether, not which
+                a[1] == b[1]
+            } else {
+                a[1] == b[1] && (a[1] == 0.0 || (a[0] - b[0]).abs() <= 1e-4 * (1.0 + a[0]))
+            };
+            if !same {
+                let r = &rays[k];
+                wrong.push(format!("ray {k} (o {:?} d {:?}): software found {} t {}, hardware found {} t {}", &r.o[..3], &r.d[..3], a[1], a[0], b[1], b[0]));
+            } else if a[1] == 1.0 && flags & 1 == 0 && record(&sw_records, a[7].to_bits()) != record(&hw_records, b[7].to_bits()) {
+                // the same distance on another triangle: a shared edge or a coplanar pair
+                other_triangle += 1;
+            }
+        }
+        let share = wrong.len() as f64 / compared as f64;
+        eprintln!("{what}: {compared} rays, {hits} hit; {} mismatched ({:.3}%), {other_triangle} on a neighbouring triangle; {grazing} of the {} non-robust rays differ", wrong.len(), 100.0 * share, rays.len() - compared);
+        for w in wrong.iter().take(3) {
+            eprintln!("  {w}");
+        }
+        // (the reference's robustness margin is 1e-5 of a barycentric; the GPUs' f32 may still
+        // split a hair's breadth)
+        assert!(share <= 0.0005, "{what}: {} of {compared} rays differ:\n{}", wrong.len(), wrong.iter().take(12).cloned().collect::<Vec<_>>().join("\n"));
+        assert!(other_triangle * 100 <= hits, "{what}: {other_triangle} hits on another triangle");
+    }
+}
+
 /// GPU build times on this machine (native, kansei's profiler through a headless renderer), for
 /// the PR's numbers: `cargo test --release -p kansei-core --test rt_grid_gpu -- --ignored
 /// --nocapture`. A room of 4.6 m walls at 4.75 cm cells (gi-box's grid), with and without the big
@@ -548,7 +752,7 @@ fn a_box_that_follows_the_eye_moves_in_steps() {
 fn build_times() {
     use kansei_core::renderers::{Renderer, RendererConfig};
     let instance = wgpu::Instance::default();
-    let Some(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())) else {
+    let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())) else {
         eprintln!("no GPU adapter: skipped");
         return;
     };
@@ -604,7 +808,7 @@ fn build_times() {
                 grid.finish(&mut encoder);
                 queue.submit(Some(encoder.finish()));
                 renderer.end_profiled_frame();
-                device.poll(wgpu::Maintain::Wait);
+                let _ = device.poll(wgpu::PollType::wait_indefinitely());
             }
             let profile = renderer.take_profile();
             let ms = |label: &str| profile.gpu.iter().find(|p| p.label == label).map_or(0.0, |p| p.busy_ms);
@@ -613,6 +817,72 @@ fn build_times() {
                 "{scene_name}, {what}: gather {:.3} + count {:.3} + scan {:.3} + fill {:.3} ms (GPU, {} frames); {} triangles, {} references, {} big",
                 ms("Rt/Gather"), ms("Rt/GridCount"), ms("Rt/GridScan"), ms("Rt/GridFill"), profile.gpu_frames, s.triangles, s.references, s.big_triangles
             );
+        }
+    }
+}
+
+#[test]
+fn instances_carry_their_records_albedo_and_emission() {
+    let Some((device, queue)) = device() else {
+        eprintln!("no GPU adapter: skipped");
+        return;
+    };
+    use wgpu::util::DeviceExt;
+    // three quads a metre apart, each record (x, albedo, emission, unused): the first two with
+    // their own colour and glow, the third unlit
+    let colours = [[0.9f32, 0.2, 0.1], [0.1, 0.8, 0.3], [0.5, 0.5, 0.5]];
+    let glows = [[60.0f32, 22.0, 4.0], [0.0, 3.0, 9.0], [0.0; 3]];
+    let mut words: Vec<u32> = Vec::new();
+    for k in 0..3 {
+        let [r, g, b] = colours[k].map(|c| (c * 255.0).round() as u32);
+        words.extend([(k as f32 - 1.0).to_bits(), r | g << 8 | b << 16, pack_emission(glows[k]), 0]);
+    }
+    let records = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: None, contents: bytemuck::cast_slice(&words), usage: wgpu::BufferUsages::STORAGE });
+    let mesh = RtMesh::from_geometry(&quad());
+    let mesh_buffer = mesh.create_buffer(&device);
+    let placement = RtPlacement::Wgsl("fn kansei_rt_place(record: u32, p: vec3f) -> vec3f { return p + vec3f(kansei_rt_record_f32(record, 0u), 0.0, 0.0); }\n".into());
+    let mut grid = RtGrid::new(&device, options());
+    for (surface, per_record) in [(RtSurface::new([0.2, 0.2, 0.2]).with_record_surface(Some(1), Some(2)), true), (RtSurface::new([0.2, 0.2, 0.2]), false)] {
+        let source = RtSource {
+            mesh: &mesh_buffer,
+            triangles: mesh.triangle_count(),
+            records: Some((&records, 16)),
+            first_record: 0,
+            record_count: 3,
+            world: Mat4::IDENTITY,
+            placement: &placement,
+            surface,
+            id: 1,
+        };
+        let mut encoder = device.create_command_encoder(&Default::default());
+        grid.begin(&device, &queue, &mut encoder);
+        grid.gather(&device, &queue, &mut encoder, &[source]);
+        grid.finish(&mut encoder);
+        queue.submit(Some(encoder.finish()));
+        grid.read_back(&device, &queue);
+        grid.wait_readback(&device);
+        assert_eq!(grid.stats().triangles, 6);
+        let tris = read_words(&device, &queue, grid.triangles_buffer());
+        for t in 0..6 {
+            let tri = &tris[t * 16..t * 16 + 16];
+            let record = (tri[11] & 0xfffff) as usize;
+            let albedo = [tri[7] & 255, (tri[7] >> 8) & 255, (tri[7] >> 16) & 255].map(|c| c as f32 / 255.0);
+            assert_eq!(tri[7] >> 24, 255, "opaque albedo");
+            // the quad sits where its record put it
+            let x = f32::from_bits(tri[0]);
+            assert!((x - (record as f32 - 1.0)).abs() <= 0.5 + 1e-5, "triangle {t} at x {x}, record {record}");
+            if per_record {
+                for c in 0..3 {
+                    assert!((albedo[c] - colours[record][c]).abs() < 0.01, "record {record}: {albedo:?}");
+                }
+                let glow = unpack_emission(tri[15]);
+                for c in 0..3 {
+                    assert!((glow[c] - glows[record][c]).abs() <= 0.01 * 60.0, "record {record}: {glow:?}");
+                }
+            } else {
+                assert!(albedo.iter().all(|&c| (c - 0.2).abs() < 0.01), "the surface's own albedo: {albedo:?}");
+                assert_eq!(tri[15], 0, "no emission");
+            }
         }
     }
 }

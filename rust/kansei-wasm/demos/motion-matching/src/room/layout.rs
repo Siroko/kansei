@@ -6,7 +6,7 @@
 //! meshes are merged by material (and by how they are drawn) into one renderable each, so the
 //! room is a draw per material; `<name>_COL` boxes are the collision world, `<name>_SHADOW` meshes
 //! what their parent casts into the shadow maps, `_CUT` meshes Blender's boolean cutters (skipped);
-//! `kansei` names a role (`shell`, `mirror`, `glass`, `aquarium`, `caustics`, `dragon`, `spawn`,
+//! `kansei` names a role (`shell`, `mirror`, `glass`, `aquarium`, `dragon`, `spawn`,
 //! `preview`); lights carry `kansei_light` (`sun`, `skylight`, `lamp`,
 //! `display`); cameras named `CAM_<view>` are the page's fixed views.
 //!
@@ -113,10 +113,8 @@ pub struct Layout {
     /// The room's inside (the shell's bounds).
     pub min: GVec3,
     pub max: GVec3,
-    /// The aquarium's water (`kansei: aquarium`), and the rectangle (x, z) the caustics' map
-    /// covers (`kansei: caustics`, else round the tank, where the sun throws them, and the dragon).
+    /// The aquarium's water (`kansei: aquarium`).
     pub tank: Option<Tank>,
-    pub caustics: ([f32; 2], [f32; 2]),
     /// The colour maps the reflections' hits read (`assets::albedo_array`, a layer each) and the
     /// tint each is drawn with.
     pub albedo_layers: Vec<(wgpu::TextureView, [f32; 3])>,
@@ -346,7 +344,6 @@ pub async fn load(renderer: &Renderer, scene: &mut Scene, deferred: bool) -> Res
     let mut dragon = (GVec3::new(0.0, 0.5, 0.0), 0.7, 2.6);
     let mut tank = None;
     let mut colliders = 0;
-    let mut caustics = None;
     let (mut shell_lo, mut shell_hi) = (GVec3::splat(f32::MAX), GVec3::splat(f32::MIN));
     let (mut sun, mut skylight, mut lamps, mut display) = (None, None, Vec::new(), None);
     let mut triangles: HashMap<String, usize> = HashMap::new();
@@ -431,10 +428,8 @@ pub async fn load(renderer: &Renderer, scene: &mut Scene, deferred: bool) -> Res
                 tank = Some(Tank { min: bounds.0, max: bounds.1, fill: number(&x, "fill").unwrap_or(0.85) });
                 continue;
             }
-            "caustics" => {
-                caustics = Some(([bounds.0.x, bounds.0.z], [bounds.1.x, bounds.1.z]));
-                continue;
-            }
+            // (an older glb's area for the caustics' map: their tiles follow the casters now)
+            "caustics" => continue,
             "shell" => {
                 shell_lo = shell_lo.min(bounds.0);
                 shell_hi = shell_hi.max(bounds.1);
@@ -594,21 +589,6 @@ pub async fn load(renderer: &Renderer, scene: &mut Scene, deferred: bool) -> Res
     spot.volumetric_scale = 1.0;
     let display = scene.add(SceneNode::Light(Light::Spot(spot)));
 
-    // the caustics' map: as authored, else round the tank and where the sun through it lands on
-    // the floor, and round the dragon
-    let caustics = caustics.unwrap_or_else(|| {
-        let mut points = vec![dragon.0 - GVec3::splat(2.0), dragon.0 + GVec3::splat(2.0)];
-        if let Some(t) = tank {
-            for corner in [t.min, t.max, GVec3::new(t.min.x, t.max.y, t.max.z), GVec3::new(t.max.x, t.max.y, t.min.z)] {
-                points.push(corner - GVec3::splat(0.8));
-                points.push(corner + GVec3::splat(0.8));
-                let along = corner.y / (-sun_direction.y).max(0.1);
-                points.push(corner + sun_direction * along);
-            }
-        }
-        let (a, b) = points.iter().fold((GVec3::splat(f32::MAX), GVec3::splat(f32::MIN)), |(a, b), p| (a.min(*p), b.max(*p)));
-        ([a.x.max(lo.x), a.z.max(lo.z)], [b.x.min(hi.x), b.z.min(hi.z)])
-    });
     triangles.insert("grid".into(), grid_triangles);
     let mut triangles: Vec<(String, usize)> = triangles.into_iter().collect();
     triangles.sort();
@@ -624,7 +604,6 @@ pub async fn load(renderer: &Renderer, scene: &mut Scene, deferred: bool) -> Res
         min: lo,
         max: hi,
         tank,
-        caustics,
         albedo_layers,
         traversals,
         triangles,

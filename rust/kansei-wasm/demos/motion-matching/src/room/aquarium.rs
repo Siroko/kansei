@@ -10,8 +10,8 @@
 //! through the tank's panes and the water to what is behind them in the grid (Beer-Lambert in the
 //! water) and reflects the room off it, with small ripples on its normal. The water is in the grid
 //! too, as glass (`FluidHeightfield`'s coarse mesh of the surface), so the mirrors and the dragon
-//! show it, and the caustics' photons refract at it (`RtCausticsEffect`, the fine height field and
-//! the same ripples): the sun through the tank throws them across the floor. `fluid_render =
+//! show it, and the caustics' photons refract at it (`RtCausticsEffect`, the water's box a
+//! caster): the sun through the tank throws them across the floor. `fluid_render =
 //! screen` draws it the old way, refracting the image on screen (`FluidSurfaceEffect`'s
 //! composite). Like the lake, the water rests when it can: culled out of view, asleep once settled
 //! with nothing near it.
@@ -23,7 +23,7 @@ use kansei_core::materials::Material;
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::postprocessing::effects::{FluidGlassSurface, FluidSurfaceEffect, FluidSurfaceOptions};
 use kansei_core::renderers::Renderer;
-use kansei_core::rt::{RtCausticWater, RtSurface};
+use kansei_core::rt::RtSurface;
 use kansei_core::simulations::fluid::{
     lattice_density, DensityFieldOptions, FluidActivity, FluidCapsule, FluidColliders, FluidCollidersOptions, FluidContainer, FluidContainerOptions, FluidDensityField,
     FluidHeightfield, FluidHeightfieldOptions, FluidMarchingCubes, FluidSimulation, FluidSimulationOptions, FluidSleepOptions, FluidSolver, FluidStepper, FluidSubstepPass, MarchingCubesOptions, PbfOptions,
@@ -501,17 +501,25 @@ impl Aquarium {
         self.poke = true;
     }
 
-    /// The water for the caustics (`RtCausticsEffect::set_water`), drawn as ray-traced glass and
-    /// shown; and the box it fills.
-    pub fn caustic_water(&self, surface: &FluidSurfaceEffect) -> Option<RtCausticWater> {
-        let heightfield = surface.heightfield.as_ref().filter(|_| self.rt && self.show)?;
-        let (min, size) = heightfield.rect();
-        Some(RtCausticWater { heights: heightfield.height_view().clone(), min, size, dims: heightfield.height_dims(), source: self.grid_water as u32, ior: self.glass.ior, tint: self.glass.tint, ripples: self.glass.ripples, level: self.tank.level() })
+    /// Whether the water throws caustics (`RtCausticsEffect`, its box a caster): drawn as
+    /// ray-traced glass, shown, and in the grid (its height field's coarse mesh, which the photons
+    /// refract at).
+    pub fn casts_caustics(&self, surface: &FluidSurfaceEffect) -> bool {
+        surface.heightfield.is_some() && self.rt && self.show
     }
 
-    /// The water's box (world metres): the caustics aim their photons at it.
+    /// The amount of the water's glass's ripples (its caustics' photons bend at them too).
+    pub fn ripples(&self) -> f32 {
+        self.glass.ripples
+    }
+
+    /// The slab round the water's surface (world metres), its caustics' caster: the photons aim
+    /// at it and refract at the surface's copy in the grid. A slab, not the tank: what lands inside
+    /// a caster's box is taken for its own core, and the bed and the stand under the water must
+    /// keep the light the surface focuses on them.
     pub fn water_box(&self) -> (GVec3, GVec3) {
-        (self.tank.min - 0.05, GVec3::new(self.tank.max.x, self.tank.level() + 0.15, self.tank.max.z) + 0.05)
+        let level = self.tank.level();
+        (GVec3::new(self.tank.min.x - 0.05, level - 0.1, self.tank.min.z - 0.05), GVec3::new(self.tank.max.x + 0.05, level + 0.15, self.tank.max.z + 0.05))
     }
 
     /// The glass's uniform for this frame (the ripples' time `time`), and the grid's copy read

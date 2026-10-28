@@ -1,7 +1,9 @@
 //! Minimal path tracer validation example.
 //!
 //! Creates a simple scene with boxes, builds a BVH, traces 1 SPP per frame,
-//! and blits the path tracer output to the window surface. The image may be
+//! and blits the path tracer output to the window surface. The scene is traced
+//! by hardware ray queries where the device has them (`KANSEI_RT_BACKEND`
+//! overrides, as for the RT grid), the window's title says which. The image may be
 //! black or noisy — the goal is to verify the full pipeline compiles and runs
 //! without GPU validation errors.
 
@@ -89,8 +91,8 @@ impl BlitResources {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Blit/PipelineLayout"),
-            bind_group_layouts: &[&bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
         });
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -118,7 +120,7 @@ impl BlitResources {
             },
             depth_stencil: None,
             multisample: Default::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
@@ -162,6 +164,7 @@ impl BlitResources {
             label: Some("Blit/Pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: target_view,
+                depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -330,11 +333,15 @@ impl ApplicationHandler for App {
         let mut tlas = TLASBuilder::new(&renderer);
         let gpu_data = bvh.build_full(&renderer, &self.scene, &mut tlas);
         log::info!(
-            "BVH built: {} triangles, {} BVH4 nodes, {} instances",
+            "BVH built: {} triangles, {} BVH4 nodes, {} instances; traced by {:?}",
             gpu_data.triangle_count,
             gpu_data.node_count,
             gpu_data.instance_count,
+            gpu_data.backend(),
         );
+        // the traversal in the title: hardware ray queries or the BVH4s in compute (KANSEI_RT_BACKEND)
+        let info = renderer.device().adapter_info();
+        window.set_title(&format!("Kansei \u{2014} Path Tracer Test ({}, {:?}; traced by {:?})", info.name, info.backend, gpu_data.backend()));
 
         // ── Create PathTracer ────────────────────────────────────────────
         let mut pt = PathTracer::new(&renderer);
@@ -415,9 +422,7 @@ impl ApplicationHandler for App {
 
                 // Get surface texture
                 let surface = renderer.surface().unwrap();
-                let output = surface
-                    .get_current_texture()
-                    .expect("Failed to get surface texture");
+                let output = kansei_core::renderers::surface_texture(surface).expect("Failed to get surface texture");
                 let canvas_view = output.texture.create_view(&Default::default());
 
                 let mut encoder =
@@ -434,7 +439,7 @@ impl ApplicationHandler for App {
                 }
 
                 queue.submit(std::iter::once(encoder.finish()));
-                output.present();
+                queue.present(output);
 
                 if let Some(ref w) = self.window {
                     w.request_redraw();

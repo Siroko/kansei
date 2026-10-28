@@ -165,7 +165,7 @@ impl RadianceInjection {
         }
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("VoxelGI/InjectBGL"), entries: &entries });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("VoxelGI/Inject"), source: wgpu::ShaderSource::Wgsl(INJECT_WGSL.into()) });
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("VoxelGI/Inject"), bind_group_layouts: &[&bgl], push_constant_ranges: &[] });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("VoxelGI/Inject"), bind_group_layouts: &[Some(&bgl)], immediate_size: 0 });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("VoxelGI/Inject"),
             layout: Some(&layout),

@@ -199,17 +199,15 @@ settings! {
     fluid_max_x: f32 = 0.0;
     fluid_max_y: f32 = 0.0;
     fluid_max_z: f32 = 0.0;
-    // the caustics of the glass and the water (`RtCausticsEffect`): photons a light (a side), the
-    // weight of a frame, the light's scale; the display spot over the dragon
+    // the caustics of the glass and the water (`RtCausticsEffect`): the light's scale; the display
+    // spot over the dragon
     caustics: bool = true;
-    caustics_photons: f32 = 128.0;
-    caustics_blend: f32 = 0.1;
-    // frames between the caustics' updates (four times that with the tank and the dragon out of view)
+    // frames between the caustics' photons while they accumulate (four times that with the tank
+    // and the dragon out of view)
     caustics_every: f32 = 2.0;
     caustics_intensity: f32 = 1.0;
     caustics_view: bool = false;
-    // the water's caustics from photons (else a net of caustic lines), the lights' emitters' size
-    caustics_water_photons: bool = true;
+    // photons from the lights' emitters' area (soft), else from their centres (crisp)
     caustics_area: bool = false;
     // the light through the glass scaled, its splats narrowed (`RtCausticsEffect::focus_gain`,
     // `focus_sharpen`; 1 and 1 physical)
@@ -296,10 +294,7 @@ impl Settings {
         let high = quality == "high";
         self.glass_checker = !high;
         self.glass_refl_shared = !high;
-        // (both: the aquarium throws its caustics on the floor only by photons through it)
-        self.caustics_water_photons = true;
         self.caustics_area = high;
-        self.caustics_photons = if high { 256.0 } else { 128.0 };
         self.caustics_every = if high { 1.0 } else { 2.0 };
         self.caustics_glass_gain = if high { 1.0 } else { 3.0 };
         self.caustics_sharpen = if high { 1.0 } else { 0.5 };

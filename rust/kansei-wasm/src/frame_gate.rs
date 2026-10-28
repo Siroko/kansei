@@ -6,8 +6,8 @@
 //! `FramesInFlight` lets the loop skip a refresh while `cap` frames are still on the GPU, so the
 //! frame it renders next starts from fresh input.
 //!
-//! wgpu 24's WebGPU backend does not implement `Queue::on_submitted_work_done`, so the end of a
-//! frame is a fence of its own: a 4-byte buffer cleared after the frame's last submit and then
+//! The end of a frame is a fence of its own (wgpu 24's WebGPU backend, which this was written
+//! for, lacked `Queue::on_submitted_work_done`): a 4-byte buffer cleared after the frame's last submit and then
 //! mapped, which resolves once the GPU has passed it (the queue runs in order). It uses only the
 //! device and queue, nothing of the page, so it works the same from a worker.
 
@@ -42,7 +42,7 @@ impl FramesInFlight {
     /// Whether a frame may start now.
     pub fn ready(&self) -> bool {
         #[cfg(not(target_arch = "wasm32"))]
-        self.device.poll(wgpu::Maintain::Poll);
+        let _ = self.device.poll(wgpu::PollType::Poll);
         self.cap == 0 || self.in_flight() < self.cap
     }
 
@@ -80,6 +80,6 @@ impl FramesInFlight {
             busy.store(false, Ordering::Release);
         });
         #[cfg(not(target_arch = "wasm32"))]
-        self.device.poll(wgpu::Maintain::Poll);
+        let _ = self.device.poll(wgpu::PollType::Poll);
     }
 }

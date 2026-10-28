@@ -41,6 +41,12 @@ pub trait PostProcessingEffect {
         false
     }
     fn destroy(&mut self);
+    /// Light by this environment (`environment::EnvironmentLighting`, from a
+    /// `GradientEnvironment`, `SkyAtmosphere::lighting` or an `HdrEnvironment`): an effect that
+    /// reads the sky (its rays' or cones' misses, its fog's ambient, the background) takes it in
+    /// place of the one it had. `PostProcessingVolume::set_environment` hands it to every effect.
+    /// Nothing by default.
+    fn set_environment(&mut self, _environment: &crate::environment::EnvironmentLighting) {}
     /// A short name for profiling (the type's name by default).
     fn name(&self) -> &'static str {
         let path = std::any::type_name::<Self>();

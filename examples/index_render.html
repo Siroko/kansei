@@ -85,12 +85,13 @@
 
     // Post-processing volume — all effects are compute-shader based.
     const volume = new PostProcessingVolume(renderer, [
-      // SSAO — adds contact shadows between cubes as they cluster together.
+      // SSAO — adds contact shadows between cubes as they cluster together. The cubes are unlit
+      // (their texture as it is), so their whole colour is ambient.
       new SSAOEffect({
         radius: 0.2,
-        bias: 0.02,
         kernelSize: 16,
-        strength: 0.5
+        strength: 0.5,
+        ambient: { kind: 'unlit' },
       }),
       // God Rays — radial light shafts from a fixed screen-space source position.
       new GodRaysEffect({

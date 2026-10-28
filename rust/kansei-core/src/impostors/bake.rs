@@ -194,7 +194,7 @@ impl Renderer {
             {
                 let color_attachments: Vec<_> = targets
                     .iter()
-                    .map(|view| Some(wgpu::RenderPassColorAttachment { view, resolve_target: None, ops: wgpu::Operations { load: clear, store: wgpu::StoreOp::Store } }))
+                    .map(|view| Some(wgpu::RenderPassColorAttachment { view, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: clear, store: wgpu::StoreOp::Store } }))
                     .collect();
                 let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("Impostor/Frame"),

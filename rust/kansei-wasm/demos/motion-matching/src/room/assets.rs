@@ -57,10 +57,10 @@ pub fn albedo_array(renderer: &Renderer, sources: &[&wgpu::TextureView]) -> (wgp
         primitive: Default::default(),
         depth_stencil: None,
         multisample: Default::default(),
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     });
-    let sampler = device.create_sampler(&wgpu::SamplerDescriptor { label: Some("Room/AlbedoBlit"), mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, mipmap_filter: wgpu::FilterMode::Linear, ..Default::default() });
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor { label: Some("Room/AlbedoBlit"), mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, mipmap_filter: wgpu::MipmapFilterMode::Linear, ..Default::default() });
     let white = Shared::upload(renderer, Texture::from_rgba("White", 1, 1, &[255, 255, 255, 255]));
     let level = |layer: u32, mip: u32| texture.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2), base_mip_level: mip, mip_level_count: Some(1), base_array_layer: layer, array_layer_count: Some(1), ..Default::default() });
     let mut encoder = renderer.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Room/Albedo") });
@@ -79,7 +79,7 @@ pub fn albedo_array(renderer: &Renderer, sources: &[&wgpu::TextureView]) -> (wgp
             let target = level(layer, mip);
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Room/AlbedoBlit"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &target, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::WHITE), store: wgpu::StoreOp::Store } })],
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &target, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::WHITE), store: wgpu::StoreOp::Store } })],
                 ..Default::default()
             });
             pass.set_pipeline(&pipeline);

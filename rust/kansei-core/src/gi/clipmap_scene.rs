@@ -183,6 +183,12 @@ impl SceneVoxelClipmap {
         self.sky_source = sky_lighting.clone();
     }
 
+    /// Back to the gradient's sky (`set_sky_gradient`) after `use_sky_lighting`.
+    pub fn reset_sky_lighting(&mut self) {
+        let sky = self.sky.clone();
+        self.use_sky_lighting(&sky);
+    }
+
     /// Keep irradiance probes traced through the clipmap (`ClipmapProbes`), updated each frame
     /// after its light, following the camera. Read them with `VoxelGIEffect::set_clipmap_probes`
     /// or a material's `CLIPMAP_PROBES_WGSL`. Calling it again with other options builds them

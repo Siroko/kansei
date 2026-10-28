@@ -167,7 +167,8 @@ fn main(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_index) lid: 
     if (lid < PROBE_SH_WORDS) {
         var c = vec3f(0.0);
         for (var r = 0u; r < PROBE_RAYS; r++) {
-            let y = probeShBasis(wgDir[r].xyz);
+            var y: array<f32, 9>;
+            probeShBasis(wgDir[r].xyz, &y);
             c += wgRadiance[r].rgb * y[lid];
         }
         let band = select(select(PROBE_PI / 4.0, 2.0 * PROBE_PI / 3.0, lid < 4u), PROBE_PI, lid == 0u);

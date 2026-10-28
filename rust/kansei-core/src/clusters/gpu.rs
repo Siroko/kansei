@@ -234,7 +234,7 @@ impl ClusterCulling {
         let prepare_bgl = layout("ClusterCulling/Prepare", &[uniform(10), storage(11, true), storage(12, false), storage(13, false)]);
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("ClusterCulling"), source: wgpu::ShaderSource::Wgsl(format!("{CLUSTER_CULL_WGSL}\n{CLUSTER_MESH_WGSL}").into()) });
         let pipeline = |entry: &str, layouts: &[&wgpu::BindGroupLayout]| {
-            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("ClusterCulling"), bind_group_layouts: layouts, push_constant_ranges: &[] });
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("ClusterCulling"), bind_group_layouts: &layouts.iter().copied().map(Some).collect::<Vec<_>>(), immediate_size: 0 });
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some(&format!("ClusterCulling/{entry}")), layout: Some(&layout), module: &module, entry_point: Some(entry), compilation_options: Default::default(), cache: None })
         };
         let view = device.create_buffer(&wgpu::BufferDescriptor { label: Some("ClusterCulling/Views"), size: (MAX_VIEWS * std::mem::size_of::<ClusterViewGpu>()) as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
@@ -639,7 +639,7 @@ impl Feedback {
         self.needed.clear();
         #[cfg(not(target_arch = "wasm32"))]
         if self.pending.is_some() {
-            device.poll(wgpu::Maintain::Poll);
+            let _ = device.poll(wgpu::PollType::Poll);
         }
         #[cfg(target_arch = "wasm32")]
         let _ = device;
@@ -649,7 +649,7 @@ impl Feedback {
         }
         let staging = self.staging.as_ref().unwrap();
         {
-            let bytes = staging.slice(..).get_mapped_range();
+            let bytes = staging.slice(..).get_mapped_range().unwrap();
             let words: &[u32] = bytemuck::cast_slice(&bytes);
             self.needed.extend(cuts.into_iter().zip(words.chunks(2).map(|w| (w[0], w[1]))));
             self.last.extend(self.needed.iter().map(|(k, v)| (*k, *v)));

@@ -45,15 +45,27 @@
 //!   metres up, default 0.6) or `view=probes` (the probes, lit by their own irradiance);
 //! - the distance field (it turns voxel GI's scene volume on whatever the mode): `sdf_ao=0..1`
 //!   (its AO on the GI), `sdf_shadows=off|fallback|always` (the voxels' shadows through it, where
-//!   no map covers them or always), `shadows=map|sdf` (the direct light's shadows through it, by
+//!   no map covers them or always), `shadows=sdf` (the direct light's shadows through it, by
 //!   the material helper `gi::SDF_WGSL`);
+//! - the direct light's shadows: `shadows=maps` (the shadow atlas, PCSS: the default) or
+//!   `shadows=rt` (`RtShadowsEffect`: rays through the grid of triangles toward a point of the
+//!   lamp's disk, denoised; the materials leave the lamp to it through `RT_SHADOWS_GBUFFER_WGSL`),
+//!   with `rts_res=half|full`, `rts_contact=<m>` (the screen-space contact rays, 0.25; 0 none) and
+//!   `rts_view=lit|visibility|direct|mask`; its shadow rays pass through the glass ball, whose
+//!   caustics (`RtCausticsEffect`: photons from the lamp through the ball into a tile round it)
+//!   put back what the glass changes of that light, the light it focuses and the shadow it
+//!   leaves: `caustics=0` without them, `caustics_view=caustics` (the light they add and take,
+//!   over grey);
+//! - `glass_shadow=1`: the glass ball casts into the shadow maps (with `shadows=maps`, the solid
+//!   disc a shadow map gives glass); `roll=1`: the glass ball rolls back and forth across the rug;
+//!   `glass_radius=` (m): the glass ball's size (0.015 and `cam=marble`: a 3 cm marble on the rug);
 //! - the balls: `mirror=0`, `glass=0` (without either, and without `reflect`, `gi=rt` or `rt=1`, no
 //!   grid of triangles is built), `mirror_rough=0..1`, `glass_ior=` (1.5), `glass_rough=0..1`
 //!   (frosted), `glass_tint=r,g,b` (the light left after a metre inside), `glass_samples=` (paths
 //!   a frosted pixel a frame, 4), `rt_screen=0` (their rays' hits lit by the lamp and the voxels
 //!   even where the camera sees them), `rt_direct=0` (hits the camera doesn't see lit by the
 //!   voxels alone);
-//! - `cam=front|corner|low|floor|glass`;
+//! - `cam=front|corner|low|floor|glass|chrome|marble`;
 //! - `dragon=1|full`: the Stanford dragon (CC-BY-NC-4.0, see `www/assets/license.txt`): `1` the
 //!   decimated `.glb` (19k triangles), `full` the whole scan (871k triangles, 24 MB);
 //! - `animate=1`: the dragon (or, without it, the tall block) turns and slides, re-voxelized each
@@ -62,6 +74,12 @@
 //!   triangles (`Renderer::enable_rt_grid`, `RtReflectionsEffect`), lit by the voxels;
 //!   `floor_f0`, `floor_rough`, `rt_view=lit|reflection|mirror|cost`, `rt_trace=voxels`,
 //!   `rt_res=quarter`, `rt_lod=0` (the dragon into the grid whole, not by its cluster cut);
+//! - the environment past the box's opening (`environment`): `env=none` (the default: black),
+//!   `gradient` (a studio gradient, `GradientEnvironment`, on a dome) or `hdri` (Poly Haven's CC0
+//!   `studio_small_09`, `HdrEnvironment`: the background, the balls' reflections and refraction, and
+//!   the GI's rays past the box); `env_ev=` (stops over the default), `env_rotation=` (degrees about
+//!   the vertical), `env_blur=0..1` (the HDRI background's softness), `env_spin=` (degrees a second:
+//!   the HDRI prepared again every frame, to time it);
 //! - `albedo=constant`, `rug=off` (the box without its rug), `ui=0` (no panel);
 //! - `stats=1`: triangles, frame interval and the GPU time of each pass (the renderer's profiling).
 
@@ -72,22 +90,24 @@ use std::rc::Rc;
 use kansei_core::buffers::{BufferType, ComputeBuffer, Sampler, Texture};
 use kansei_core::cameras::Camera;
 use kansei_core::controls::CameraControls;
+use kansei_core::environment::{EnvironmentLighting, GradientEnvironment, HdrEnvironment, HdrEnvironmentOptions, HdrEnvironmentSettings};
 use kansei_core::geometries::{BoxGeometry, SphereGeometry};
 use kansei_core::gi::{GiSurface, SceneVoxelGiOptions, SdfProbeOptions, SdfShadows, VoxelGIEffect, VoxelGIOptions, VoxelGiQuality, SDF_WGSL, VOXEL_WRITE_WGSL};
 use kansei_core::lights::{Light, SpotLight, SPOT_LIGHTS_WGSL};
 use kansei_core::loaders::GLTFLoader;
-use kansei_core::materials::{Binding, Material, MaterialOptions, ShaderStages, StandardLitOptions, GBUFFER_OUT_WGSL};
+use kansei_core::materials::{Binding, GradientSkyOptions, Material, MaterialOptions, ShaderStages, StandardLitOptions, GBUFFER_OUT_WGSL};
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::postprocessing::{
     PostProcessingEffect, PostProcessingVolume,
-    effects::{exposure_from_ev100, GiQuality, ScreenSpaceGIEffect, ScreenSpaceGIOptions, ToneMapEffect, ToneMapOptions},
+    effects::{exposure_from_ev100, EnvironmentBackgroundEffect, GiQuality, ScreenSpaceGIEffect, ScreenSpaceGIOptions, ToneMapEffect, ToneMapOptions},
 };
 use kansei_core::renderers::{Renderer, RendererConfig};
 use kansei_core::clusters::{ClusterLod, ClusterMesh, ClusterOptions};
-use kansei_core::rt::{
+use kansei_core::rt::{RtCausticsEffect, RtCausticsOptions, RtCausticsView, 
     RtDiffuseGiEffect, RtDiffuseGiOptions, RtGiDenoise, RtGiHitLighting, RtGiKernel, RtGiMode, RtGiResolution, RtGiShadows, RtGiView, RtGlass, RtGridOptions,
-    RtReflectionsEffect, RtReflectionsOptions, RtReflectionsView, RtSurface, RtTraceResolution, SceneRtGridOptions,
+    RtReflectionsEffect, RtReflectionsOptions, RtReflectionsView, RtShadowsEffect, RtShadowsView, RtSurface, RtTraceResolution, SceneRtGridOptions,
+    RT_SHADOWS_GBUFFER_WGSL,
 };
 use kansei_wasm::{fetch_bytes, flag, is_phone, now, param, param_or, Canvas, Frame};
 
@@ -130,7 +150,7 @@ fn shade(in: VOut, base: vec3<f32>) -> KanseiGBufferOut {
     let view3 = mat3x3<f32>(view_matrix[0].xyz, view_matrix[1].xyz, view_matrix[2].xyz);
     let camera_pos = -(transpose(view3) * view_matrix[3].xyz);
     let v = normalize(camera_pos - in.world);
-    return kansei_gbuffer_out_specular(lit_radiance(in.world, n, v, base, in.clip.xy), vec3<f32>(0.0), n, base, surface.specular.x, surface.specular.y);
+    return lit_out(lit_radiance(in.world, n, v, base, in.clip.xy), n, base, surface.specular.x, surface.specular.y);
 }
 "#;
 
@@ -165,6 +185,13 @@ const MIRROR_GI_ALBEDO: [f32; 3] = [0.02, 0.02, 0.02];
 /// The light the glass leaves after a metre inside (a faint green, as window glass).
 const GLASS_TINT: [f32; 3] = [0.82, 0.93, 0.88];
 const BALL_RADIUS: f32 = 0.4;
+/// Where the glass ball rests on the rug (x, z), its bottom a little over the rug's top.
+const GLASS_REST: [f32; 2] = [-0.1, -0.45];
+
+/// The glass ball's centre for its radius `r` (`glass_radius=`), `x` along from its rest.
+fn glass_centre(r: f32, x: f32) -> Vec3 {
+    Vec3::new(GLASS_REST[0] + x, 0.02 + r * 1.0125, GLASS_REST[1])
+}
 /// The balls' tessellation (the grid traces their triangles, shaded by their vertex normals).
 const BALL_SEGMENTS: u32 = 64;
 const BALL_RINGS: u32 = 48;
@@ -195,10 +222,11 @@ fn rug_texture() -> Texture {
 }
 
 /// The rug's material; `voxel_entry` false voxelizes it with its constant `GiSurface` instead.
-fn rug_material(voxel_entry: bool, sdf: Option<&SdfBinding>) -> Material {
+fn rug_material(voxel_entry: bool, sdf: Option<&SdfBinding>, rt: bool) -> Material {
     let (code, bindings) = lit_shader(
         &format!("{VOXEL_WRITE_WGSL}\n{SURFACE_WGSL}\n{TEXTURED_WGSL}"),
         sdf,
+        rt,
         vec![
             Binding::uniform(0, ShaderStages::VERTEX | ShaderStages::FRAGMENT),
             Binding::texture_2d(1, ShaderStages::FRAGMENT),
@@ -213,10 +241,33 @@ fn rug_material(voxel_entry: bool, sdf: Option<&SdfBinding>) -> Material {
     material
 }
 
+/// The GBuffer output of a surface that lights itself (`lit_out`): its light, normal and albedo,
+/// and a polished one's F0 and roughness.
+const SELF_LIT_OUT_WGSL: &str = r#"
+fn lit_out(color: vec3<f32>, n: vec3<f32>, base: vec3<f32>, f0: f32, roughness: f32) -> KanseiGBufferOut {
+    return kansei_gbuffer_out_specular(color, vec3<f32>(0.0), n, base, f0, roughness);
+}
+"#;
+
 /// The spot lights' light on a surface (`lit_radiance`), shadowed by the shadow atlas.
 const MAP_SHADOWS_WGSL: &str = r#"
 fn lit_radiance(world: vec3<f32>, n: vec3<f32>, v: vec3<f32>, base: vec3<f32>, pixel: vec2<f32>) -> vec3<f32> {
     return kansei_spot_lights_radiance(world, n, v, base, 1.0, 0.0, pixel);
+}
+"#;
+
+/// No light of its own: the lamp's direct light is `RtShadowsEffect`'s, with ray-traced shadows
+/// (`RT_SHADOWS_GBUFFER_WGSL`'s `kansei_gbuffer_out_rt_lit` marks the surface for it). Matte
+/// surfaces take its GGX at roughness 1, as `kansei_brdf` lights them with the maps; a polished
+/// one's highlight is the traced reflections'.
+const RT_SHADOWS_WGSL: &str = r#"
+fn lit_radiance(world: vec3<f32>, n: vec3<f32>, v: vec3<f32>, base: vec3<f32>, pixel: vec2<f32>) -> vec3<f32> {
+    return vec3<f32>(0.0);
+}
+
+fn lit_out(color: vec3<f32>, n: vec3<f32>, base: vec3<f32>, f0: f32, roughness: f32) -> KanseiGBufferOut {
+    let polished = f0 > 0.0;
+    return kansei_gbuffer_out_rt_lit(color, vec3<f32>(0.0), n, base, select(1.0, roughness, polished), f0, polished);
 }
 "#;
 
@@ -258,15 +309,16 @@ impl SdfBinding {
     }
 }
 
-/// `body` (which calls `lit_radiance`, through `SURFACE_WGSL`'s `shade`) after the GBuffer output and
-/// the light chunk for `sdf` (shadows through the field) or the shadow maps, with its bindings:
-/// `bindings` plus the field's.
-fn lit_shader(body: &str, sdf: Option<&SdfBinding>, mut bindings: Vec<Binding>) -> (String, Vec<Binding>) {
+/// `body` (which calls `lit_radiance` and `lit_out`, through `SURFACE_WGSL`'s `shade`) after the
+/// GBuffer output and the light chunk for `sdf` (shadows through the field), `rt` (the light left
+/// to `RtShadowsEffect`) or the shadow maps, with its bindings: `bindings` plus the field's.
+fn lit_shader(body: &str, sdf: Option<&SdfBinding>, rt: bool, mut bindings: Vec<Binding>) -> (String, Vec<Binding>) {
     match sdf {
-        None => (format!("{GBUFFER_OUT_WGSL}\n{SPOT_LIGHTS_WGSL}\n{MAP_SHADOWS_WGSL}\n{body}"), bindings),
+        _ if rt => (format!("{GBUFFER_OUT_WGSL}\n{RT_SHADOWS_GBUFFER_WGSL}\n{RT_SHADOWS_WGSL}\n{body}"), bindings),
+        None => (format!("{GBUFFER_OUT_WGSL}\n{SPOT_LIGHTS_WGSL}\n{MAP_SHADOWS_WGSL}\n{SELF_LIT_OUT_WGSL}\n{body}"), bindings),
         Some(_) => {
             bindings.extend([Binding::uniform(10, ShaderStages::FRAGMENT), Binding::texture_3d(11, ShaderStages::FRAGMENT), Binding::sampler(12, ShaderStages::FRAGMENT)]);
-            (format!("{GBUFFER_OUT_WGSL}\n{SPOT_LIGHTS_WGSL}\n{SDF_WGSL}\n{SDF_SHADOWS_WGSL}\n{body}"), bindings)
+            (format!("{GBUFFER_OUT_WGSL}\n{SPOT_LIGHTS_WGSL}\n{SDF_WGSL}\n{SDF_SHADOWS_WGSL}\n{SELF_LIT_OUT_WGSL}\n{body}"), bindings)
         }
     }
 }
@@ -280,9 +332,10 @@ fn bind_sdf(material: &mut Material, sdf: Option<&SdfBinding>) {
     }
 }
 
-/// A lit material of `base_color`, polished as `specular` says (F0, roughness; zeros: matte).
-fn lit_material(label: &str, base_color: [f32; 3], sdf: Option<&SdfBinding>, specular: [f32; 2]) -> Material {
-    let (code, bindings) = lit_shader(&format!("{SURFACE_WGSL}\n{PLAIN_WGSL}"), sdf, vec![Binding::uniform(0, ShaderStages::VERTEX | ShaderStages::FRAGMENT)]);
+/// A lit material of `base_color`, polished as `specular` says (F0, roughness; zeros: matte), its
+/// direct light ray traced by `RtShadowsEffect` with `rt`.
+fn lit_material(label: &str, base_color: [f32; 3], sdf: Option<&SdfBinding>, rt: bool, specular: [f32; 2]) -> Material {
+    let (code, bindings) = lit_shader(&format!("{SURFACE_WGSL}\n{PLAIN_WGSL}"), sdf, rt, vec![Binding::uniform(0, ShaderStages::VERTEX | ShaderStages::FRAGMENT)]);
     let mut material = Material::new(label, &code, bindings, MaterialOptions { mrt_output_count: Some(4), ..Default::default() });
     material.set_uniform_bindable(0, label, &[base_color[0], base_color[1], base_color[2], 1.0f32, specular[0], specular[1], 0.0, 0.0]);
     bind_sdf(&mut material, sdf);
@@ -426,6 +479,45 @@ impl View {
     }
 }
 
+/// The environment past the box's opening (`env=`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Env {
+    /// Black, as the box has always been.
+    None,
+    /// A studio gradient (`GradientEnvironment`), bright above, on a dome round the box.
+    Gradient,
+    /// The studio HDRI (`HdrEnvironment`), fetched the first time.
+    Hdri,
+}
+
+impl Env {
+    fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "none" | "off" | "0" => Env::None,
+            "gradient" => Env::Gradient,
+            "hdri" | "hdr" => Env::Hdri,
+            _ => return None,
+        })
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Env::None => "none",
+            Env::Gradient => "gradient",
+            Env::Hdri => "hdri",
+        }
+    }
+}
+
+/// Poly Haven's "Studio Small 09" by Sergej Majboroda (CC0), 1024 x 512.
+const HDRI_ASSET: &str = "assets/studio_small_09_1k.hdr";
+/// The HDRI's stops at `env_ev=0`: its mean radiance is about 0.86, the lamp-lit walls' about 20.
+const HDRI_EV: f32 = 4.0;
+/// The studio gradient's radiance straight up and straight down at `env_ev=0` (cd/m²), about the
+/// HDRI's own above and below.
+const STUDIO_UP: [f32; 3] = [20.0, 20.0, 21.0];
+const STUDIO_DOWN: [f32; 3] = [6.0, 5.8, 5.6];
+
 /// The reflections' view by name: `lit`, `reflection`, `mirror` or `cost`.
 fn reflection_view(name: &str) -> Option<RtReflectionsView> {
     match name {
@@ -523,6 +615,105 @@ fn rt_grid_options() -> SceneRtGridOptions {
     }
 }
 
+/// The direct light's shadows (`shadows=`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Direct {
+    /// The shadow atlas (PCSS, the lamp's disk).
+    Maps,
+    /// Voxel GI's distance field, through the material helper `gi::SDF_WGSL`.
+    Sdf,
+    /// Ray traced through the room's grid (`RtShadowsEffect`): the materials leave the lamp's
+    /// light to it.
+    Rt,
+}
+
+impl Direct {
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "maps" | "map" => Some(Self::Maps),
+            "sdf" => Some(Self::Sdf),
+            "rt" => Some(Self::Rt),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Maps => "maps",
+            Self::Sdf => "sdf",
+            Self::Rt => "rt",
+        }
+    }
+}
+
+fn rt_shadows_view(name: &str) -> Option<RtShadowsView> {
+    match name {
+        "lit" => Some(RtShadowsView::Lit),
+        "visibility" => Some(RtShadowsView::Visibility),
+        "direct" => Some(RtShadowsView::Direct),
+        "mask" => Some(RtShadowsView::Mask),
+        _ => None,
+    }
+}
+
+fn rt_shadows_view_name(view: RtShadowsView) -> &'static str {
+    match view {
+        RtShadowsView::Lit => "lit",
+        RtShadowsView::Visibility => "visibility",
+        RtShadowsView::Direct => "direct",
+        RtShadowsView::Mask => "mask",
+    }
+}
+
+/// `RtShadowsEffect`'s settings (`rts_*`, the panel's "RT shadows").
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RtShadows {
+    view: RtShadowsView,
+    /// a ray a pixel (else one for each 2 x 2)
+    full: bool,
+    /// metres the screen-space contact rays walk (0: none)
+    contact: f32,
+    /// the glass ball's caustics (`RtCausticsEffect`), and whether they show alone
+    caustics: bool,
+    caustics_view: bool,
+}
+
+impl RtShadows {
+    fn from_url() -> Self {
+        Self {
+            view: param("rts_view").and_then(|v| rt_shadows_view(&v)).unwrap_or_default(),
+            full: param("rts_res").as_deref() == Some("full"),
+            // (the effect's default)
+            contact: param_or("rts_contact", 0.25f32).clamp(0.0, 2.0),
+            caustics: flag("caustics", true),
+            caustics_view: param("caustics_view").as_deref() == Some("caustics"),
+        }
+    }
+
+    fn set(&mut self, key: &str, v: &str) -> bool {
+        match key {
+            "view" => rt_shadows_view(v).map(|x| self.view = x),
+            "res" => Some(self.full = v == "full"),
+            "contact" => v.parse::<f32>().ok().map(|x| self.contact = x.clamp(0.0, 2.0)),
+            "caustics" => Some(self.caustics = matches!(v, "1" | "true" | "on")),
+            "caustics_view" => Some(self.caustics_view = v == "caustics"),
+            _ => None,
+        }
+        .is_some()
+    }
+
+    fn json(&self) -> String {
+        format!(
+            "{{\"view\":\"{}\",\"res\":\"{}\",\"contact\":{},\"caustics\":{},\"caustics_view\":\"{}\"}}",
+            rt_shadows_view_name(self.view),
+            if self.full { "full" } else { "half" },
+            self.contact,
+            self.caustics,
+            if self.caustics_view { "caustics" } else { "lit" }
+        )
+    }
+}
+
 /// Everything the panel and the URL set.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Config {
@@ -539,9 +730,9 @@ struct Config {
     sdf_ao: f32,
     /// The voxels' shadows through the distance field.
     sdf_shadows: SdfShadows,
-    /// The direct light's shadows through the distance field (the material helper) instead of
-    /// the shadow atlas.
-    direct_sdf: bool,
+    /// The direct light's shadows: the shadow atlas, the distance field or ray traced.
+    direct: Direct,
+    rt_shadows: RtShadows,
     /// The SDF slice's height, metres.
     slice: f32,
     /// `reflect=1`: the polished floor and the grid of triangles its reflections trace (set at
@@ -563,9 +754,20 @@ struct Config {
     glass_rough: f32,
     glass_tint: [f32; 3],
     glass_samples: u32,
+    /// The glass ball casts into the shadow maps (`glass_shadow=1`), and rolls (`roll=1`); its
+    /// radius (`glass_radius=`, m, set at load).
+    glass_shadow: bool,
+    glass_radius: f32,
+    roll: bool,
     /// The balls' (and the floor's) rays' hits lit by the lit image where the camera sees them
     /// (`rt_screen=`), else by the lamp and the voxels.
     screen_hits: bool,
+    /// The environment past the opening, its stops over the default, its turn (degrees) and the
+    /// HDRI background's blur.
+    env: Env,
+    env_ev: f32,
+    env_rotation: f32,
+    env_blur: f32,
 }
 
 impl Config {
@@ -576,7 +778,7 @@ impl Config {
 
     /// Whether anything reads the distance field.
     fn needs_sdf(&self) -> bool {
-        self.sdf_ao > 0.0 || self.sdf_shadows != SdfShadows::Off || self.view == View::Sdf || self.direct_sdf || self.needs_probes()
+        self.sdf_ao > 0.0 || self.sdf_shadows != SdfShadows::Off || self.view == View::Sdf || self.direct == Direct::Sdf || self.needs_probes()
     }
 
     /// Whether the scene's voxel GI must run: for the voxel modes, the distance field, or the
@@ -598,6 +800,17 @@ impl Config {
     fn glass_material(&self) -> StandardLitOptions {
         StandardLitOptions::glass(self.glass_tint, self.glass_ior, self.glass_rough)
     }
+
+    /// The HDRI's settings.
+    fn hdri_settings(&self) -> HdrEnvironmentSettings {
+        HdrEnvironmentSettings { intensity: (HDRI_EV + self.env_ev).exp2(), rotation: self.env_rotation.to_radians(), tint: [1.0; 3] }
+    }
+
+    /// The studio gradient's radiance up and down.
+    fn studio(&self) -> ([f32; 3], [f32; 3]) {
+        let k = self.env_ev.exp2();
+        (STUDIO_UP.map(|v| v * k), STUDIO_DOWN.map(|v| v * k))
+    }
 }
 
 /// A preset: the GI mode, voxel tier (None: the device's default), view, dragon and the
@@ -611,11 +824,11 @@ struct Preset {
     dragon: Dragon,
     sdf_ao: f32,
     sdf_shadows: SdfShadows,
-    direct_sdf: bool,
+    direct: Direct,
 }
 
 const fn preset(name: &'static str, label: &'static str, gi: &'static str, voxels: Option<VoxelGiQuality>, view: View, dragon: Dragon) -> Preset {
-    Preset { name, label, gi, voxels, view, dragon, sdf_ao: 0.0, sdf_shadows: SdfShadows::Off, direct_sdf: false }
+    Preset { name, label, gi, voxels, view, dragon, sdf_ao: 0.0, sdf_shadows: SdfShadows::Off, direct: Direct::Maps }
 }
 
 const PRESETS: [Preset; 15] = [
@@ -630,8 +843,8 @@ const PRESETS: [Preset; 15] = [
     preset("phone", "Phone (low)", "voxel+ssgi", Some(VoxelGiQuality::Low), View::Lit, Dragon::Off),
     preset("dragon", "Dragon, 871k tris (voxel + SSGI)", "voxel+ssgi", None, View::Lit, Dragon::Full),
     // the distance field: its AO on the GI and soft shadows for the voxels and the direct light
-    Preset { sdf_ao: 0.8, sdf_shadows: SdfShadows::Always, direct_sdf: true, ..preset("sdf", "SDF: AO + soft shadows", "voxel+ssgi", None, View::Lit, Dragon::Off) },
-    Preset { sdf_ao: 0.8, sdf_shadows: SdfShadows::Always, direct_sdf: true, ..preset("sdf-dragon", "SDF + dragon, 871k tris", "voxel+ssgi", None, View::Lit, Dragon::Full) },
+    Preset { sdf_ao: 0.8, sdf_shadows: SdfShadows::Always, direct: Direct::Sdf, ..preset("sdf", "SDF: AO + soft shadows", "voxel+ssgi", None, View::Lit, Dragon::Off) },
+    Preset { sdf_ao: 0.8, sdf_shadows: SdfShadows::Always, direct: Direct::Sdf, ..preset("sdf-dragon", "SDF + dragon, 871k tris", "voxel+ssgi", None, View::Lit, Dragon::Full) },
     preset("slice", "SDF slice (debug)", "voxel", None, View::Sdf, Dragon::Off),
     // irradiance probes traced in the distance field, under SSGI
     preset("probes", "Probes + SSGI", "probes+ssgi", None, View::Lit, Dragon::Off),
@@ -645,7 +858,7 @@ fn probe_options(phone: bool) -> SdfProbeOptions {
 }
 
 /// The camera presets: (name, target, distance, azimuth, elevation).
-const CAMERAS: [(&str, [f32; 3], f32, f32, f32); 5] = [
+const CAMERAS: [(&str, [f32; 3], f32, f32, f32); 7] = [
     // the box's opening, framed as the Cornell box photographs are
     ("front", [0.0, 2.0, -2.0], 8.3, 0.0, 0.0),
     // inside, from the upper front-left corner toward the short block and the green wall
@@ -656,6 +869,10 @@ const CAMERAS: [(&str, [f32; 3], f32, f32, f32); 5] = [
     ("floor", [-0.3, 0.5, -2.0], 6.2, 0.3, 0.42),
     // close on the glass ball, the room and (with dragon=1) the dragon behind it
     ("glass", [-0.1, 0.45, -0.45], 1.8, 0.92, 0.12),
+    // close on the chrome ball from in front of the opening: it mirrors what is behind the camera
+    ("chrome", [0.8, 1.6, -1.5], 2.2, -0.35, 0.1),
+    // close on the glass ball shrunk to a marble (glass_radius=0.015) and its caustics on the rug
+    ("marble", [-0.1, 0.03, -0.45], 0.12, 0.92, 0.5),
 ];
 
 struct State {
@@ -670,8 +887,9 @@ struct State {
     enabled_voxels: Option<VoxelGiQuality>,
     /// Bumped whenever voxel GI or its field is made anew (materials that read the field rebind).
     gi_generation: u32,
-    /// The generation the lit materials read the field of (None: they use the shadow maps).
-    materials_sdf: Option<u32>,
+    /// The direct shadows the lit materials were made for, and the generation of the field they
+    /// read (with `Direct::Sdf`).
+    materials: (Direct, Option<u32>),
     /// The lit renderables: (scene index, label, albedo); the rug is apart.
     lit: Vec<(usize, &'static str, [f32; 3])>,
     tall: usize,
@@ -688,6 +906,16 @@ struct State {
     stats: Option<Stats>,
     /// The floor's F0 and roughness (zeros without `reflect=1`).
     floor_specular: [f32; 2],
+    /// The environments: the studio gradient (and its dome) and the HDRI once fetched.
+    gradient: GradientEnvironment,
+    dome: usize,
+    hdri: Option<HdrEnvironment>,
+    /// Fetching and decoding the HDRI, and uploading it, ms.
+    hdri_load_ms: (f64, f64),
+    /// `env_spin`: degrees a second the HDRI turns.
+    env_spin: f32,
+    /// Seconds the glass ball has rolled (`roll=1`).
+    roll_time: f32,
 }
 
 /// The `stats=1` overlay's numbers, refreshed every second.
@@ -729,7 +957,7 @@ fn with_preset(config: Config, name: &str, phone: bool) -> Config {
         dragon: p.dragon,
         sdf_ao: p.sdf_ao,
         sdf_shadows: p.sdf_shadows,
-        direct_sdf: p.direct_sdf,
+        direct: p.direct,
         ..config
     }
 }
@@ -746,7 +974,8 @@ fn config_from_url(phone: bool) -> Config {
         textured: true,
         sdf_ao: 0.0,
         sdf_shadows: SdfShadows::Off,
-        direct_sdf: false,
+        direct: Direct::Maps,
+        rt_shadows: RtShadows::from_url(),
         slice: 0.6,
         reflect: flag("reflect", false),
         reflections: true,
@@ -762,7 +991,14 @@ fn config_from_url(phone: bool) -> Config {
         glass_rough: param_or("glass_rough", 0.0f32).clamp(0.0, 1.0),
         glass_tint: param("glass_tint").and_then(|v| parse_rgb(&v)).unwrap_or(GLASS_TINT),
         glass_samples: param_or("glass_samples", 4u32).clamp(1, 16),
+        glass_shadow: flag("glass_shadow", false),
+        glass_radius: param_or("glass_radius", BALL_RADIUS).clamp(0.005, BALL_RADIUS),
+        roll: flag("roll", false),
         screen_hits: flag("rt_screen", true),
+        env: param("env").as_deref().and_then(Env::from_name).unwrap_or(Env::None),
+        env_ev: param_or("env_ev", 0.0f32),
+        env_rotation: param_or("env_rotation", 0.0f32),
+        env_blur: param_or("env_blur", 0.0f32).clamp(0.0, 1.0),
     };
     if let Some(preset) = param("preset").or_else(|| param("gi").is_none().then(|| DEFAULT_PRESET.to_string())) {
         c = with_preset(c, &preset, phone);
@@ -786,23 +1022,46 @@ fn config_from_url(phone: bool) -> Config {
     if let Some(shadows) = param("sdf_shadows").as_deref().and_then(SdfShadows::from_name) {
         c.sdf_shadows = shadows;
     }
-    if let Some(direct) = param("shadows") {
-        c.direct_sdf = direct == "sdf";
+    if let Some(direct) = param("shadows").as_deref().and_then(Direct::from_name) {
+        c.direct = direct;
     }
     if let Some(slice) = param("slice").and_then(|v| v.parse::<f32>().ok()) {
         c.slice = slice;
     }
     c.rug = param("rug").as_deref() != Some("off");
     c.textured = param("albedo").as_deref() != Some("constant");
-    c.grid = c.reflect || c.gi == Gi::Rt || flag("rt", false) || c.mirror || c.glass;
+    c.grid = c.reflect || c.gi == Gi::Rt || c.direct == Direct::Rt || flag("rt", false) || c.mirror || c.glass;
     c
 }
 
 /// The post-processing chain for `config`: its GI effect (none when off) and the tone mapping.
-fn build_effects(renderer: &Renderer, config: &Config, phone: bool, stats: bool) -> Vec<Box<dyn PostProcessingEffect>> {
+/// With an `environment`, every effect is lit by it (`set_environment`) and its cubemap, where it
+/// has one, is the background. The room's materials have no sky ambient of their own, so none is
+/// taken out where the GI replaces it.
+fn build_effects(renderer: &Renderer, config: &Config, phone: bool, stats: bool, environment: Option<&EnvironmentLighting>) -> Vec<Box<dyn PostProcessingEffect>> {
     let indirect = config.view == View::Indirect;
     let mut effects: Vec<Box<dyn PostProcessingEffect>> = Vec::new();
-    let screen = ScreenSpaceGIOptions { radius_m: 4.0, ..Default::default() };
+    // the lamp's direct light with ray-traced shadows (shadows=rt): first, so the GI and the
+    // reflections' screen hits see it (and its visibility weighs the caustics)
+    let mut visibility = None;
+    if let (Direct::Rt, Some(grid)) = (config.direct, renderer.rt_grid()) {
+        let mut shadows = RtShadowsEffect::new(grid.handle());
+        let r = config.rt_shadows;
+        shadows.view = r.view;
+        shadows.half_resolution = !r.full;
+        shadows.contact_length = r.contact;
+        visibility = Some(shadows.visibility());
+        effects.push(Box::new(shadows));
+        if r.view != RtShadowsView::Lit {
+            // its debug views alone: the direct light exposed as the image is, the visibility and
+            // the mask as they are
+            let mut tone = ToneMapOptions::for_surface(renderer.presentation_format());
+            tone.exposure = if r.view == RtShadowsView::Direct { exposure_from_ev100(5.0) } else { 1.0 };
+            effects.push(Box::new(ToneMapEffect::new(tone)));
+            return effects;
+        }
+    }
+    let screen = ScreenSpaceGIOptions { radius_m: 4.0, ambient_occlusion: 0.0, ..Default::default() };
     match config.gi {
         Gi::Off if config.view != View::Sdf => {}
         Gi::Screen(quality) if config.view != View::Sdf => {
@@ -816,7 +1075,7 @@ fn build_effects(renderer: &Renderer, config: &Config, phone: bool, stats: bool)
             let scene_gi = renderer.voxel_gi().expect("gi=rt enables voxel GI");
             let grid = renderer.rt_grid().expect("gi=rt builds the grid");
             let r = config.rtgi;
-            let options = RtDiffuseGiOptions { resolution: r.resolution, hit_lighting: r.hit, shadows: r.shadows, denoise: r.denoise, kernel: r.kernel, max_distance: 20.0, ..Default::default() };
+            let options = RtDiffuseGiOptions { resolution: r.resolution, hit_lighting: r.hit, shadows: r.shadows, denoise: r.denoise, kernel: r.kernel, max_distance: 20.0, ambient: 0.0, ..Default::default() };
             let mut effect = RtDiffuseGiEffect::with_volume(scene_gi.volume(), grid.handle(), options);
             effect.mode = r.mode;
             effect.accumulate = r.accumulate;
@@ -831,7 +1090,7 @@ fn build_effects(renderer: &Renderer, config: &Config, phone: bool, stats: bool)
             let scene_gi = renderer.voxel_gi().expect("voxel GI is enabled for the voxel modes and the field");
             let near_quality = if phone || scene_gi.quality() == VoxelGiQuality::Low { GiQuality::Low } else { GiQuality::High };
             let near_field = config.gi.near_field().then_some(ScreenSpaceGIOptions { quality: near_quality, ..screen });
-            let mut effect = VoxelGIEffect::new(scene_gi.volume(), VoxelGIOptions { quality: scene_gi.quality(), near_field, ..Default::default() });
+            let mut effect = VoxelGIEffect::new(scene_gi.volume(), VoxelGIOptions { quality: scene_gi.quality(), near_field, material_ambient: 0.0, ..Default::default() });
             effect.show_indirect = indirect;
             effect.show_voxels = config.view == View::Voxels;
             effect.set_sdf(scene_gi.sdf());
@@ -842,6 +1101,17 @@ fn build_effects(renderer: &Renderer, config: &Config, phone: bool, stats: bool)
             effect.show_probes = config.view == View::Probes;
             effects.push(Box::new(effect));
         }
+    }
+    // the glass ball's caustics on the light RtShadowsEffect lets through it (the casters and the
+    // lights each frame)
+    if let (Direct::Rt, true, true, Some(grid)) = (config.direct, config.rt_shadows.caustics, config.glass, renderer.rt_grid()) {
+        let mut caustics = RtCausticsEffect::new(renderer.device(), grid.handle(), RtCausticsOptions::default());
+        // (its triangles carry its tint, the light left after a metre)
+        caustics.set_glass(config.glass_ior, [1.0; 3]);
+        caustics.view = if config.rt_shadows.caustics_view { RtCausticsView::Caustics } else { RtCausticsView::Lit };
+        // the light they add and take only where the lamp reaches
+        caustics.set_visibility(visibility);
+        effects.push(Box::new(caustics));
     }
     // the polished floor's reflections, the chrome ball and the glass, through the room's grid
     if let (true, Some(scene_gi), Some(grid)) = (config.traces(), renderer.voxel_gi(), renderer.rt_grid()) {
@@ -864,6 +1134,16 @@ fn build_effects(renderer: &Renderer, config: &Config, phone: bool, stats: bool)
         }
         reflections.set_glass(config.glass.then_some(RtGlass { samples: config.glass_samples, ..Default::default() }));
         effects.push(Box::new(reflections));
+    }
+    if let Some(environment) = environment {
+        for effect in &mut effects {
+            effect.set_environment(environment);
+        }
+        if environment.environment.is_some() {
+            let mut background = EnvironmentBackgroundEffect::new(environment);
+            background.blur = config.env_blur;
+            effects.insert(0, Box::new(background));
+        }
     }
     let mut tone = ToneMapOptions::for_surface(renderer.presentation_format());
     // the indirect view alone is 2 stops brighter
@@ -932,22 +1212,30 @@ impl State {
                 gi.disable_probes();
             }
         }
-        self.volume.effects = build_effects(&self.renderer, &config, self.phone, self.stats.is_some());
-        // the lit materials: shadowed through the field (bound to this one) or by the maps
-        let wanted = config.direct_sdf.then_some(self.gi_generation);
-        if wanted != self.materials_sdf || config.textured != previous.textured {
-            let sdf = config.direct_sdf.then(|| self.renderer.voxel_gi().and_then(SdfBinding::of)).flatten();
+        let environment = self.environment();
+        self.renderer.set_environment(environment.as_ref());
+        self.volume.effects = build_effects(&self.renderer, &config, self.phone, self.stats.is_some(), environment.as_ref());
+        if let Some(r) = self.scene.get_renderable_mut(self.dome) {
+            r.visible = config.env == Env::Gradient;
+        }
+        self.set_env_settings(config);
+        // the lit materials: shadowed through the field (bound to this one), by the maps, or
+        // leaving the lamp to the ray-traced shadows
+        let wanted = (config.direct, (config.direct == Direct::Sdf).then_some(self.gi_generation));
+        if wanted != self.materials || config.textured != previous.textured {
+            let sdf = (config.direct == Direct::Sdf).then(|| self.renderer.voxel_gi().and_then(SdfBinding::of)).flatten();
+            let rt = config.direct == Direct::Rt;
             for &(index, label, albedo) in &self.lit {
                 if let Some(r) = self.scene.get_renderable_mut(index) {
-                    r.material = lit_material(label, albedo, sdf.as_ref(), if label == "Floor" { self.floor_specular } else { [0.0; 2] });
+                    r.material = lit_material(label, albedo, sdf.as_ref(), rt, if label == "Floor" { self.floor_specular } else { [0.0; 2] });
                     r.material_dirty = true;
                 }
             }
             if let Some(r) = self.scene.get_renderable_mut(self.rug) {
-                r.material = rug_material(config.textured, sdf.as_ref());
+                r.material = rug_material(config.textured, sdf.as_ref(), rt);
                 r.material_dirty = true;
             }
-            self.materials_sdf = wanted;
+            self.materials = wanted;
         }
 
         if let Some(r) = self.scene.get_renderable_mut(self.rug) {
@@ -957,6 +1245,10 @@ impl State {
             if let Some(r) = index.and_then(|i| self.scene.get_renderable_mut(i)) {
                 r.visible = on;
             }
+        }
+        if let Some(r) = self.glass.and_then(|i| self.scene.get_renderable_mut(i)) {
+            r.cast_shadow = config.glass_shadow;
+            r.dynamic = config.roll;
         }
         self.set_ball_materials(config);
         if config.textured != previous.textured {
@@ -983,10 +1275,40 @@ impl State {
         }
     }
 
+    /// The environment `config.env` names (None: black; the HDRI's until it is fetched).
+    fn environment(&self) -> Option<EnvironmentLighting> {
+        match self.config.env {
+            Env::None => None,
+            Env::Gradient => Some(self.gradient.lighting()),
+            Env::Hdri => self.hdri.as_ref().map(|h| h.lighting()),
+        }
+    }
+
+    /// The environment's intensity, turn and blur to `config`'s (alone: the chain goes on as it
+    /// is; the HDRI is prepared again before the next frame).
+    fn set_env_settings(&mut self, config: Config) {
+        self.config = config;
+        let (up, down) = config.studio();
+        self.gradient.set(self.renderer.queue(), up, down);
+        if let Some(buffer) = self.scene.get_renderable(self.dome).and_then(|r| r.material.bindable_buffer(0)) {
+            let bytes: Vec<u8> = dome_uniform(up, down).iter().flat_map(|v| v.to_le_bytes()).collect();
+            self.renderer.queue().write_buffer(&buffer, 0, &bytes);
+        }
+        if let Some(hdri) = &mut self.hdri {
+            hdri.set_settings(config.hdri_settings());
+        }
+        if let Some(background) = self.volume.effect_mut::<EnvironmentBackgroundEffect>() {
+            background.blur = config.env_blur;
+        }
+    }
+
     /// The balls' materials to `config`'s (alone: the effects, and the frosted glass's history, go
     /// on as they are).
     fn set_ball_materials(&mut self, config: Config) {
         self.config = config;
+        if let Some(caustics) = self.volume.effect_mut::<RtCausticsEffect>() {
+            caustics.set_glass(config.glass_ior, [1.0; 3]);
+        }
         for (index, material) in [(self.mirror, config.mirror_material()), (self.glass, config.glass_material())] {
             if let Some(r) = index.and_then(|i| self.scene.get_renderable_mut(i)) {
                 r.material.set_standard_lit(&self.renderer, &material);
@@ -1015,6 +1337,33 @@ impl State {
             }
         }
         self.controls.update(&mut self.camera, dt);
+        if self.env_spin != 0.0 && self.hdri.is_some() {
+            let config = Config { env_rotation: (self.config.env_rotation + self.env_spin * dt) % 360.0, ..self.config };
+            self.set_env_settings(config);
+        }
+        // the HDRI's cubemaps and SH, prepared again when its settings changed
+        if let Some(hdri) = &mut self.hdri {
+            hdri.prepare(self.renderer.device(), self.renderer.queue());
+        }
+        if let (true, Some(r)) = (self.config.roll, self.glass.and_then(|i| self.scene.get_renderable_mut(i))) {
+            // back and forth across the rug, turning as it rolls
+            self.roll_time += dt;
+            let radius = self.config.glass_radius;
+            let x = 0.5 * (radius / BALL_RADIUS).max(0.2) * (self.roll_time * 0.5).sin();
+            r.object.position = glass_centre(radius, x);
+            r.object.rotation.z = -x / radius;
+        }
+        if let Some(shadows) = self.volume.effect_mut::<RtShadowsEffect>() {
+            shadows.update_lights(self.scene.lights());
+        }
+        let ball = self.glass.and_then(|i| self.scene.get_renderable(i)).filter(|r| r.visible).map(|r| {
+            let c = glam::Vec3::new(r.object.position.x, r.object.position.y, r.object.position.z);
+            (c - glam::Vec3::splat(self.config.glass_radius), c + glam::Vec3::splat(self.config.glass_radius))
+        });
+        if let Some(caustics) = self.volume.effect_mut::<RtCausticsEffect>() {
+            caustics.update_lights(self.scene.lights());
+            caustics.set_casters(ball.as_slice());
+        }
         if let Some(gi) = self.volume.effect_mut::<RtDiffuseGiEffect>() {
             gi.update_lights(self.scene.lights());
         }
@@ -1114,13 +1463,34 @@ impl State {
         )
     }
 
+    /// The environment's settings, and the HDRI's size and load times (null until fetched).
+    fn env_info(&self) -> String {
+        let c = &self.config;
+        let hdri = self.hdri.as_ref().map_or("null".into(), |h| {
+            let (w, h2) = h.image_size();
+            format!("{{\"image\":[{w},{h2}],\"face\":{},\"mib\":{:.1},\"fetch_decode_ms\":{:.1},\"upload_ms\":{:.1}}}", h.face_size(), h.memory_bytes() as f64 / (1 << 20) as f64, self.hdri_load_ms.0, self.hdri_load_ms.1)
+        });
+        format!("{{\"mode\":\"{}\",\"ev\":{},\"rotation\":{},\"blur\":{},\"spin\":{},\"hdri\":{hdri}}}", c.env.name(), c.env_ev, c.env_rotation, c.env_blur, self.env_spin)
+    }
+
+    /// The glass ball's caustics: the photons and the tile last frame (null when they don't run).
+    fn caustics_info(&self) -> String {
+        let Some(c) = self.volume.effect::<RtCausticsEffect>() else { return "null".into() };
+        let (pairs, photons, fed) = c.photons_sent();
+        let tile = c.tile(0).map_or("null".into(), |(_, texel, dims, history)| format!("{{\"texel_mm\":{:.2},\"dims\":{dims:?},\"history\":{history}}}", texel * 1e3));
+        format!("{{\"lights\":{pairs},\"photons\":{photons},\"fed\":{fed},\"tile\":{tile}}}")
+    }
+
     fn info(&self) -> String {
         let gi = self.renderer.voxel_gi();
         let passes: Vec<String> = self.stats.as_ref().map_or(Vec::new(), |s| s.passes.iter().map(|(l, ms)| format!("[\"{l}\",{ms:.3}]")).collect());
         // (+ 0.0: an empty sum is -0)
         let sum = |prefix: &str| self.stats.as_ref().map_or(0.0, |s| s.passes.iter().filter(|p| p.0.starts_with(prefix)).map(|p| p.1).sum::<f64>()) + 0.0;
         format!(
-            "{{\"grid\":{},\"rtgi\":{},\"rtgi_ms\":{:.3},\"reflect\":{},\"balls\":{},\"rt_ms\":{:.3},\"reflect_ms\":{:.3},\"glass_ms\":{:.3},\"gi\":\"{}\",\"view\":\"{}\",\"voxels\":\"{}\",\"voxel_tier\":{},\"dims\":{},\"mib\":{:.1},\"dragon\":\"{}\",\"animate\":{},\"rug\":{},\"textured\":{},\"sdf_ao\":{},\"sdf_shadows\":\"{}\",\"shadows\":\"{}\",\"slice\":{},\"sdf\":{},\"sdf_ms\":{:.3},\"probes\":{},\"probe_dims\":{},\"probes_ms\":{:.3},\"triangles\":{},\"stats\":{},\"frame_ms\":{:.2},\"gpu_ms\":{:.3},\"gpu_span_ms\":{:.3},\"voxelize_ms\":{:.3},\"inject_ms\":{:.3},\"mips_ms\":{:.3},\"screen_ms\":{:.3},\"ssgi_ms\":{:.3},\"passes\":[{}]}}",
+            "{{\"env\":{},\"env_prepare_ms\":{:.3},\"env_background_ms\":{:.3},\"grid\":{},\"rtgi\":{},\"rtgi_ms\":{:.3},\"reflect\":{},\"balls\":{},\"rt_ms\":{:.3},\"reflect_ms\":{:.3},\"glass_ms\":{:.3},\"gi\":\"{}\",\"view\":\"{}\",\"voxels\":\"{}\",\"voxel_tier\":{},\"dims\":{},\"mib\":{:.1},\"dragon\":\"{}\",\"animate\":{},\"rug\":{},\"textured\":{},\"sdf_ao\":{},\"sdf_shadows\":\"{}\",\"shadows\":\"{}\",\"rt_shadows\":{},\"rt_shadows_ms\":{:.3},\"caustics\":{},\"caustics_ms\":{:.3},\"slice\":{},\"sdf\":{},\"sdf_ms\":{:.3},\"probes\":{},\"probe_dims\":{},\"probes_ms\":{:.3},\"triangles\":{},\"stats\":{},\"frame_ms\":{:.2},\"gpu_ms\":{:.3},\"gpu_span_ms\":{:.3},\"voxelize_ms\":{:.3},\"inject_ms\":{:.3},\"mips_ms\":{:.3},\"screen_ms\":{:.3},\"ssgi_ms\":{:.3},\"passes\":[{}]}}",
+            self.env_info(),
+            sum("Environment/Cube") + sum("Environment/Prefilter") + sum("Environment/SH"),
+            sum("Environment/Background"),
             self.grid_info(),
             self.rtgi_info(),
             sum("RtGi/"),
@@ -1141,7 +1511,11 @@ impl State {
             self.config.textured,
             self.config.sdf_ao,
             self.config.sdf_shadows.name(),
-            if self.config.direct_sdf { "sdf" } else { "map" },
+            self.config.direct.name(),
+            self.config.rt_shadows.json(),
+            sum("RtShadows/"),
+            self.caustics_info(),
+            sum("RtCaustics/"),
             self.config.slice,
             gi.and_then(|g| g.sdf()).is_some(),
             sum("VoxelGI/Sdf"),
@@ -1163,6 +1537,27 @@ impl State {
     }
 }
 
+/// The studio gradient's dome (`Material::gradient_sky`'s uniform): `up` at the zenith, `down`
+/// below the horizon, their mean at it.
+fn dome_uniform(up: [f32; 3], down: [f32; 3]) -> [f32; 12] {
+    let o = GradientSkyOptions { zenith: up, horizon: std::array::from_fn(|c| (up[c] + down[c]) * 0.5), ground: down, curve: 0.5 };
+    let ([zr, zg, zb], [hr, hg, hb], [gr, gg, gb]) = (o.zenith, o.horizon, o.ground);
+    [zr, zg, zb, o.curve, hr, hg, hb, 0.0, gr, gg, gb, 0.0]
+}
+
+/// Fetch the studio HDRI and upload it: the environment, and the ms its fetch and decode took and
+/// its upload (None if it can't be fetched or read).
+async fn load_hdri(device: &wgpu::Device, queue: &wgpu::Queue) -> Option<(HdrEnvironment, (f64, f64))> {
+    let t = now();
+    let bytes = fetch_bytes(HDRI_ASSET).await.map_err(|e| log::warn!("{HDRI_ASSET}: {e:?}")).ok()?;
+    let image = kansei_core::environment::HdrImage::decode(&bytes).map_err(|e| log::warn!("{e}")).ok()?;
+    let decoded = now();
+    let hdri = HdrEnvironment::new(device, queue, &image, HdrEnvironmentOptions::default());
+    let ms = ((decoded - t) * 1000.0, (now() - decoded) * 1000.0);
+    log::info!("HDRI: {} x {}, fetched and decoded in {:.0} ms, uploaded in {:.1} ms; cube faces of {}", image.width, image.height, ms.0, ms.1, hdri.face_size());
+    Some((hdri, ms))
+}
+
 /// Add the dragon to the scene (hidden until the config shows it), returning its index.
 const DRAGON_ALBEDO: [f32; 3] = [0.75, 0.62, 0.42];
 
@@ -1176,7 +1571,7 @@ fn add_dragon(scene: &mut Scene, geometry: kansei_core::geometries::Geometry, re
         log::info!("dragon: cluster LOD of {} triangles in {:.0} ms", geometry.index_count() / 3, (now() - t) * 1000.0);
         ClusterLod::new(mesh)
     });
-    let mut dragon = Renderable::new(geometry, lit_material("Dragon", albedo, None, [0.0; 2])).with_gi(GiSurface::new(albedo));
+    let mut dragon = Renderable::new(geometry, lit_material("Dragon", albedo, None, false, [0.0; 2])).with_gi(GiSurface::new(albedo));
     dragon.clusters = clusters;
     // its hits shaded with its vertex normals, not its cut's facets
     dragon.rt = grid.then(|| RtSurface::new(albedo).with_smooth_normals());
@@ -1214,20 +1609,20 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     ];
     for (label, size, position, color) in slabs {
         let specular = if label == "Floor" { floor_specular } else { [0.0; 2] };
-        let mut slab = Renderable::new(BoxGeometry::new(size[0], size[1], size[2]), lit_material(label, color, None, specular)).with_gi(GiSurface::new(color));
+        let mut slab = Renderable::new(BoxGeometry::new(size[0], size[1], size[2]), lit_material(label, color, None, false, specular)).with_gi(GiSurface::new(color));
         slab.object.set_position(position[0], position[1], position[2]);
         slab.rt = rt(color);
         lit.push((scene.add(SceneNode::Renderable(slab)), label, color));
     }
     // a tall block near the red wall and a short one near the green wall
     let tall_rest = (Vec3::new(-0.75, 1.2, -2.6), 0.33);
-    let mut tall = Renderable::new(BoxGeometry::new(1.2, 2.4, 1.2), lit_material("Tall", white, None, [0.0; 2])).with_gi(GiSurface::new(white));
+    let mut tall = Renderable::new(BoxGeometry::new(1.2, 2.4, 1.2), lit_material("Tall", white, None, false, [0.0; 2])).with_gi(GiSurface::new(white));
     tall.rt = rt(white);
     tall.object.position = tall_rest.0;
     tall.object.rotation.y = tall_rest.1;
     let tall = scene.add(SceneNode::Renderable(tall));
     lit.push((tall, "Tall", white));
-    let mut short = Renderable::new(BoxGeometry::new(1.2, 1.2, 1.2), lit_material("Short", white, None, [0.0; 2])).with_gi(GiSurface::new(white));
+    let mut short = Renderable::new(BoxGeometry::new(1.2, 1.2, 1.2), lit_material("Short", white, None, false, [0.0; 2])).with_gi(GiSurface::new(white));
     short.rt = rt(white);
     short.object.set_position(0.8, 0.6, -1.5);
     short.object.rotation.y = -0.3;
@@ -1236,7 +1631,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     // before the short one, whose sides facing the camera only bounces light; its constant
     // surface (its mean colour) is used where the material's voxel entry is not
     let mean: [f32; 3] = std::array::from_fn(|c| (RUG_LEFT[c] + RUG_RIGHT[c]) * 0.5);
-    let mut rug = Renderable::new(BoxGeometry::new(2.4, 0.02, 0.8), rug_material(config.textured, None)).with_gi(GiSurface::new(mean));
+    let mut rug = Renderable::new(BoxGeometry::new(2.4, 0.02, 0.8), rug_material(config.textured, None, false)).with_gi(GiSurface::new(mean));
     rug.object.set_position(0.0, 0.01, -0.55);
     rug.rt = rt(mean);
     let rug = scene.add(SceneNode::Renderable(rug));
@@ -1255,7 +1650,9 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         let mut ball = Renderable::new(sphere(), Material::standard_lit("Glass", &config.glass_material()));
         ball.rt = Some(RtSurface::glass(config.glass_tint));
         ball.cast_shadow = false;
-        ball.object.set_position(-0.1, BALL_RADIUS + 0.025, -0.45);
+        ball.object.position = glass_centre(config.glass_radius, 0.0);
+        let s = config.glass_radius / BALL_RADIUS;
+        ball.object.scale = Vec3::new(s, s, s);
         ball.visible = config.glass;
         glass = Some(scene.add(SceneNode::Renderable(ball)));
     }
@@ -1277,6 +1674,20 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     lamp.volumetric_scale = 0.0;
     scene.add(SceneNode::Light(Light::Spot(lamp)));
 
+    // the studio gradient's dome round the box (env=gradient), out of the GI, the grid and the
+    // shadows
+    let (up, down) = config.studio();
+    let gradient = GradientEnvironment::new(renderer.device(), up, down);
+    let dome_options = GradientSkyOptions { zenith: up, horizon: std::array::from_fn(|c| (up[c] + down[c]) * 0.5), ground: down, curve: 0.5 };
+    let mut dome = Renderable::new(SphereGeometry::new(60.0, 48, 24), Material::gradient_sky("Dome", &dome_options));
+    dome.cast_shadow = false;
+    dome.visible = false;
+    let dome = scene.add(SceneNode::Renderable(dome));
+    let (hdri, hdri_load_ms) = match config.env {
+        Env::Hdri => load_hdri(renderer.device(), renderer.queue()).await.map_or((None, (0.0, 0.0)), |(h, ms)| (Some(h), ms)),
+        _ => (None, (0.0, 0.0)),
+    };
+
     let camera = Camera::new(38.0, 0.1, 100.0, canvas.aspect());
     let (_, target, distance, azimuth, elevation) = CAMERAS.iter().find(|c| Some(c.0) == param("cam").as_deref()).copied().unwrap_or(CAMERAS[0]);
     let mut controls = CameraControls::from_canvas(canvas.element(), Vec3::new(target[0], target[1], target[2]), distance).with_mouse_pan(canvas.element());
@@ -1297,7 +1708,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         phone,
         enabled_voxels: None,
         gi_generation: 0,
-        materials_sdf: None,
+        materials: (Direct::Maps, None),
         lit,
         tall,
         rug,
@@ -1309,6 +1720,12 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         time: 0.0,
         stats,
         floor_specular,
+        gradient,
+        dome,
+        hdri,
+        hdri_load_ms,
+        env_spin: param_or("env_spin", 0.0f32),
+        roll_time: 0.0,
     };
     state.apply(config);
     log::info!("Kansei — GI box (WASM) ready: {}", state.info());
@@ -1406,7 +1823,7 @@ async fn apply_with_dragon(config: Config) {
                         s.dragons[slot] = Some(index);
                         s.lit.push((index, "Dragon", DRAGON_ALBEDO));
                         // its material follows the others' at the next apply
-                        s.materials_sdf = Some(u32::MAX);
+                        s.materials.1 = Some(u32::MAX);
                     }
                 });
             }
@@ -1432,7 +1849,7 @@ pub fn set_textured(on: bool) {
     with_state(|s| s.apply(Config { textured: on, ..s.config }));
 }
 
-/// Camera preset `front|corner|low|floor|glass` (`CAMERAS`).
+/// Camera preset `front|corner|low|floor|glass|chrome` (`CAMERAS`).
 #[wasm_bindgen]
 pub fn set_camera(name: &str) {
     if let Some(&(_, t, distance, azimuth, elevation)) = CAMERAS.iter().find(|c| c.0 == name) {
@@ -1454,11 +1871,29 @@ pub fn set_sdf_shadows(name: &str) {
     }
 }
 
-/// The direct light's shadows: `map` (the shadow atlas) or `sdf` (the distance field, through the
-/// material helper `gi::SDF_WGSL`).
+/// The direct light's shadows: `maps` (the shadow atlas), `sdf` (the distance field, through the
+/// material helper `gi::SDF_WGSL`) or `rt` (ray traced through the grid by `RtShadowsEffect`;
+/// with the grid only, built at load: the page reloads with `shadows=rt` otherwise).
 #[wasm_bindgen]
 pub fn set_shadows(name: &str) {
-    with_state(|s| s.apply(Config { direct_sdf: name == "sdf", ..s.config }));
+    let Some(direct) = Direct::from_name(name) else { return };
+    with_state(|s| {
+        if direct != Direct::Rt || s.config.grid {
+            s.apply(Config { direct, ..s.config })
+        }
+    });
+}
+
+/// One of `RtShadowsEffect`'s settings (`view`: `lit|visibility|direct|mask`; `res`: `half|full`;
+/// `contact`: metres) and value.
+#[wasm_bindgen]
+pub fn set_rt_shadows(key: &str, value: &str) {
+    with_state(|s| {
+        let mut config = s.config;
+        if config.rt_shadows.set(key, value) {
+            s.apply(config);
+        }
+    });
 }
 
 /// The SDF slice's height, metres (`view=sdf`).
@@ -1543,4 +1978,46 @@ pub fn set_reflection_grid(on: bool) {
 #[wasm_bindgen]
 pub fn set_reflection_resolution(name: &str) {
     with_state(|s| s.apply(Config { reflection_quarter: name == "quarter", ..s.config }));
+}
+
+/// `env=none|gradient|hdri`: the environment past the box's opening, fetching the HDRI the first
+/// time.
+#[wasm_bindgen]
+pub async fn set_env(name: String) {
+    let Some(env) = Env::from_name(&name) else { return };
+    if env == Env::Hdri {
+        if let Some((device, queue)) = with_state(|s| s.hdri.is_none().then(|| (s.renderer.device().clone(), s.renderer.queue().clone()))).flatten() {
+            if let Some((hdri, ms)) = load_hdri(&device, &queue).await {
+                with_state(|s| {
+                    s.hdri = Some(hdri);
+                    s.hdri_load_ms = ms;
+                });
+            }
+        }
+    }
+    with_state(|s| s.apply(Config { env, ..s.config }));
+}
+
+/// The environment's stops over its default (the gradient's and the HDRI's alike).
+#[wasm_bindgen]
+pub fn set_env_ev(ev: f32) {
+    with_state(|s| s.set_env_settings(Config { env_ev: ev, ..s.config }));
+}
+
+/// The HDRI's turn about the vertical, degrees.
+#[wasm_bindgen]
+pub fn set_env_rotation(degrees: f32) {
+    with_state(|s| s.set_env_settings(Config { env_rotation: degrees, ..s.config }));
+}
+
+/// The HDRI background's blur, 0 (sharp) to 1.
+#[wasm_bindgen]
+pub fn set_env_blur(blur: f32) {
+    with_state(|s| s.set_env_settings(Config { env_blur: blur.clamp(0.0, 1.0), ..s.config }));
+}
+
+/// Degrees a second the HDRI turns (0: still): prepared again every frame, to time it.
+#[wasm_bindgen]
+pub fn set_env_spin(degrees_per_second: f32) {
+    with_state(|s| s.env_spin = degrees_per_second);
 }

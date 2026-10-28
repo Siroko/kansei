@@ -1,8 +1,9 @@
 //! The path tracer's denoisers, TLAS, probe grid and effect on a real GPU: the spatial filter
 //! widens its step every iteration, the temporal filter keeps its history across same-size
 //! resizes, the TLAS leaves follow the Morton sort, the probe grid hands out the SH it just wrote,
-//! and `PathTracerEffect` in a post chain writes the scene lit by its lights. Skipped (passes)
-//! when no adapter is available.
+//! `PathTracerEffect` in a post chain writes the scene lit by its lights, the tracer's guide
+//! buffers hold the surface and its motion, and `PathTracerDenoise` keeps the light while it
+//! removes the noise. Skipped (passes) when no adapter is available.
 
 use kansei_core::cameras::Camera;
 use kansei_core::geometries::BoxGeometry;
@@ -10,16 +11,25 @@ use kansei_core::lights::{DirectionalLight, Light};
 use kansei_core::materials::{Material, MaterialOptions, StandardLitOptions};
 use kansei_core::math::Vec3;
 use kansei_core::objects::{Renderable, Scene, SceneNode};
-use kansei_core::pathtracer::{BVHBuilder, PathTracerEffect, PathTracerMaterial, ProbeGrid, SpatialDenoise, TLASBuilder, TemporalDenoise};
+use kansei_core::pathtracer::{BVHBuilder, PathTracerDenoise, PathTracerEffect, PathTracerMaterial, ProbeGrid, SpatialDenoise, TLASBuilder, TemporalDenoise};
 use kansei_core::postprocessing::PostProcessingEffect;
 use kansei_core::renderers::{GBuffer, Renderer, RendererConfig};
 
 const W: u32 = 64;
 const H: u32 = 64;
 
+/// The fast adapter on `WGPU_BACKEND`'s backend (the discrete GPU beside an integrated one, so the
+/// scene goes to hardware ray queries where it has them), named on stderr.
+fn adapter() -> Option<wgpu::Adapter> {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, ..Default::default() })).ok()?;
+    let info = adapter.get_info();
+    eprintln!("{} ({:?})", info.name, info.backend);
+    Some(adapter)
+}
+
 fn renderer() -> Option<Renderer> {
-    let instance = wgpu::Instance::default();
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?;
+    let adapter = adapter()?;
     let mut renderer = Renderer::new(RendererConfig::default());
     pollster::block_on(renderer.initialize_headless(&adapter));
     Some(renderer)
@@ -65,6 +75,7 @@ fn flat_gbuffer(renderer: &Renderer) -> (wgpu::TextureView, wgpu::TextureView) {
         }),
         timestamp_writes: None,
         occlusion_query_set: None,
+        multiview_mask: None,
     });
     renderer.queue().submit(Some(encoder.finish()));
     let normal = rgba_texture(renderer, &vec![[0.5, 0.5, 1.0, 1.0]; (W * H) as usize]);
@@ -329,8 +340,7 @@ fn traced_floor(renderer: &mut Renderer, sun: bool, frames: u32) -> [f32; 3] {
 
 #[test]
 fn the_effect_writes_the_floor_lit_by_the_scenes_lights() {
-    let instance = wgpu::Instance::default();
-    let Some(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())) else { return };
+    let Some(adapter) = adapter() else { return };
     let mut renderer = Renderer::new(RendererConfig { width: W, height: H, sample_count: 1, ..Default::default() });
     pollster::block_on(renderer.initialize_headless(&adapter));
     let sky_only = traced_floor(&mut renderer, false, 8);
@@ -341,4 +351,177 @@ fn the_effect_writes_the_floor_lit_by_the_scenes_lights() {
     let sun = sunlit[1] - sky_only[1];
     let lambert = 0.8 * 3.0 / std::f32::consts::PI;
     assert!((sun - lambert).abs() < 0.1 * lambert, "the sun adds {sun}, not {lambert}: {sunlit:?} against {sky_only:?}");
+}
+
+/// Read a W×H rgba32uint texture back (the tracer's guide buffers).
+fn read_uint_view(renderer: &Renderer, view: &wgpu::TextureView) -> Vec<[u32; 4]> {
+    let device = renderer.device();
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: None,
+        source: wgpu::ShaderSource::Wgsl(
+            r#"
+            @group(0) @binding(0) var src : texture_2d<u32>;
+            @group(0) @binding(1) var<storage, read_write> dst : array<vec4u>;
+            @compute @workgroup_size(8, 8) fn main(@builtin(global_invocation_id) id : vec3u) {
+                let size = textureDimensions(src);
+                if (id.x >= size.x || id.y >= size.y) { return; }
+                dst[id.y * size.x + id.x] = textureLoad(src, id.xy, 0);
+            }
+            "#
+            .into(),
+        ),
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: None, module: &module, entry_point: Some("main"), compilation_options: Default::default(), cache: None });
+    let size = (W * H * 16) as u64;
+    let buf = device.create_buffer(&wgpu::BufferDescriptor { label: None, size, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &pipeline.get_bind_group_layout(0),
+        entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(view) }, wgpu::BindGroupEntry { binding: 1, resource: buf.as_entire_binding() }],
+    });
+    let mut encoder = device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.dispatch_workgroups(W / 8, H / 8, 1);
+    }
+    renderer.queue().submit(Some(encoder.finish()));
+    renderer.read_back_buffer_sync(&buf, size)
+}
+
+fn half(word: u32, high: bool) -> f32 {
+    let h = if high { word >> 16 } else { word & 0xffff } as u16;
+    // f16 -> f32 (normal numbers and zero suffice here)
+    let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let exp = ((h >> 10) & 0x1f) as i32;
+    let mant = (h & 0x3ff) as f32;
+    if exp == 0 {
+        return sign * mant * 2f32.powi(-24);
+    }
+    sign * (1.0 + mant / 1024.0) * 2f32.powi(exp - 15)
+}
+
+fn snorm(word: u32, high: bool) -> f32 {
+    let v = if high { (word >> 16) as u16 as i16 } else { word as u16 as i16 };
+    (v as f32 / 32767.0).max(-1.0)
+}
+
+/// A 6 x 6 floor under a white sun straight down, seen from 3 m above, traced with guides.
+struct Floor {
+    renderer: Renderer,
+    scene: Scene,
+    camera: Camera,
+    tracer: kansei_core::pathtracer::PathTracer,
+    bvh: BVHBuilder,
+    data: kansei_core::pathtracer::GPUBVHData,
+    tlas: TLASBuilder,
+    lights: u32,
+}
+
+impl Floor {
+    fn new() -> Option<Self> {
+        let renderer = renderer()?;
+        let mut scene = Scene::new();
+        let mut floor = Renderable::new(BoxGeometry::new(6.0, 0.2, 6.0), box_material());
+        floor.object.set_position(0.0, -0.1, 0.0);
+        scene.add(SceneNode::Renderable(floor));
+        scene.add(SceneNode::Light(Light::Directional(DirectionalLight::new(Vec3::new(0.0, -1.0, 0.0), Vec3::new(1.0, 1.0, 1.0), 3.0))));
+        let mut camera = Camera::new(40.0, 0.1, 50.0, 1.0);
+        Self::look_from(&mut camera, 0.0);
+        scene.prepare(&camera.position());
+        let mut bvh = BVHBuilder::new();
+        let mut tlas = TLASBuilder::new(&renderer);
+        let data = bvh.build_full(&renderer, &scene, &mut tlas);
+        let mut tracer = kansei_core::pathtracer::PathTracer::new(&renderer);
+        tracer.resize(W, H);
+        tracer.set_materials(&BVHBuilder::scene_materials(&scene));
+        let lights = tracer.set_lights_from_scene(&scene);
+        tracer.set_guides(true);
+        Some(Self { renderer, scene, camera, tracer, bvh, data, tlas, lights })
+    }
+
+    /// Straight down from 3 m above (x, 0).
+    fn look_from(camera: &mut Camera, x: f32) {
+        camera.set_position(x, 3.0, 0.0);
+        camera.look_at(&Vec3::new(x, 0.0, -0.001));
+        camera.update_projection_matrix();
+        camera.update_view_matrix();
+    }
+
+    fn trace(&mut self, denoise: Option<&mut PathTracerDenoise>) {
+        let mut encoder = self.renderer.device().create_command_encoder(&Default::default());
+        self.tracer.reset_accumulation();
+        self.tracer.trace(&mut encoder, &self.data, self.tlas.tlas_nodes_buf.as_ref().unwrap(), &self.camera, self.lights);
+        if let Some(d) = denoise {
+            d.denoise(&mut encoder, &self.tracer, &self.camera);
+        }
+        self.renderer.queue().submit(Some(encoder.finish()));
+    }
+
+    fn surface(&self) -> Vec<[u32; 4]> {
+        read_uint_view(&self.renderer, self.tracer.guides().unwrap().surface)
+    }
+}
+
+/// The guides hold the floor's albedos (its base colour through Fresnel at the view), its
+/// normal and depth, and the motion of the camera and of the floor itself.
+#[test]
+fn guides_hold_the_surface_and_its_motion() {
+    let Some(mut f) = Floor::new() else { return };
+    f.tracer.set_jitter(false);
+    f.trace(None);
+    let c = px(W / 2, H / 2);
+    let albedo = read_uint_view(&f.renderer, f.tracer.guides().unwrap().albedo)[c];
+    // straight on, Schlick's Fresnel is F0 = 0.04: 0.8 * 0.96 diffuse, 0.04 specular
+    let (da, sa) = (half(albedo[0], false), half(albedo[1], true));
+    assert!((da - 0.768).abs() < 0.005 && (sa - 0.04).abs() < 0.002, "albedos {da} {sa}");
+    let s = f.surface()[c];
+    let (z, ny) = (f32::from_bits(s[0]), snorm(s[1], true));
+    assert!((z - 3.0).abs() < 0.01 && ny > 0.99, "depth {z}, normal y {ny}");
+    let still = (half(s[2], false), half(s[2], true));
+    assert!(still.0.abs() < 1e-5 && still.1.abs() < 1e-5, "a still camera's motion {still:?}");
+
+    // the camera 0.3 m right: the floor moves left by 0.3 m of the 2 * 3 * tan(20°) the view spans
+    let shift = 0.3 / (6.0 * 20f32.to_radians().tan());
+    Floor::look_from(&mut f.camera, 0.3);
+    f.trace(None);
+    let m = half(f.surface()[c][2], false);
+    assert!((m + shift).abs() < 0.002, "camera motion {m}, expected {}", -shift);
+
+    // the camera still, the floor 0.3 m right: it moves right as much (last frame's transform)
+    f.trace(None);
+    let idx = f.scene.ordered_indices().next().unwrap();
+    let r = f.scene.get_renderable_mut(idx).unwrap();
+    r.object.set_position(0.3, -0.1, 0.0);
+    r.object.update_model_matrix();
+    r.object.update_world_matrix(None);
+    f.bvh.refresh_transforms(&f.renderer, &f.scene, &mut f.data, &mut f.tlas);
+    f.trace(None);
+    let m = half(f.surface()[c][2], false);
+    assert!((m - shift).abs() < 0.002, "object motion {m}, expected {shift}");
+}
+
+/// Over frames the denoiser keeps the floor's light and takes away most of its noise (the
+/// specular lobe picked 1 time in 20).
+#[test]
+fn the_denoiser_keeps_the_light_and_removes_the_noise() {
+    let Some(mut f) = Floor::new() else { return };
+    let mut denoise = PathTracerDenoise::new(&f.renderer);
+    for _ in 0..16 {
+        f.trace(Some(&mut denoise));
+    }
+    let noisy = read_view(&f.renderer, f.tracer.output_view().unwrap());
+    let denoised = read_view(&f.renderer, denoise.output_view().unwrap());
+    let stats = |img: &[[f32; 4]]| {
+        let v: Vec<f32> = (H / 4..H * 3 / 4).flat_map(|y| (W / 4..W * 3 / 4).map(move |x| (x, y))).map(|(x, y)| img[px(x, y)][1]).collect();
+        let mean = v.iter().sum::<f32>() / v.len() as f32;
+        let sd = (v.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / v.len() as f32).sqrt();
+        (mean, sd)
+    };
+    let (nm, nsd) = stats(&noisy);
+    let (dm, dsd) = stats(&denoised);
+    assert!(denoised.iter().all(|p| p.iter().all(|c| c.is_finite())), "non-finite output");
+    assert!((dm - nm).abs() < 0.05 * nm, "the light changed: {dm} against {nm}");
+    assert!(dsd < 0.2 * nsd, "noise left: {dsd} of {nsd}");
 }

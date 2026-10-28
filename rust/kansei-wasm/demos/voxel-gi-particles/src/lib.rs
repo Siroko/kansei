@@ -604,7 +604,7 @@ impl AutoFocus {
         let buffer = &gpu.readback;
         use std::sync::atomic::Ordering::Relaxed;
         if self.state.load(Relaxed) == 2 {
-            let depth = bytemuck::pod_read_unaligned::<f32>(&buffer.slice(..).get_mapped_range()[..4]);
+            let depth = bytemuck::pod_read_unaligned::<f32>(&buffer.slice(..).get_mapped_range().unwrap()[..4]);
             buffer.unmap();
             self.state.store(0, Relaxed);
             if depth < 1.0 {

@@ -155,9 +155,9 @@ impl App {
         let slice = staging.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| tx.send(r).unwrap());
-        device.poll(wgpu::Maintain::Wait);
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
         rx.recv().unwrap().unwrap();
-        let data = slice.get_mapped_range();
+        let data = slice.get_mapped_range().unwrap();
         let pos: &[f32] = bytemuck::cast_slice(&data);
 
         // ── Analyse: sample the SDF the same way the shader does ──

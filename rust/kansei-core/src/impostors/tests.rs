@@ -114,8 +114,8 @@ struct FOut { @location(0) color: vec4<f32>, @location(1) emissive: vec4<f32>, @
 "#;
 
 fn headless() -> Option<crate::renderers::Renderer> {
-    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-    let adapter = pollster::block_on(instance.request_adapter(&Default::default()))?;
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let adapter = pollster::block_on(instance.request_adapter(&Default::default())).ok()?;
     let mut renderer = crate::renderers::Renderer::new(crate::renderers::RendererConfig { width: 64, height: 64, ..Default::default() });
     pollster::block_on(renderer.initialize_headless(&adapter));
     Some(renderer)
@@ -208,7 +208,7 @@ fn rays_through_the_impostor_find_the_sphere() {
     let out_size = (eyes.len() * 6 * 16) as u64;
     let out = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: out_size, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
     let staging = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: out_size, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
-    let sampler = device.create_sampler(&wgpu::SamplerDescriptor { mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, mipmap_filter: wgpu::FilterMode::Linear, ..Default::default() });
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor { mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, mipmap_filter: wgpu::MipmapFilterMode::Linear, ..Default::default() });
     let (albedo, normal_depth) = (impostor.albedo_atlas().create_view(&Default::default()), impostor.normal_depth_atlas().create_view(&Default::default()));
     let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
@@ -232,8 +232,8 @@ fn rays_through_the_impostor_find_the_sphere() {
     encoder.copy_buffer_to_buffer(&out, 0, &staging, 0, out_size);
     queue.submit(Some(encoder.finish()));
     staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-    device.poll(wgpu::Maintain::Wait);
-    let values: Vec<[f32; 4]> = bytemuck::cast_slice(&staging.slice(..).get_mapped_range()).to_vec();
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    let values: Vec<[f32; 4]> = bytemuck::cast_slice(&staging.slice(..).get_mapped_range().unwrap()).to_vec();
     let v3 = |v: [f32; 4]| glam::Vec3::new(v[0], v[1], v[2]);
     for (i, eye) in eyes.iter().enumerate() {
         let [p, hit, normal, far_p, far_hit, _] = std::array::from_fn(|k| values[i * 6 + k]);

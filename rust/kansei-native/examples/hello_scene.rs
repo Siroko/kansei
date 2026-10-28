@@ -4,7 +4,10 @@
 //!
 //!   cargo run -p kansei-native --example hello_scene [-- --post] [-- --no-shadows]
 //!
-//! `--post` renders through a post-processing volume (bloom, then a colour grade).
+//! `--post` renders through a post-processing volume (bloom, then a colour grade). It prints the
+//! adapter it runs on; pick another with wgpu's variables, for example `WGPU_BACKEND=dx12` (or
+//! `vulkan`). DX12 compiles shaders with the DXC built into kansei-core (`WGPU_DX12_COMPILER`
+//! picks another).
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -56,6 +59,8 @@ fn build(window: Arc<Window>) -> Running {
         ..Default::default()
     });
     pollster::block_on(renderer.initialize_with_target(window.clone()));
+    let adapter = renderer.adapter_info();
+    println!("adapter: {} ({:?}, driver {} {})", adapter.name, adapter.backend, adapter.driver, adapter.driver_info);
     if shadows {
         renderer.enable_shadows(2048);
         renderer.enable_point_shadows(512, 1);

@@ -3,19 +3,77 @@ use crate::lights::Light;
 use crate::objects::Scene;
 use crate::renderers::Renderer;
 
+use crate::rt::RtBackend;
+
+use super::accel;
 use super::blue_noise::generate_blue_noise;
 use super::bvh_builder::GPUBVHData;
 use super::material::PathTracerMaterial;
 
-/// Size of the TraceParams uniform in bytes (48 floats * 4 bytes).
-const TRACE_PARAMS_SIZE: u64 = 192;
+/// Size of the TraceParams uniform in bytes (52 floats * 4 bytes).
+pub(crate) const TRACE_PARAMS_SIZE: u64 = 208;
+
+// TraceParams flags (trace.wgsl's PT_*)
+const PT_GUIDES: u32 = 1;
+const PT_PREV_INSTANCES: u32 = 2;
+
+/// The guide buffers a trace writes for a denoiser (`PathTracer::set_guides`), all
+/// `rgba32uint`, laid out as trace.wgsl's bindings 20-22 describe: the first hit's diffuse and
+/// specular light each over its albedo (`signal`), those albedos (`albedo`), the light no filter
+/// should touch (sky, emitters seen directly, in both), and the surface: linear depth, normal,
+/// motion and last frame's depth (`surface`).
+pub struct PathTracerGuides<'a> {
+    pub signal: &'a wgpu::TextureView,
+    pub albedo: &'a wgpu::TextureView,
+    pub surface: &'a wgpu::TextureView,
+    pub width: u32,
+    pub height: u32,
+}
+
+struct GuideTextures {
+    signal: wgpu::TextureView,
+    albedo: wgpu::TextureView,
+    surface: wgpu::TextureView,
+}
+
+impl GuideTextures {
+    fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
+        let view = |label| {
+            device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba32Uint,
+                    usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                })
+                .create_view(&wgpu::TextureViewDescriptor::default())
+        };
+        Self { signal: view("PathTracer/GuideSignal"), albedo: view("PathTracer/GuideAlbedo"), surface: view("PathTracer/GuideSurface") }
+    }
+}
+
+/// The `index`-th element (from 1) of the Halton sequence in `base`, in [0, 1).
+fn halton(mut index: u32, base: u32) -> f32 {
+    let mut f = 1.0;
+    let mut r = 0.0;
+    while index > 0 {
+        f /= base as f32;
+        r += f * (index % base) as f32;
+        index /= base;
+    }
+    r
+}
 
 /// Owns the path trace compute pipeline and dispatches trace passes.
 ///
-/// The trace shader is formed by concatenating `intersection.wgsl`,
-/// `traversal.wgsl`, a binding preamble for the BVH storage buffers,
-/// and `trace.wgsl`. The resulting pipeline uses a single bind group
-/// (group 0) with 9 bindings:
+/// The trace shader is formed by concatenating `intersection.wgsl`, `instances.wgsl`, the
+/// scene's traversal for its backend (`traversal.wgsl`'s BVH4s, or `traversal_query.wgsl`'s
+/// hardware ray queries; `GPUBVHData::backend`) with its bindings, and `trace.wgsl`. The pipeline
+/// uses a single bind group (group 0), made for each backend the first time it traces one:
 ///
 ///   0  TraceParams uniform
 ///   1  output_tex  storage texture (rgba16float, write)
@@ -23,13 +81,19 @@ const TRACE_PARAMS_SIZE: u64 = 192;
 ///   3  scene_lights storage buffer (read)
 ///   4  blue_noise  storage buffer  (read)
 ///   5  triangles   storage buffer  (read) — array<f32>
-///   6  bvh4_nodes  storage buffer  (read) — array<vec4<f32>>
-///   7  tlas_bvh4_nodes storage buffer (read) — array<vec4<f32>>
+///   6  bvh4_nodes  storage buffer  (read) — array<vec4<f32>> (software)
+///   7  tlas_bvh4_nodes storage buffer (read) — array<vec4<f32>> (software), or the scene's
+///      acceleration structure (hardware)
 ///   8  instances   storage buffer  (read) — array of Instance
 ///   9  prev_frame  texture_2d (read) — previous frame for temporal accumulation
+///  10  the ray counter, while counting rays (`set_count_rays`)
+///   20-22 guide buffers (rgba32uint, write) — `PathTracerGuides`, written with `set_guides`
+///   23 prev_instances storage buffer (read) — last frame's instances, for the guides' motion
 pub struct PathTracer {
-    trace_pipeline: Option<wgpu::ComputePipeline>,
-    trace_bgl: Option<wgpu::BindGroupLayout>,
+    /// the trace pipelines made so far, by backend and whether they count rays
+    pipelines: Vec<TracePipeline>,
+    count_rays: bool,
+    ray_counter: Option<wgpu::Buffer>,
     params_buf: Option<wgpu::Buffer>,
     output_texture: Option<wgpu::Texture>,
     output_view: Option<wgpu::TextureView>,
@@ -39,6 +103,21 @@ pub struct PathTracer {
     lights_buf: Option<wgpu::Buffer>,
     blue_noise_buf: Option<wgpu::Buffer>,
     frame_index: u32,
+    /// the sampler's frame: advances every trace, never reset (`frame_index` counts the
+    /// accumulated frames)
+    seed: u32,
+    jitter: bool,
+    /// the last trace's sub-pixel offset, pixels
+    last_jitter: [f32; 2],
+    /// full-size guide buffers while `set_guides(true)`, else 1x1 placeholders to bind
+    guides: Option<GuideTextures>,
+    guides_enabled: bool,
+    placeholder_guides: GuideTextures,
+    /// last frame's instances (the guides' object motion), and whether it holds them
+    prev_instances: Option<wgpu::Buffer>,
+    prev_instances_valid: bool,
+    /// last frame's view-projection, for the guides' motion
+    prev_view_proj: Option<[f32; 16]>,
     width: u32,
     height: u32,
     device: wgpu::Device,
@@ -48,169 +127,100 @@ pub struct PathTracer {
     use_blue_noise: bool,
 }
 
-impl PathTracer {
-    /// Create a new `PathTracer` from an initialized renderer.
-    ///
-    /// This immediately builds the compute pipeline and uploads the
-    /// blue noise LUT. Call [`resize`] before the first [`trace`].
-    pub fn new(renderer: &Renderer) -> Self {
-        let device = renderer.device().clone();
-        let queue = renderer.queue().clone();
+struct TracePipeline {
+    backend: RtBackend,
+    count_rays: bool,
+    layout: wgpu::BindGroupLayout,
+    pipeline: wgpu::ComputePipeline,
+}
 
-        // ── Build concatenated shader source ────────────────────────
-        //
-        // The traversal shader references `triangles`, `bvh4_nodes`,
-        // `tlas_bvh4_nodes`, and `instances` without declaring their
-        // bindings (they are marked "external"). We inject a small
-        // preamble between traversal.wgsl and trace.wgsl that declares
-        // bindings 5-8 matching the TypeScript engine.
-        let intersection_src = include_str!("shaders/intersection.wgsl");
-        let traversal_src = include_str!("shaders/traversal.wgsl");
-        let trace_src = include_str!("shaders/trace.wgsl");
+/// The ray counter's binding.
+const COUNTER_BINDING: u32 = 10;
 
-        let bvh_bindings = "\
-// ── BVH storage bindings (injected by PathTracer) ───────────────────
-@group(0) @binding(5) var<storage, read> triangles       : array<f32>;
-@group(0) @binding(6) var<storage, read> bvh4_nodes      : array<vec4f>;
-@group(0) @binding(7) var<storage, read> tlas_bvh4_nodes : array<vec4f>;
-@group(0) @binding(8) var<storage, read> instances       : array<Instance>;
-";
+/// The trace shader for `backend`, counting rays or not.
+pub(crate) fn trace_wgsl(backend: RtBackend, count_rays: bool) -> String {
+    accel::assemble(format!(
+        "{}\n{}",
+        accel::traversal_wgsl(backend, 5, count_rays.then_some(COUNTER_BINDING)),
+        include_str!("shaders/trace.wgsl")
+    ))
+}
 
-        let shader_code = format!(
-            "{}\n{}\n{}\n{}",
-            intersection_src, traversal_src, bvh_bindings, trace_src,
-        );
-
-        let shader_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("PathTracer/trace"),
-            source: wgpu::ShaderSource::Wgsl(shader_code.into()),
-        });
+impl TracePipeline {
+    fn new(device: &wgpu::Device, backend: RtBackend, count_rays: bool) -> Self {
+        let shader_module = accel::shader_module(device, backend, "PathTracer/trace", &trace_wgsl(backend, count_rays));
 
         // ── Bind group layout ──────────────────────────────────────
-        let trace_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("PathTracer/BGL"),
-            entries: &[
-                // 0: TraceParams uniform
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: wgpu::BufferSize::new(TRACE_PARAMS_SIZE),
-                    },
-                    count: None,
+        let storage = |binding| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let mut entries = vec![
+            // 0: TraceParams uniform
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: wgpu::BufferSize::new(TRACE_PARAMS_SIZE),
                 },
-                // 1: output texture (rgba16float, write)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::StorageTexture {
-                        access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: wgpu::TextureFormat::Rgba16Float,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                    },
-                    count: None,
+                count: None,
+            },
+            // 1: output texture (rgba16float, write)
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::StorageTexture {
+                    access: wgpu::StorageTextureAccess::WriteOnly,
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    view_dimension: wgpu::TextureViewDimension::D2,
                 },
-                // 2: materials
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
+                count: None,
+            },
+            // 2: materials, 3: scene_lights, 4: blue_noise
+            storage(2),
+            storage(3),
+            storage(4),
+            // 9: prev_frame (previous frame for temporal accumulation)
+            wgpu::BindGroupLayoutEntry {
+                binding: 9,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
                 },
-                // 3: scene_lights
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // 4: blue_noise
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // 5: triangles (array<f32>)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 5,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // 6: bvh4_nodes (array<vec4f>)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 6,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // 7: tlas_bvh4_nodes (array<vec4f>)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 7,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // 8: instances (array<Instance>)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 8,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // 9: prev_frame (previous frame for temporal accumulation)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 9,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-            ],
-        });
+                count: None,
+            },
+            // 20-22: guide buffers (rgba32uint, write)
+            guide_entry(20),
+            guide_entry(21),
+            guide_entry(22),
+            // 23: prev_instances (array<Instance>)
+            storage(23),
+        ];
+        // 5-8: the scene
+        entries.extend(accel::traversal_layout_entries(backend, 5));
+        if count_rays {
+            entries.push(accel::counter_layout_entry(COUNTER_BINDING));
+        }
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("PathTracer/BGL"), entries: &entries });
 
         // ── Pipeline ───────────────────────────────────────────────
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("PathTracer/PipelineLayout"),
-            bind_group_layouts: &[&trace_bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
         });
 
-        let trace_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("PathTracer/Pipeline"),
             layout: Some(&pipeline_layout),
             module: &shader_module,
@@ -218,6 +228,18 @@ impl PathTracer {
             compilation_options: Default::default(),
             cache: None,
         });
+        Self { backend, count_rays, layout, pipeline }
+    }
+}
+
+impl PathTracer {
+    /// Create a new `PathTracer` from an initialized renderer.
+    ///
+    /// This uploads the blue noise LUT; the trace pipeline is made at the first `trace`, for the
+    /// scene's backend. Call [`resize`] before the first [`trace`].
+    pub fn new(renderer: &Renderer) -> Self {
+        let device = renderer.device().clone();
+        let queue = renderer.queue().clone();
 
         // ── TraceParams uniform buffer ─────────────────────────────
         let params_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -238,8 +260,9 @@ impl PathTracer {
         queue.write_buffer(&blue_noise_buf, 0, bytemuck::cast_slice(&noise_data));
 
         Self {
-            trace_pipeline: Some(trace_pipeline),
-            trace_bgl: Some(trace_bgl),
+            pipelines: Vec::new(),
+            count_rays: false,
+            ray_counter: None,
             params_buf: Some(params_buf),
             output_texture: None,
             output_view: None,
@@ -249,6 +272,15 @@ impl PathTracer {
             lights_buf: None,
             blue_noise_buf: Some(blue_noise_buf),
             frame_index: 0,
+            seed: 0,
+            jitter: true,
+            last_jitter: [0.0; 2],
+            guides: None,
+            guides_enabled: false,
+            placeholder_guides: GuideTextures::new(&device, 1, 1),
+            prev_instances: None,
+            prev_instances_valid: false,
+            prev_view_proj: None,
             width: 0,
             height: 0,
             device,
@@ -274,6 +306,56 @@ impl PathTracer {
     /// Enable/disable blue noise sampling (falls back to PCG RNG).
     pub fn set_use_blue_noise(&mut self, enabled: bool) {
         self.use_blue_noise = enabled;
+    }
+
+    /// Count the rays the traces cast (each closest-hit and any-hit query, an atomic add in the
+    /// shader: slower, for measuring rays per second); `take_ray_count` reads them.
+    pub fn set_count_rays(&mut self, enabled: bool) {
+        self.count_rays = enabled;
+    }
+
+    /// The rays the traces cast since counting started or the last take (a 32-bit count: take it
+    /// every frame or so at 1080p), waiting for the GPU; then counting again from 0.
+    pub fn take_ray_count(&mut self, renderer: &Renderer) -> u32 {
+        let Some(counter) = self.ray_counter.as_ref() else { return 0 };
+        let count: Vec<u32> = renderer.read_back_buffer_sync(counter, 4);
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("PathTracer/RayCounter") });
+        encoder.clear_buffer(counter, 0, None);
+        self.queue.submit(Some(encoder.finish()));
+        count[0]
+    }
+
+    /// Offset the primary rays within their pixels, a Halton (2, 3) point a frame (default on):
+    /// accumulated or denoised frames anti-alias. Off, every ray goes through its pixel's centre.
+    pub fn set_jitter(&mut self, enabled: bool) {
+        self.jitter = enabled;
+    }
+
+    /// Write the guide buffers a denoiser reads (`guides`; `PathTracerDenoise` turns this on).
+    pub fn set_guides(&mut self, enabled: bool) {
+        if enabled != self.guides_enabled {
+            self.guides_enabled = enabled;
+            self.guides = (enabled && self.width > 0).then(|| GuideTextures::new(&self.device, self.width, self.height));
+            self.prev_instances_valid = false;
+            self.prev_view_proj = None;
+        }
+    }
+
+    /// The guide buffers the last trace wrote, while `set_guides` is on (after the first `resize`).
+    pub fn guides(&self) -> Option<PathTracerGuides<'_>> {
+        self.guides.as_ref().map(|g| PathTracerGuides { signal: &g.signal, albedo: &g.albedo, surface: &g.surface, width: self.width, height: self.height })
+    }
+
+    /// The last trace's sub-pixel offset of its (first) samples from the pixel centres, in pixels
+    /// (+x right, +y down).
+    pub fn jitter(&self) -> [f32; 2] {
+        self.last_jitter
+    }
+
+    /// The sampler's frame: it advances every trace and `reset_accumulation` leaves it, so each
+    /// frame draws new samples.
+    pub fn seed(&self) -> u32 {
+        self.seed
     }
 
     // ── Resize / recreate output texture ───────────────────────────
@@ -319,6 +401,10 @@ impl PathTracer {
         let prev_view = prev.create_view(&wgpu::TextureViewDescriptor::default());
         self.prev_texture = Some(prev);
         self.prev_view = Some(prev_view);
+        if self.guides_enabled {
+            self.guides = Some(GuideTextures::new(&self.device, width, height));
+            self.prev_view_proj = None;
+        }
     }
 
     // ── Material upload ────────────────────────────────────────────
@@ -412,7 +498,8 @@ impl PathTracer {
     ///   - `resize()` called with non-zero dimensions
     ///   - `set_materials()` called with at least one material
     ///   - `bvh_data` from `BVHBuilder::upload_to_gpu()`
-    ///   - `tlas_buf` from `TLASBuilder` (the TLAS BVH4 node buffer)
+    ///   - `tlas_buf` from `TLASBuilder` (the TLAS BVH4 node buffer; unused when
+    ///     `bvh_data.backend()` is hardware)
     ///   - `camera` with up-to-date view/projection matrices
     ///   - `light_count` number of lights uploaded via `set_lights_raw`
     pub fn trace(
@@ -423,10 +510,28 @@ impl PathTracer {
         camera: &Camera,
         light_count: u32,
     ) {
+        // The pipeline for the scene's backend
+        let backend = bvh_data.backend();
+        let count_rays = self.count_rays;
+        let index = match self.pipelines.iter().position(|p| p.backend == backend && p.count_rays == count_rays) {
+            Some(index) => index,
+            None => {
+                self.pipelines.push(TracePipeline::new(&self.device, backend, count_rays));
+                self.pipelines.len() - 1
+            }
+        };
+        if count_rays && self.ray_counter.is_none() {
+            self.ray_counter = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("PathTracer/RayCounter"),
+                size: 4,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
+
         // Guard: all resources must be present
-        let (Some(pipeline), Some(bgl), Some(params_buf), Some(output_view), Some(prev_view)) = (
-            self.trace_pipeline.as_ref(),
-            self.trace_bgl.as_ref(),
+        let TracePipeline { layout: bgl, pipeline, .. } = &self.pipelines[index];
+        let (Some(params_buf), Some(output_view), Some(prev_view)) = (
             self.params_buf.as_ref(),
             self.output_view.as_ref(),
             self.prev_view.as_ref(),
@@ -451,57 +556,71 @@ impl PathTracer {
         }
         let lights_buf = self.lights_buf.as_ref().unwrap();
 
+        // last frame's instances, for the guides' object motion (a copy of the instances after
+        // each trace; the same buffer, unread, until there is one)
+        if self.guides_enabled {
+            let size = bvh_data.instances_buf.size();
+            if self.prev_instances.as_ref().is_none_or(|b| b.size() != size) {
+                self.prev_instances = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("PathTracer/PrevInstances"),
+                    size,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+                self.prev_instances_valid = false;
+            }
+        }
+        let prev_instances = match (self.guides_enabled, self.prev_instances.as_ref()) {
+            (true, Some(buf)) => buf,
+            _ => &bvh_data.instances_buf,
+        };
+        let guides = self.guides.as_ref().unwrap_or(&self.placeholder_guides);
+
         // ── Upload TraceParams ─────────────────────────────────────
         let params = self.pack_params(camera, light_count);
+        self.last_jitter = [params[32], params[33]];
         self.queue
             .write_buffer(params_buf, 0, bytemuck::cast_slice(&params));
 
         // ── Create bind group ──────────────────────────────────────
+        let mut entries = vec![
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: params_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(output_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: materials_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: lights_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: blue_noise_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 9,
+                resource: wgpu::BindingResource::TextureView(prev_view),
+            },
+            wgpu::BindGroupEntry { binding: 20, resource: wgpu::BindingResource::TextureView(&guides.signal) },
+            wgpu::BindGroupEntry { binding: 21, resource: wgpu::BindingResource::TextureView(&guides.albedo) },
+            wgpu::BindGroupEntry { binding: 22, resource: wgpu::BindingResource::TextureView(&guides.surface) },
+            wgpu::BindGroupEntry { binding: 23, resource: prev_instances.as_entire_binding() },
+        ];
+        entries.extend(bvh_data.bind_group_entries(tlas_buf, 5));
+        if let (true, Some(counter)) = (count_rays, self.ray_counter.as_ref()) {
+            entries.push(wgpu::BindGroupEntry { binding: COUNTER_BINDING, resource: counter.as_entire_binding() });
+        }
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("PathTracer/BG"),
             layout: bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: params_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(output_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: materials_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: lights_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: blue_noise_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: bvh_data.triangles_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: bvh_data.bvh4_nodes_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: tlas_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 8,
-                    resource: bvh_data.instances_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 9,
-                    resource: wgpu::BindingResource::TextureView(prev_view),
-                },
-            ],
+            entries: &entries,
         });
 
         // ── Dispatch ───────────────────────────────────────────────
@@ -533,8 +652,17 @@ impl PathTracer {
             );
         }
 
+        if self.guides_enabled {
+            if let Some(prev) = self.prev_instances.as_ref() {
+                encoder.copy_buffer_to_buffer(&bvh_data.instances_buf, 0, prev, 0, prev.size());
+                self.prev_instances_valid = true;
+            }
+            self.prev_view_proj = Some(*camera.projection_matrix.mul(&camera.view_matrix).as_slice());
+        }
+
         // Advance frame index (for temporal jitter / accumulation)
         self.frame_index += 1;
+        self.seed = self.seed.wrapping_add(1);
     }
 
     // ── Output accessor ────────────────────────────────────────────
@@ -556,14 +684,14 @@ impl PathTracer {
 
     // ── TraceParams packing ────────────────────────────────────────
 
-    /// Pack camera + render parameters into a 192-byte (48 x f32) array
+    /// Pack camera + render parameters into a 208-byte (52 x f32) array
     /// matching the WGSL `TraceParams` struct layout.
-    fn pack_params(&self, camera: &Camera, light_count: u32) -> [f32; 48] {
+    fn pack_params(&self, camera: &Camera, light_count: u32) -> [f32; 52] {
         // inv_view_proj = (P * V)^-1
         let vp = camera.projection_matrix.mul(&camera.view_matrix);
         let inv_vp = vp.inverse();
 
-        let mut params = [0.0f32; 48];
+        let mut params = [0.0f32; 52];
 
         // bytes 0-63: mat4x4f inv_view_proj (16 floats, column-major)
         params[0..16].copy_from_slice(inv_vp.as_slice());
@@ -598,17 +726,48 @@ impl PathTracer {
         // bytes 104-107: u32 max_bounces
         params[26] = f32::from_bits(self.max_bounces);
 
-        // bytes 108-111: _pad0
+        // bytes 108-111: u32 seed
+        params[27] = f32::from_bits(self.seed);
 
         // bytes 112-123: vec3f ambient_color (default dark gray sky)
         params[28] = 0.05;
         params[29] = 0.07;
         params[30] = 0.1;
 
-        // bytes 124-127: _pad1
-        // bytes 128-191: padding vec4f * 4 (zeroed)
+        // bytes 124-127: u32 flags
+        let mut flags = 0;
+        if self.guides_enabled {
+            flags |= PT_GUIDES;
+            if self.prev_instances_valid {
+                flags |= PT_PREV_INSTANCES;
+            }
+        }
+        params[31] = f32::from_bits(flags);
+
+        // bytes 128-135: vec2f jitter, in pixels within [-0.5, 0.5)
+        if self.jitter {
+            let i = self.seed % 65536 + 1;
+            params[32] = halton(i, 2) - 0.5;
+            params[33] = halton(i, 3) - 0.5;
+        }
+
+        // bytes 144-207: mat4x4f prev_view_proj (this frame's on the first)
+        params[36..52].copy_from_slice(self.prev_view_proj.as_ref().unwrap_or(vp.as_slice()));
 
         params
+    }
+}
+
+fn guide_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::StorageTexture {
+            access: wgpu::StorageTextureAccess::WriteOnly,
+            format: wgpu::TextureFormat::Rgba32Uint,
+            view_dimension: wgpu::TextureViewDimension::D2,
+        },
+        count: None,
     }
 }
 
@@ -632,6 +791,54 @@ fn pack_lights<'a>(lights: impl Iterator<Item = &'a Light>) -> Vec<f32> {
         data.extend_from_slice(&record);
     }
     data
+}
+
+#[cfg(test)]
+mod shader_tests {
+    use super::*;
+    use crate::pathtracer::denoise::{AtrousParamsGpu, SvgfParamsGpu, SVGF_WGSL};
+
+    fn validate(name: &str, code: &str) -> naga::Module {
+        let module = naga::front::wgsl::parse_str(code).unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(code)));
+        // (unpack2x16float counts as f16-in-f32 in naga 30, a capability every WebGPU device has)
+        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::SHADER_FLOAT16_IN_FLOAT32)
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("{name}: {}", e.emit_to_string(code)));
+        module
+    }
+
+    fn struct_span(module: &naga::Module, name: &str) -> u64 {
+        module
+            .types
+            .iter()
+            .find_map(|(_, ty)| match (&ty.name, &ty.inner) {
+                (Some(n), naga::TypeInner::Struct { span, .. }) if n == name => Some(*span as u64),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no struct {name}"))
+    }
+
+    /// The trace and the denoiser validate, and their uniforms are the size the CPU packs.
+    #[test]
+    fn shaders_validate_and_the_params_match() {
+        // (the hardware backend's: accel.rs's shaders_validate_pathtracer)
+        let trace = validate("trace", &trace_wgsl(RtBackend::Software, false));
+        assert_eq!(struct_span(&trace, "TraceParams"), TRACE_PARAMS_SIZE);
+        let svgf = validate("svgf", SVGF_WGSL);
+        assert_eq!(struct_span(&svgf, "SvgfParams"), std::mem::size_of::<SvgfParamsGpu>() as u64);
+        assert_eq!(struct_span(&svgf, "AtrousParams"), std::mem::size_of::<AtrousParamsGpu>() as u64);
+        assert_eq!(struct_span(&svgf, "Texel"), 24);
+    }
+
+    /// Jitter offsets cover the pixel evenly: Halton (2, 3)'s first points.
+    #[test]
+    fn halton_points() {
+        assert_eq!(halton(1, 2), 0.5);
+        assert_eq!(halton(2, 2), 0.25);
+        assert_eq!(halton(3, 2), 0.75);
+        assert!((halton(1, 3) - 1.0 / 3.0).abs() < 1e-6);
+        assert!((halton(2, 3) - 2.0 / 3.0).abs() < 1e-6);
+    }
 }
 
 #[cfg(test)]

@@ -289,6 +289,7 @@ impl RaymarchingRenderable {
             .begin_render_pass(&wgpu::RenderPassDescriptor {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: canvas_view,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -307,7 +308,7 @@ impl RaymarchingRenderable {
     /// into `density_field` (`splat_radius` each), raymarch it from `camera` over a `background`
     /// colour, blit and present. The bounds follow the simulation's.
     pub fn render_frame(&mut self, renderer: &Renderer, density_field: &mut FluidDensityField, sim: &super::FluidSimulation, splat_radius: f32, camera: &crate::cameras::Camera, background: wgpu::Color) {
-        let Some(output) = renderer.surface().and_then(|s| s.get_current_texture().ok()) else { return };
+        let Some(output) = renderer.surface().and_then(crate::renderers::surface_texture) else { return };
         let canvas_view = output.texture.create_view(&Default::default());
         let mut encoder = renderer.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("FluidRaymarch/Frame") });
         density_field.update_with_encoder(&mut encoder, sim.world_bounds_min, sim.world_bounds_max, sim.particle_count(), splat_radius);
@@ -317,6 +318,7 @@ impl RaymarchingRenderable {
         encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: &self.color_view,
+                depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations { load: wgpu::LoadOp::Clear(background), store: wgpu::StoreOp::Store },
             })],
@@ -332,7 +334,7 @@ impl RaymarchingRenderable {
         let (width, height) = self.size;
         self.render(&mut encoder, &canvas_view, &Mat4::from(view_proj.inverse()), [eye.x, eye.y, eye.z], width, height);
         renderer.submit(std::iter::once(encoder.finish()));
-        output.present();
+        renderer.queue().present(output);
     }
 
     pub fn surface_renderer_mut(&mut self) -> &mut FluidSurfaceRenderer {

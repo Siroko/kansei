@@ -10,8 +10,8 @@ const COLOR: [f32; 4] = [0.25, 0.5, 0.75, 1.0];
 
 fn gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
     let instance = wgpu::Instance::default();
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?;
-    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None)).ok()
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
+    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()
 }
 
 fn f16_to_f32(h: u16) -> f32 {
@@ -59,6 +59,7 @@ fn render(device: &wgpu::Device, queue: &wgpu::Queue, effect: &mut DepthOfFieldE
         }),
         timestamp_writes: None,
         occlusion_query_set: None,
+        multiview_mask: None,
     });
     effect.render(device, queue, &mut encoder, &gbuffer, &input_view, &depth_view, &output_view, &camera, w, h);
     let row = (w * 8).div_ceil(256) * 256;
@@ -70,8 +71,8 @@ fn render(device: &wgpu::Device, queue: &wgpu::Queue, effect: &mut DepthOfFieldE
     );
     queue.submit(std::iter::once(encoder.finish()));
     readback.slice(..).map_async(wgpu::MapMode::Read, |r| r.unwrap());
-    device.poll(wgpu::Maintain::Wait);
-    let data = readback.slice(..).get_mapped_range();
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    let data = readback.slice(..).get_mapped_range().unwrap();
     let mut out = Vec::with_capacity((w * h) as usize);
     for y in 0..h {
         for x in 0..w {

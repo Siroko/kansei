@@ -142,10 +142,10 @@ impl App {
             slice.map_async(wgpu::MapMode::Read, move |r| {
                 tx.send(r).unwrap();
             });
-            device.poll(wgpu::Maintain::Wait);
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
             rx.recv().unwrap().unwrap();
 
-            let data = slice.get_mapped_range();
+            let data = slice.get_mapped_range().unwrap();
             let tags: Vec<i32> = bytemuck::cast_slice(&data).to_vec();
             drop(data);
             staging.unmap();

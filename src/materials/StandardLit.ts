@@ -112,6 +112,8 @@ export function standardLitShader(options: StandardLitOptions = {}): string {
             ? 'out.currClip = kansei_camera_temporal.viewProj * world;\n    out.prevClip = kansei_camera_temporal.prevViewProj * (mesh.prevWorld * vec4f(local, 1.0));'
             : '',
         KANSEI_VELOCITY_FRAGMENT: velocity ? 'out.velocity = kansei_motion_vector(in.currClip, in.prevClip);' : '',
+        // the hemisphere's ambient alone (Rust's `standard_lit_environment` lights it by an environment)
+        KANSEI_AMBIENT: '',
     });
     return [LIGHTS_WGSL, SHADOW_MAP_WGSL, CASCADED_SHADOWS_WGSL, SPOT_LIGHTS_WGSL, velocity ? MOTION_VECTORS_WGSL : '', body].join('\n');
 }

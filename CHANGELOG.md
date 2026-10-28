@@ -3,6 +3,19 @@
 The `kansei` npm package is the TypeScript engine in `src/`. The Rust engine in `rust/` is not
 published to npm or crates.io (see the README for depending on it from git).
 
+## Unreleased
+
+### Fixes
+
+- `SSAOEffect` works: its hemisphere pointed into every surface (the normal rebuilt from depth
+  faced away from the camera), so flat surfaces read occluded and creases lit. It now samples
+  around the GBuffer's normal (or a correctly oriented one from depth), turns its kernel per
+  pixel, blurs by depth and scales its bias with distance, and darkens only the ambient light,
+  not the direct light or the emission. Its options take that ambient, `ambient` (required):
+  `{ kind: 'hemisphere', up, down }` (as `Material.standardLit`'s `skyUp` and `skyDown`),
+  `{ kind: 'sky', skyLighting }` or `{ kind: 'unlit' }`; `bias` is now per metre of distance
+  (default 0.003).
+
 ## 0.1.0
 
 The first release since 0.0.11 (January 2025). The TypeScript engine was rebuilt alongside the

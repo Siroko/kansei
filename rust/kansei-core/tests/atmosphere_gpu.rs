@@ -9,8 +9,8 @@ use kansei_core::math::Vec3;
 
 fn gpu() -> Option<(wgpu::Device, wgpu::Queue)> {
     let instance = wgpu::Instance::default();
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?;
-    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None)).ok()
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
+    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).ok()
 }
 
 fn f16_to_f32(h: u16) -> f32 {
@@ -65,8 +65,8 @@ fn read_mip(device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Texture,
     );
     queue.submit(std::iter::once(encoder.finish()));
     buffer.slice(..).map_async(wgpu::MapMode::Read, |r| r.unwrap());
-    device.poll(wgpu::Maintain::Wait);
-    let data = buffer.slice(..).get_mapped_range();
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    let data = buffer.slice(..).get_mapped_range().unwrap();
     let mut texels = Vec::with_capacity((w * h * d) as usize);
     for y in 0..h * d {
         for x in 0..w {
@@ -192,8 +192,8 @@ fn read_floats(device: &wgpu::Device, queue: &wgpu::Queue, buffer: &wgpu::Buffer
     encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, buffer.size());
     queue.submit(std::iter::once(encoder.finish()));
     staging.slice(..).map_async(wgpu::MapMode::Read, |r| r.unwrap());
-    device.poll(wgpu::Maintain::Wait);
-    let floats = bytemuck::cast_slice::<u8, f32>(&staging.slice(..).get_mapped_range()).to_vec();
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    let floats = bytemuck::cast_slice::<u8, f32>(&staging.slice(..).get_mapped_range().unwrap()).to_vec();
     floats
 }
 
@@ -482,7 +482,7 @@ fn atmosphere_frame_cost() {
         for i in 0..220 {
             let t0 = std::time::Instant::now();
             f();
-            device.poll(wgpu::Maintain::Wait);
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
             if i >= 20 {
                 samples.push(t0.elapsed().as_secs_f64() * 1e3);
             }

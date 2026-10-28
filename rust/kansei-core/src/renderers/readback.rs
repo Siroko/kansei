@@ -57,14 +57,14 @@ impl<T: bytemuck::Pod> Future for BufferReadback<T> {
         #[cfg(not(target_arch = "wasm32"))]
         {
             if self.state.lock().unwrap().result.is_none() {
-                let _ = self.device.poll(wgpu::Maintain::Wait);
+                let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
             }
         }
         let mut s = self.state.lock().unwrap();
         match s.result.take() {
             Some(Ok(())) => {
                 drop(s);
-                let data = bytemuck::pod_collect_to_vec(&self.staging.slice(..).get_mapped_range()[..]);
+                let data = bytemuck::pod_collect_to_vec(&self.staging.slice(..).get_mapped_range().unwrap()[..]);
                 self.staging.unmap();
                 Poll::Ready(Ok(data))
             }

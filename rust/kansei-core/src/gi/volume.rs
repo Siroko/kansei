@@ -216,7 +216,7 @@ impl VoxelVolume {
             label: Some("VoxelVolume/LinearClamp"),
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..Default::default()
         });
         Self { layout, texture, view, mip0_storage, mips, anisotropic: None, uniform, sampler, gpu }
@@ -338,7 +338,7 @@ impl Mip3d {
             ],
         });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("Mip3d"), source: wgpu::ShaderSource::Wgsl(MIP3D_WGSL.into()) });
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("Mip3d"), bind_group_layouts: &[&bgl], push_constant_ranges: &[] });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("Mip3d"), bind_group_layouts: &[Some(&bgl)], immediate_size: 0 });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("Mip3d"),
             layout: Some(&layout),

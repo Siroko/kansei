@@ -737,7 +737,7 @@ impl CullPipeline {
         });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("InstanceCulling"), source: wgpu::ShaderSource::Wgsl(WGSL.into()) });
         let pipeline = |entry_point: &str, bgls: &[&wgpu::BindGroupLayout]| {
-            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("InstanceCulling"), bind_group_layouts: bgls, push_constant_ranges: &[] });
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("InstanceCulling"), bind_group_layouts: &bgls.iter().copied().map(Some).collect::<Vec<_>>(), immediate_size: 0 });
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(&format!("InstanceCulling/{entry_point}")),
                 layout: Some(&layout),
@@ -862,12 +862,12 @@ mod tests {
     /// all of it with every view in one dispatch, and split into chunks.
     #[test]
     fn gpu_culls_and_compacts_per_view() {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-        let Some(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
             eprintln!("no GPU adapter: skipped");
             return;
         };
-        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default(), None)).unwrap();
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
         // 8-word instances: centre xyz, scale, then an id and padding
         let mut data: Vec<f32> = Vec::new();
         for i in 0..100 {
@@ -954,12 +954,12 @@ mod tests {
     /// shadow map by `shadow_lod_range` and a reflection by `reflection_lod_range`.
     #[test]
     fn gpu_lod_bands_per_kind_of_view() {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-        let Some(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
             eprintln!("no GPU adapter: skipped");
             return;
         };
-        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default(), None)).unwrap();
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
         // a row of instances along x, |x| metres from the LOD origin; ids from x
         let data: Vec<f32> = (0..100).flat_map(|i| [i as f32 - 50.0, 0.0, 0.0, 1.0, i as f32, 0.0, 0.0, 0.0]).collect();
         use wgpu::util::DeviceExt;
@@ -1007,12 +1007,12 @@ mod tests {
     #[test]
     #[ignore]
     fn time_cull_pass() {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-        let Some(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
         if !adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
             return eprintln!("no timestamp queries: skipping");
         }
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { required_features: wgpu::Features::TIMESTAMP_QUERY, ..Default::default() }, None)).unwrap();
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { required_features: wgpu::Features::TIMESTAMP_QUERY, ..Default::default() })).unwrap();
         use wgpu::util::DeviceExt;
         let mut seed = 1u32;
         let mut rnd = move || {
@@ -1082,8 +1082,8 @@ mod tests {
             encoder.copy_buffer_to_buffer(&resolve, 0, &staging, 0, resolve.size());
             queue.submit(Some(encoder.finish()));
             staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-            device.poll(wgpu::Maintain::Wait);
-            let stamps: Vec<u64> = bytemuck::cast_slice(&staging.slice(..).get_mapped_range()).to_vec();
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            let stamps: Vec<u64> = bytemuck::cast_slice(&staging.slice(..).get_mapped_range().unwrap()).to_vec();
             staging.unmap();
             let period = queue.get_timestamp_period() as f64;
             // (after a warm-up; a pass whose stamps did not resolve reads 0)
@@ -1105,12 +1105,12 @@ mod tests {
     /// reflection at the camera's band scaled by its LOD distance scale.
     #[test]
     fn gpu_crossfades_between_lods() {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-        let Some(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
             eprintln!("no GPU adapter: skipped");
             return;
         };
-        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default(), None)).unwrap();
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
         // a row of instances along x, x metres from the LOD origin (0 to 99); ids from x
         let data: Vec<f32> = (0..100).flat_map(|i| [i as f32, 0.0, 0.0, 1.0, i as f32, 0.0, 0.0, 0.0]).collect();
         use wgpu::util::DeviceExt;
@@ -1178,12 +1178,12 @@ mod tests {
     /// first about f of them, on every frame.
     #[test]
     fn lod_fade_dither_is_complementary() {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-        let Some(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
             eprintln!("no GPU adapter: skipped");
             return;
         };
-        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default(), None)).unwrap();
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
         let code = format!(
             "{}\n@group(0) @binding(0) var<storage, read_write> out : array<u32>;\n\
              @group(0) @binding(1) var<uniform> job : vec4f;\n\
@@ -1229,8 +1229,8 @@ mod tests {
         encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, buffer.size());
         queue.submit(Some(encoder.finish()));
         staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-        device.poll(wgpu::Maintain::Wait);
-        let words = bytemuck::cast_slice(&staging.slice(..).get_mapped_range()).to_vec();
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let words = bytemuck::cast_slice(&staging.slice(..).get_mapped_range().unwrap()).to_vec();
         words
     }
 
@@ -1267,13 +1267,13 @@ mod tests {
             primitive: Default::default(),
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Always,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Always),
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
             multisample: Default::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
         let mut encoder = device.create_command_encoder(&Default::default());
@@ -1301,12 +1301,12 @@ mod tests {
     /// and boxes both work, and the counters add up.
     #[test]
     fn gpu_culls_occluded_instances_in_two_phases() {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-        let Some(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
             eprintln!("no GPU adapter: skipped");
             return;
         };
-        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default(), None)).unwrap();
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
         // the camera at the origin looking down -z, 90 degrees; a wall 10 m away over the left half
         let view = glam::Mat4::look_at_rh(glam::Vec3::ZERO, glam::Vec3::NEG_Z, glam::Vec3::Y);
         let proj = glam::Mat4::perspective_rh(std::f32::consts::FRAC_PI_2, 1.0, 0.1, 100.0);

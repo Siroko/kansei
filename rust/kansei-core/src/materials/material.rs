@@ -25,6 +25,11 @@ impl CullMode {
 /// Configuration for a render material.
 pub struct MaterialOptions {
     pub transparent: bool,
+    /// Drawn after the opaque renderables, once the GBuffer's colour has been copied to its
+    /// `background` (the TS `transmissive`): an effect or material can then refract what is
+    /// behind it from that copy (`postprocessing::effects::ScreenSpaceGlassEffect`). It still
+    /// writes depth and occludes; transparent renderables draw after it.
+    pub transmissive: bool,
     pub depth_write: Option<bool>,
     pub depth_compare: wgpu::CompareFunction,
     pub cull_mode: CullMode,
@@ -56,6 +61,7 @@ impl Default for MaterialOptions {
     fn default() -> Self {
         Self {
             transparent: false,
+            transmissive: false,
             depth_write: None,
             depth_compare: wgpu::CompareFunction::Less,
             cull_mode: CullMode::Back,
@@ -193,13 +199,13 @@ impl Material {
             let material_bgl = BindGroupBuilder::create_layout(device, &format!("{label}/MaterialBGL"), bindings);
             let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some(&format!("{label}/PipelineLayout")),
-                bind_group_layouts: &[&material_bgl, &shared.camera_bgl, &shared.mesh_bgl, &shared.shadow_bgl],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(&material_bgl), Some(&shared.camera_bgl), Some(&shared.mesh_bgl), Some(&shared.shadow_bgl)],
+                immediate_size: 0,
             });
             let depth_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some(&format!("{label}/DepthPipelineLayout")),
-                bind_group_layouts: &[&material_bgl, &shared.camera_bgl, &shared.mesh_bgl],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(&material_bgl), Some(&shared.camera_bgl), Some(&shared.mesh_bgl)],
+                immediate_size: 0,
             });
             crate::renderers::MaterialProgram { module, material_bgl, pipeline_layout, depth_pipeline_layout }
         });
@@ -339,7 +345,7 @@ impl Material {
             vertex: wgpu::VertexState {
                 module,
                 entry_point: Some(vertex_entry),
-                buffers: vertex_layouts,
+                buffers: &vertex_layouts.iter().cloned().map(Some).collect::<Vec<_>>(),
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -355,8 +361,8 @@ impl Material {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: depth_format,
-                depth_write_enabled: depth_write,
-                depth_compare: self.options.depth_compare,
+                depth_write_enabled: Some(depth_write),
+                depth_compare: Some(self.options.depth_compare),
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
@@ -364,7 +370,7 @@ impl Material {
                 count: sample_count,
                 ..Default::default()
             },
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         })
     }
@@ -399,8 +405,8 @@ impl Material {
             .get_or_insert_with(|| {
                 device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                     label: Some(&format!("{}/ClusterPipelineLayout", self.label)),
-                    bind_group_layouts: &[self.material_bgl.as_ref().unwrap(), &shared.camera_bgl, &shared.cluster_mesh_bgl, &shared.shadow_bgl],
-                    push_constant_ranges: &[],
+                    bind_group_layouts: &[Some(self.material_bgl.as_ref().unwrap()), Some(&shared.camera_bgl), Some(&shared.cluster_mesh_bgl), Some(&shared.shadow_bgl)],
+                    immediate_size: 0,
                 })
             })
             .clone()
@@ -433,8 +439,8 @@ impl Material {
             .get_or_insert_with(|| {
                 device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                     label: Some(&format!("{}/ClusterDepthPipelineLayout", self.label)),
-                    bind_group_layouts: &[self.material_bgl.as_ref().unwrap(), &shared.camera_bgl, &shared.cluster_mesh_bgl],
-                    push_constant_ranges: &[],
+                    bind_group_layouts: &[Some(self.material_bgl.as_ref().unwrap()), Some(&shared.camera_bgl), Some(&shared.cluster_mesh_bgl)],
+                    immediate_size: 0,
                 })
             })
             .clone();
@@ -500,7 +506,7 @@ impl Material {
             vertex: wgpu::VertexState {
                 module,
                 entry_point: Some(vertex_entry),
-                buffers: vertex_layouts,
+                buffers: &vertex_layouts.iter().cloned().map(Some).collect::<Vec<_>>(),
                 compilation_options: Default::default(),
             },
             fragment,
@@ -511,13 +517,13 @@ impl Material {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: depth_format,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::LessEqual,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
                 stencil: Default::default(),
                 bias,
             }),
             multisample: Default::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         })
     }
@@ -564,7 +570,7 @@ impl Material {
             vertex: wgpu::VertexState {
                 module,
                 entry_point: Some(vertex_entry),
-                buffers: vertex_layouts,
+                buffers: &vertex_layouts.iter().cloned().map(Some).collect::<Vec<_>>(),
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -582,13 +588,13 @@ impl Material {
             // output @invariant; the small bias toward the camera covers compilers that differ
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: GBuffer::DEPTH_FORMAT,
-                depth_write_enabled: false,
-                depth_compare: wgpu::CompareFunction::LessEqual,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
                 stencil: Default::default(),
                 bias: wgpu::DepthBiasState { constant: -4, slope_scale: -1.0, clamp: 0.0 },
             }),
             multisample: Default::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         })
     }
@@ -621,8 +627,8 @@ impl Material {
                 .or_insert_with(|| {
                     device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                         label: Some(&format!("{}/VoxelPipelineLayout", self.label)),
-                        bind_group_layouts: &[material_bgl, &shared.camera_bgl, &shared.mesh_bgl, voxel_bgl],
-                        push_constant_ranges: &[],
+                        bind_group_layouts: &[Some(material_bgl), Some(&shared.camera_bgl), Some(&shared.mesh_bgl), Some(voxel_bgl)],
+                        immediate_size: 0,
                     })
                 })
                 .clone();
@@ -635,13 +641,13 @@ impl Material {
             let pipeline = self.shared_pipeline(format!("voxel {voxelizer} {vertex_layouts:?} {target:?} {sample_count}"), || device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(&format!("{}/VoxelPipeline", self.label)),
                 layout: Some(&layout),
-                vertex: wgpu::VertexState { module, entry_point: Some("vertex_main"), buffers: vertex_layouts, compilation_options: Default::default() },
+                vertex: wgpu::VertexState { module, entry_point: Some("vertex_main"), buffers: &vertex_layouts.iter().cloned().map(Some).collect::<Vec<_>>(), compilation_options: Default::default() },
                 fragment: Some(wgpu::FragmentState { module: fragment_module, entry_point: Some(entry), targets: &targets, compilation_options: Default::default() }),
                 // every face from every axis: the far side of a closed mesh is a surface too
                 primitive: wgpu::PrimitiveState { topology: self.options.topology, cull_mode: None, ..Default::default() },
                 depth_stencil: None,
                 multisample: wgpu::MultisampleState { count: sample_count, ..Default::default() },
-                multiview: None,
+                multiview_mask: None,
                 cache: None,
             }));
             self.voxel_pipeline_cache.insert(key, pipeline);
@@ -669,8 +675,8 @@ impl Material {
         if !self.cluster_voxel_pipeline_cache.contains_key(&voxelizer) {
             let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some(&format!("{}/ClusterVoxelPipelineLayout", self.label)),
-                bind_group_layouts: &[self.material_bgl.as_ref().unwrap(), &shared.camera_bgl, &shared.cluster_mesh_bgl, voxel_bgl],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(self.material_bgl.as_ref().unwrap()), Some(&shared.camera_bgl), Some(&shared.cluster_mesh_bgl), Some(voxel_bgl)],
+                immediate_size: 0,
             });
             let (fragment_module, entry) = match self.options.voxel_fragment_entry {
                 Some(entry) => (&module, entry),
@@ -685,7 +691,7 @@ impl Material {
                 primitive: wgpu::PrimitiveState { topology: self.options.topology, cull_mode: None, ..Default::default() },
                 depth_stencil: None,
                 multisample: wgpu::MultisampleState { count: sample_count, ..Default::default() },
-                multiview: None,
+                multiview_mask: None,
                 cache: None,
             });
             self.cluster_voxel_pipeline_cache.insert(voxelizer, pipeline);

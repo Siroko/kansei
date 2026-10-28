@@ -256,7 +256,7 @@ impl ApplicationHandler for App {
                 }
 
                 let surface = renderer.surface().unwrap();
-                let output = surface.get_current_texture().expect("Surface texture");
+                let output = kansei_core::renderers::surface_texture(surface).expect("Surface texture");
                 let canvas_view = output.texture.create_view(&Default::default());
                 let mut encoder = renderer.create_command_encoder(&Default::default());
 
@@ -265,7 +265,7 @@ impl ApplicationHandler for App {
                         pr.upload(renderer, &view, &proj, self.particle_size);
                         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: &canvas_view, resolve_target: None,
+                                view: &canvas_view, depth_slice: None, resolve_target: None,
                                 ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.02, g: 0.02, b: 0.04, a: 1.0 }), store: wgpu::StoreOp::Store },
                             })], ..Default::default()
                         });
@@ -279,7 +279,7 @@ impl ApplicationHandler for App {
                         df.update_with_encoder(&mut encoder, sim.world_bounds_min, sim.world_bounds_max, sim.particle_count(), sim.params.smoothing_radius);
                     }
                     { let _p = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: self.color_view.as_ref().unwrap(), resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.02, g: 0.02, b: 0.04, a: 1.0 }), store: wgpu::StoreOp::Store } })],
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: self.color_view.as_ref().unwrap(), depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.02, g: 0.02, b: 0.04, a: 1.0 }), store: wgpu::StoreOp::Store } })],
                         depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: self.depth_view.as_ref().unwrap(), depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }), stencil_ops: None }),
                         ..Default::default()
                     }); }
@@ -287,15 +287,15 @@ impl ApplicationHandler for App {
                         sr.render(&mut encoder, self.surface_bg.as_ref().unwrap(), &inv_vp, [eye.x, eye.y, eye.z], sim.world_bounds_min, sim.world_bounds_max, size.width, size.height);
                     }
                     { let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &canvas_view, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })], ..Default::default()
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment { view: &canvas_view, depth_slice: None, resolve_target: None, ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store } })], ..Default::default()
                     });
                     if let Some(ref blit) = self.blit { pass.set_pipeline(&blit.pipeline); pass.set_bind_group(0, self.blit_bg.as_ref().unwrap(), &[]); pass.draw(0..3, 0..1); } }
                 }
 
                 // egui
                 let raw_input = self.egui_state.as_mut().unwrap().take_egui_input(self.window.as_ref().unwrap());
-                let full_output = self.egui_ctx.run(raw_input, |ctx| {
-                    egui::SidePanel::right("controls").min_width(220.0).show(ctx, |ui| {
+                let full_output = self.egui_ctx.run_ui(raw_input, |root| {
+                    egui::Panel::right("controls").min_size(220.0).show(root, |ui| {
                         ui.heading("Fluid 3D");
                         ui.separator();
                         ui.checkbox(&mut self.show_particles, "Show particles");
@@ -344,7 +344,7 @@ impl ApplicationHandler for App {
                 renderer.egui_free_textures(&mut er, &full_output.textures_delta);
                 self.egui_renderer = Some(er);
                 self.egui_state.as_mut().unwrap().handle_platform_output(self.window.as_ref().unwrap(), full_output.platform_output);
-                output.present();
+                renderer.queue().present(output);
                 if let Some(ref w) = self.window { w.request_redraw(); }
             }
             _ => {}

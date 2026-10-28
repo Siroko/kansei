@@ -256,7 +256,7 @@ impl PostProcessingEffect for FluidSurfaceEffect {
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("FluidSurface/Layout"),
-            bind_group_layouts: &[&bgl], push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bgl)], immediate_size: 0,
         });
         self.composite_pipeline = Some(device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("FluidSurface/Pipeline"), layout: Some(&layout),

@@ -7,6 +7,7 @@
  */
 import { assemble } from '../materials/shaders/ShaderUtils';
 import rtTypes from '../../rust/kansei-core/src/rt/shaders/rt_types.wgsl?raw';
+import rtHit from '../../rust/kansei-core/src/rt/shaders/rt_hit.wgsl?raw';
 import rtGrid from '../../rust/kansei-core/src/rt/shaders/rt_grid.wgsl?raw';
 import rtBuild from '../../rust/kansei-core/src/rt/shaders/rt_build.wgsl?raw';
 import rtGather from '../../rust/kansei-core/src/rt/shaders/rt_gather.wgsl?raw';
@@ -34,7 +35,7 @@ import { COMPUTE_SHADOWS_WGSL } from '../shadows/ComputeShadows';
  * `fn kansei_rt_covered(layer: u32, uv: vec2f) -> bool`, whether an alpha-tested triangle
  * (`RtSurface.alphaLayer`) is there at `uv` (`RT_OPAQUE_WGSL`: everywhere). Rust: `rt::RT_GRID_WGSL`.
  */
-export const RT_GRID_WGSL: string = assemble([rtTypes, rtGrid]);
+export const RT_GRID_WGSL: string = assemble([rtTypes, rtHit, rtGrid]);
 
 /** A `kansei_rt_covered` for `RT_GRID_WGSL` that keeps every hit (no alpha test). */
 export const RT_OPAQUE_WGSL = 'fn kansei_rt_covered(layer: u32, uv: vec2f) -> bool { return true; }\n';
@@ -155,17 +156,20 @@ export function rtGlassWgsl(covered: string, clipmap: boolean = false): string {
     return rtTracedWgsl(covered, clipmap, rtGlass);
 }
 
+/** The default `kansei_rt_hit_albedo` (Rust: `RtReflectionsOptions::albedo_wgsl`): the triangle's albedo. */
+export const RT_DEFAULT_HIT_ALBEDO_WGSL = 'fn kansei_rt_hit_albedo(triangle: u32, p: vec3f, bary: vec2f) -> vec3f {\n    return kansei_rt_albedo(triangle);\n}\n';
+
 /**
- * rt_reflect_hit.wgsl's albedo at a hit: the triangle's albedo word (the Rust effect also reads a
- * texture array for surfaces with an albedo layer, `RtReflectionsEffect::set_albedo_texture`).
+ * The sky past the voxels (`rtSky`, which Rust's `rt_reflect_sky.wgsl` also reads from an
+ * environment cubemap): the sky lighting's SH.
  */
-const RT_FLAT_ALBEDO_WGSL = 'fn kansei_rt_hit_albedo(triangle: u32, bary: vec2f) -> vec3f {\n    return kansei_rt_albedo(triangle);\n}\n';
-/** rt_reflect_hit.wgsl's caustics and background image at a hit: none (Rust's `RtCausticsEffect` and `RtSurface::with_self_lit` have no TS port yet). */
+const RT_SKY_WGSL = 'fn rtSky(d: vec3f, tanHalf: f32) -> vec3f {\n    return skyRadiance(sky, d);\n}\n';
+/** rt_reflect_hit.wgsl's caustics and background image at a hit: none (Rust's `RtReflectionsEffect::set_caustics` and `RtSurface::with_self_lit` have no TS port yet). */
 const RT_NO_CAUSTICS_WGSL = 'fn kansei_rt_hit_caustics(p: vec3f, n: vec3f) -> vec3f {\n    return vec3f(0.0);\n}\nfn kansei_rt_hit_background(p: vec3f, n: vec3f, triangle: u32, bary: vec2f) -> vec4f {\n    return vec4f(0.0);\n}\n';
 
 function rtTracedWgsl(covered: string, clipmap: boolean, main: string): string {
     const source = clipmap ? `${CLIPMAP_WGSL}${CLIPMAP_SOURCE_WGSL}${CLIPMAP_IRRADIANCE_WGSL}` : `${VOXEL_CONES_WGSL}${voxelIrradiance}${VOLUME_SOURCE_WGSL}`;
-    return `${SKY_LIGHTING_WGSL}\n${SPOT_LIGHT_TYPES_WGSL}\n${rtReflectCommon}\n${RT_GRID_WGSL}\n${rtGridBindingsWgsl(1, 0)}\n${ALPHA_BINDINGS_WGSL}${RT_FLAT_ALBEDO_WGSL}${RT_NO_CAUSTICS_WGSL}${covered}\n${source}\n${rtReflectHit}\n${main}`;
+    return `${SKY_LIGHTING_WGSL}\n${SPOT_LIGHT_TYPES_WGSL}\n${rtReflectCommon}\n${RT_GRID_WGSL}\n${rtGridBindingsWgsl(1, 0)}\n${ALPHA_BINDINGS_WGSL}${covered}\n${RT_DEFAULT_HIT_ALBEDO_WGSL}${RT_NO_CAUSTICS_WGSL}${source}\n${RT_SKY_WGSL}${rtReflectHit}\n${main}`;
 }
 
 /** `RtReflectionsEffect`'s resolve. */

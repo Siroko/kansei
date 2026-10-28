@@ -11,9 +11,9 @@ use kansei_core::materials::{BindGroupBuilder, Binding, BindingResource};
 
 fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
     let instance = wgpu::Instance::default();
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?;
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
     let features = adapter.features() & CompressionSupport::FEATURES;
-    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { required_features: features, ..Default::default() }, None)).ok()
+    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor { required_features: features, ..Default::default() })).ok()
 }
 
 mod ktx2_fixtures;
@@ -72,7 +72,7 @@ fn read_texels(device: &wgpu::Device, queue: &wgpu::Queue, texture: &mut Texture
             .into(),
         ),
     });
-    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[&layout], push_constant_ranges: &[] });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&layout)], immediate_size: 0 });
     let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: None,
         layout: Some(&pipeline_layout),
@@ -91,8 +91,8 @@ fn read_texels(device: &wgpu::Device, queue: &wgpu::Queue, texture: &mut Texture
     encoder.copy_buffer_to_buffer(&out, 0, &readback, 0, bytes);
     queue.submit(std::iter::once(encoder.finish()));
     readback.slice(..).map_async(wgpu::MapMode::Read, |r| r.unwrap());
-    device.poll(wgpu::Maintain::Wait);
-    let values: Vec<f32> = bytemuck::cast_slice(&readback.slice(..).get_mapped_range()).to_vec();
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    let values: Vec<f32> = bytemuck::cast_slice(&readback.slice(..).get_mapped_range().unwrap()).to_vec();
     values.chunks(4).map(|c| [c[0], c[1], c[2], c[3]]).collect()
 }
 
@@ -142,9 +142,9 @@ fn every_supported_target_uploads_its_mips_and_reads_back() {
                 0 => Texture::from_levels(name, target.format(false), w, h, levels),
                 layers => Texture::from_array_levels(name, target.format(false), w, h, layers, levels),
             };
-            device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
             let texels = read_texels(&device, &queue, &mut texture);
-            assert!(pollster::block_on(device.pop_error_scope()).is_none(), "{name} {}: validation error", target.name());
+            assert!(pollster::block_on(scope.pop()).is_none(), "{name} {}: validation error", target.name());
             assert_eq!(texels.len() * 4, reference.len());
             let map = channel_map(target, !info.has_alpha);
             let mut worst = 0.0f32;
@@ -211,9 +211,9 @@ fn hdr_targets_upload_and_read_back() {
         }
         let levels = ktx2::transcode_levels(&bytes, target).unwrap();
         let mut texture = Texture::from_levels("Hdr", target.format(false), 20, 12, levels);
-        device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let texels = read_texels(&device, &queue, &mut texture);
-        assert!(pollster::block_on(device.pop_error_scope()).is_none());
+        assert!(pollster::block_on(scope.pop()).is_none());
         let errors: Vec<f32> = texels
             .iter()
             .zip(&reference)

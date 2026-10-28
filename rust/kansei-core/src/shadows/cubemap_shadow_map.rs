@@ -212,8 +212,8 @@ impl CubeMapShadowMap {
         // --- Render pipeline ---
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("CubeMapShadow/PipelineLayout"),
-            bind_group_layouts: &[&light_uniform_bgl, &mesh_bgl],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&light_uniform_bgl), Some(&mesh_bgl)],
+            immediate_size: 0,
         });
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -229,7 +229,7 @@ impl CubeMapShadowMap {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("shadow_vs"),
-                buffers: &[Vertex::LAYOUT],
+                buffers: &[Some(Vertex::LAYOUT)],
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -249,13 +249,13 @@ impl CubeMapShadowMap {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Less,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
             multisample: Default::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 

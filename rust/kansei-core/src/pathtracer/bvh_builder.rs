@@ -1,11 +1,13 @@
 use wgpu::util::DeviceExt;
 
+use super::accel::SceneAccel;
 use super::buffers::{BVH4Node, BinaryBVHNode, PackedInstance, PackedTriangle};
 use super::TLASBuilder;
 use super::material::PathTracerMaterial;
 use crate::math::Mat4;
 use crate::objects::Scene;
 use crate::renderers::Renderer;
+use crate::rt::RtBackend;
 
 // ── SAH constants ──────────────────────────────────────────────────────────
 
@@ -146,7 +148,8 @@ impl SAHBins {
 
 // ── GPU BVH output ────────────────────────────────────────────────────────
 
-/// Handles to GPU buffers produced by `BVHBuilder::upload_to_gpu`.
+/// Handles to GPU buffers produced by `BVHBuilder::upload_to_gpu`, and on the hardware backend
+/// the scene's acceleration structures.
 pub struct GPUBVHData {
     pub triangles_buf: wgpu::Buffer,
     pub bvh4_nodes_buf: wgpu::Buffer,
@@ -154,6 +157,61 @@ pub struct GPUBVHData {
     pub triangle_count: u32,
     pub node_count: u32,
     pub instance_count: u32,
+    accel: Option<SceneAccel>,
+}
+
+impl GPUBVHData {
+    /// What traces the scene: `Software` (the BVH4s, `bvh4_nodes_buf` and the `TLASBuilder`'s
+    /// nodes) or `Hardware` (ray queries over its acceleration structures).
+    pub fn backend(&self) -> RtBackend {
+        if self.accel.is_some() {
+            RtBackend::Hardware
+        } else {
+            RtBackend::Software
+        }
+    }
+
+    /// WGSL tracing the scene from a compute pass, through its backend: `Ray`, `HitInfo`,
+    /// `trace_bvh(ray)` (the closest hit), `trace_bvh_shadow(ray, max_dist)` (any hit),
+    /// `trace_bvh_internal(ray, any_hit, max_dist)` and `get_world_tri_area(tri, instance)`, its
+    /// four bindings in group 0 from `first` (`layout_entries`, `bind_group_entries`). Make the
+    /// module with `shader_module` (on the hardware backend it opens with an `enable`, and skips
+    /// a costly runtime check).
+    pub fn traversal_wgsl(&self, first: u32) -> String {
+        super::accel::traversal_wgsl(self.backend(), first, None)
+    }
+
+    /// The compute module of `code`, a module whose only ray queries are `traversal_wgsl`'s,
+    /// assembled (its `enable` first): on the hardware backend made without wgpu's ray query
+    /// initialization tracking, which the traversal does without (it keeps the rules itself) and
+    /// which cost NVIDIA's Vulkan driver ten times the path tracer's trace.
+    pub fn shader_module(&self, device: &wgpu::Device, label: &str, code: &str) -> wgpu::ShaderModule {
+        super::accel::shader_module(device, self.backend(), label, &crate::rt::hoist_wgsl_enables(code))
+    }
+
+    /// The layout entries of `traversal_wgsl(first)`'s bindings.
+    pub fn layout_entries(&self, first: u32) -> Vec<wgpu::BindGroupLayoutEntry> {
+        super::accel::traversal_layout_entries(self.backend(), first)
+    }
+
+    /// The bind group entries of `traversal_wgsl(first)`'s bindings; `tlas_nodes` is the
+    /// `TLASBuilder`'s nodes (unused by the hardware backend).
+    pub fn bind_group_entries<'a>(&'a self, tlas_nodes: &'a wgpu::Buffer, first: u32) -> Vec<wgpu::BindGroupEntry<'a>> {
+        let entry = |binding, resource| wgpu::BindGroupEntry { binding, resource };
+        match &self.accel {
+            Some(accel) => vec![
+                entry(first, self.triangles_buf.as_entire_binding()),
+                entry(first + 2, accel.tlas().as_binding()),
+                entry(first + 3, self.instances_buf.as_entire_binding()),
+            ],
+            None => vec![
+                entry(first, self.triangles_buf.as_entire_binding()),
+                entry(first + 1, self.bvh4_nodes_buf.as_entire_binding()),
+                entry(first + 2, tlas_nodes.as_entire_binding()),
+                entry(first + 3, self.instances_buf.as_entire_binding()),
+            ],
+        }
+    }
 }
 
 // ── Transform helpers ─────────────────────────────────────────────────────
@@ -210,6 +268,8 @@ pub struct BVHBuilder {
     pub scene_bounds_min: [f32; 3],
     /// Scene AABB maximum (computed during `pack_instances`).
     pub scene_bounds_max: [f32; 3],
+    /// What `upload_to_gpu` readies the scene for (`Auto` by default; see `set_backend`).
+    backend: RtBackend,
 
     // ── Temporaries ──
     /// Binary BVH nodes (cleared after collapse).
@@ -238,6 +298,7 @@ impl BVHBuilder {
             packed_instances: Vec::new(),
             scene_bounds_min: [f32::INFINITY; 3],
             scene_bounds_max: [f32::NEG_INFINITY; 3],
+            backend: RtBackend::Auto,
             binary_nodes: Vec::new(),
             aabb_cache: None,
             index_buf: Vec::new(),
@@ -246,6 +307,15 @@ impl BVHBuilder {
             next_node: 0,
             next_tri_slot: 0,
         }
+    }
+
+    /// What traces the scene `upload_to_gpu` readies: its BVH4s in compute (`Software`, the web's
+    /// only one) or, where the device has hardware ray queries, acceleration structures of the
+    /// same triangles (`Hardware`); `Auto` (the default) picks as the RT grid does
+    /// ([`RtBackend::resolve`]: hardware on Vulkan and Metal on M3 and later, `KANSEI_RT_BACKEND`
+    /// on native). `GPUBVHData::backend` says which it got. The BVH4s are built either way.
+    pub fn set_backend(&mut self, backend: RtBackend) {
+        self.backend = backend;
     }
 
     /// Add a mesh (geometry) to the builder.
@@ -918,6 +988,16 @@ impl BVHBuilder {
                 | wgpu::BufferUsages::COPY_DST,
         });
 
+        let mut accel = None;
+        if self.backend.resolve(device) == RtBackend::Hardware {
+            let largest = self.blas_entries.iter().map(|e| e.tri_count).max().unwrap_or(0);
+            if SceneAccel::fits(device, largest, self.packed_instances.len()) {
+                accel = Some(SceneAccel::new(device, renderer.queue(), &self.triangles, &self.blas_entries, &self.packed_instances));
+            } else {
+                log::warn!("path tracer: the scene ({largest} triangles in its largest mesh, {} instances) exceeds the device's acceleration structure limits: tracing in software", self.packed_instances.len());
+            }
+        }
+
         GPUBVHData {
             triangles_buf,
             bvh4_nodes_buf,
@@ -925,6 +1005,7 @@ impl BVHBuilder {
             triangle_count: self.triangles.len() as u32,
             node_count: self.bvh4_nodes.len() as u32,
             instance_count: self.packed_instances.len() as u32,
+            accel,
         }
     }
 
@@ -933,7 +1014,9 @@ impl BVHBuilder {
     /// 2. `build_all_blas` — CPU SAH build + BVH4 collapse
     /// 3. `pack_instances` — create instance data with transforms + BLAS offsets
     /// 4. `upload_to_gpu` — create GPU buffers for triangles, nodes, instances
-    /// 5. `tlas.build` — GPU Morton sort + BVH4 TLAS construction
+    ///    (and on the hardware backend the acceleration structures, `set_backend`)
+    /// 5. `tlas.build` — GPU Morton sort + BVH4 TLAS construction (on either
+    ///    backend: the passes take its buffer)
     ///
     /// Returns GPU buffer handles for use in the trace shader.
     pub fn build_full(
@@ -971,7 +1054,8 @@ impl BVHBuilder {
 
     /// Refresh instance transforms after objects have moved, without rebuilding
     /// any BLAS. Re-packs instances from the scene, writes them into the
-    /// existing GPU instances buffer, and rebuilds the TLAS.
+    /// existing GPU instances buffer, and rebuilds the TLAS (on the hardware
+    /// backend the acceleration structure's).
     ///
     /// The scene must contain the same renderables (same count, same order)
     /// as when `build_full` was called — only their transforms may change.
@@ -979,7 +1063,7 @@ impl BVHBuilder {
         &mut self,
         renderer: &Renderer,
         scene: &Scene,
-        gpu_data: &GPUBVHData,
+        gpu_data: &mut GPUBVHData,
         tlas: &mut TLASBuilder,
     ) {
         self.pack_instances(scene);
@@ -995,7 +1079,9 @@ impl BVHBuilder {
             bytemuck::cast_slice(&self.packed_instances),
         );
 
-        if gpu_data.instance_count > 0 {
+        if let Some(accel) = gpu_data.accel.as_mut() {
+            accel.set_instances(renderer.device(), renderer.queue(), &self.packed_instances);
+        } else if gpu_data.instance_count > 0 {
             tlas.build(
                 renderer,
                 &gpu_data.instances_buf,

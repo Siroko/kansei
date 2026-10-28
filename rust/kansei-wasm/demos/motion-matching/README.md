@@ -202,31 +202,33 @@ and the room renders as it does with one.
   left out) and writes a mesh 30 cm apart over it (`Renderable::rt_mesh`), coarse because the
   grid's cost is triangles a cell, marked `RtSurface::with_approximate` so the glass pass doesn't
   bend twice at it; the mirrors show the water through it, and the caustics' photons refract at
-  the fine height field. Its reflection is traced with the other surfaces' (`RtGlass::
+  it, rippled as the glass material is. Its reflection is traced with the other surfaces' (`RtGlass::
   reflections_in_trace`: half resolution, accumulated), and the glass pass traces half the glass
   pixels a frame (`RtGlass::checkerboard`, the others from the traced ones beside them):
   together they took the glass pass from 34 to 4.6 ms in `dragon`. The tank's panes are not
   traced (two more interfaces a pixel: the glass pass took 27 ms with the tank filling the screen):
   the water's own surface refracts at its walls, a thin steel frame round it.
-- **Caustics** (`kansei_core::rt::RtCausticsEffect`, new with this page; `caustics`). Every frame
-  each light (the sun, the spot lights) sends a grid of photons (`caustics_photons` a side) at the
-  dragon; those that hit glass first are refracted through it (Fresnel, absorption, total internal
-  reflection) and add their light where they land on a 3 cm map over the floor (the glb's
-  `CAUSTICS_Area`: round the aquarium, where the sun through it lands, and the dragon), and the same
-  photons taken straight on take it away where the direct light lands, so the map holds what the
-  glass changes: the light it focuses on the plinth and the shadow it leaves. It is blended over
-  frames (`caustics_blend`) and added to the surfaces under it that face up (on screen, and at the
-  reflections' and the glass's hits). Physical, the glass's light is a faint dappling (10-30% over
-  the spot's own): `game` takes it 3x as bright with its splats half as wide
-  (`caustics_glass_gain`, `caustics_sharpen`; `RtCausticsEffect::focus_gain`, `focus_sharpen`).
-  The water's caustics are a game's pool's (`kansei_water_caustic_lines`, `kansei_rt_caustics_focus`):
-  a net of bright curved lines over what lies under the water, two animated cellular layers bent
-  by slow waves, the light between them at 0.45 and on them up to 4x (the mean about kept); its
-  ripples' own focus (the refraction's Jacobian, `kansei_water_focus`) was too soft to read on the
-  pale bed. `caustics_water_photons` (on by default, both presets) sends photons through the
-  water: the low sun through the aquarium throws its caustics across the floor east of it
-  (`cam=caustics`). The map costs 0.7-1.0 ms with the water's photons (0.5 without; fed every
-  other frame, `caustics_every`; four times as seldom with the tank and the dragon out of view).
+- **Caustics** (`kansei_core::rt::RtCausticsEffect`; `caustics`). Each glass caster has a tile
+  of its own round it (the dragon's box, and a slab round the water's surface: a caster's box takes
+  what lands inside it for its own core, and the tank's bed must keep the light), a texel about a
+  pixel wide where it is on screen, reaching 1.2 m below it (the tank's bed and the floor round
+  its stand). The sun and the spot lights send photons at each caster from points of their
+  emitters (`caustics_area`; the skylight from its opening): refracted through the glass
+  (Fresnel, absorption, total internal reflection), they add their light where they land, and the
+  same photons taken straight on take it away where the direct light lands, so the tile holds
+  what the glass changes: the light it focuses on the plinth and the shadow it leaves, weighed by
+  the RT shadows' visibility of each light. A still caster's tile accumulates 64 frames and then
+  stops. The water's is a game's: its photons bend at the glass material's wind ripples too
+  (`RtCausticsEffect::set_rippled`: the grid's copy of the surface is too coarse to focus
+  anything), its tile never settles (`set_changing`, the last two feeds), and it only adds the
+  light it focuses (`set_add_only`: the tank's panes aren't in the grid, so the light it would take
+  from the floor beyond comes in through them). The caustics are added to the surfaces
+  `RtShadowsEffect` lights, on screen, and at the reflections' and the glass's hits
+  (`RtReflectionsEffect::set_caustics`, the map set each frame: it grows with the casters).
+  Physical, the glass's light is a faint dappling: `game` takes it 3x as bright with its splats
+  half as wide (`caustics_glass_gain`, `caustics_sharpen`; `focus_gain`, `focus_sharpen`). Fed
+  every other frame while they accumulate (`caustics_every`), four times as seldom with the tank
+  and the dragon out of view: 0.6-1.2 ms.
 - **The water's surface and box** (the panel's Fluid → surface resolution & box; `room.info().fluid`
   reads back what it is built at). The surface is interpolated marching cubes over a surface field
   of `fluid_res` voxels along the box's longest side (256: 72 x 91 x 256 voxels of 1.6 cm over
@@ -244,9 +246,9 @@ and the room renders as it does with one.
   nothing until the surface needs them. At rest (the default) the surface isn't extracted, so
   its resolution costs nothing per frame.
 - **Glass and water quality** (the panel's preset, `quality=`). `game` (the default): the
-  checkerboard, the glass's reflections at half resolution, the water's caustic lines, the glass's
-  caustics 3x and sharper, photons from the lights' centres. `high`: every glass pixel and its own reflection, photons
-  through the water from the lights' emitters, four times the photons.
+  checkerboard, the glass's reflections at half resolution, the glass's caustics 3x and sharper,
+  photons from the lights' centres, every other frame. `high`: every glass pixel and its own
+  reflection, physical caustics from the lights' emitters, every frame.
 - **Furniture** from Poly Haven, CC0 (lounge and arm chairs, an ottoman, coffee and side tables,
   a pendant, stools, steel shelves, a cabinet, plants, vases, pillows, five sculptures), decimated
   in Blender (a live Decimate modifier each), and pieces modelled there (the sofa, the tables, the
@@ -346,7 +348,8 @@ What the page reads from the glb (`layout.rs`), by names and custom properties (
 - `<name>_SHADOW` (a child): what its parent casts into the shadow maps and what the grid traces;
 - `<name>_CUT` (Blender's boolean cutters) and `kansei: preview` (Blender-only stand-ins): skipped;
 - `kansei`: `shell` (one-sided), `mirror` (`kansei_roughness`), `glass`, `aquarium` (the water's
-  box, `fill`), `caustics` (the caustics map's floor rectangle), `dragon` (an empty: where, yaw,
+  box, `fill`), `caustics` (ignored: an older glb's caustics map; their tiles follow the casters
+  now), `dragon` (an empty: where, yaw,
   `length`), `spawn` (an arrow: the character's start and heading);
 - materials: base colour × factor, normal map × strength, the ORM image, roughness factor, alpha
   clip for cut-outs, emission; `kansei_reflective`, `kansei_macro`, `kansei_shade` (a lamp shade
@@ -373,7 +376,7 @@ page credits them.
 ### What a frame costs
 
 1080p (`dpr=1`), M4 Pro, headless Chrome without vsync (`stats=1`, `perf=1`), the defaults
-(`game`: hybrid GI, ray-traced shadows, reflections and glass, caustics with the water's photons,
+(`game`: hybrid GI, ray-traced shadows, reflections and glass, caustics of the glass and the water,
 fog, dust, depth of field, TAA, bloom), no pack, the water asleep. The Blender room against the
 procedural one it replaced, alternated in one session (the GPU shared with other sessions: tens
 of percent between runs), GPU ms per frame:
@@ -398,6 +401,15 @@ the rays through the grid's water) and 15-20 ms running (`fluid_rest=0`: the SPH
 the tank (3.2 cm): at 256 the marching cubes' draw alone was 3-9 ms. Before the `_SHADOW`
 proxies stood in for the furniture in the grid it traced 43k triangles and `hall` was 21.6 ms;
 with the tank's panes traced as glass, its own view 54 ms.
+
+On `development`'s engine (wgpu 30, its `RtShadowsEffect` and `RtCausticsEffect`), against this
+page before it, alternated in one session (the water running): `hall` 37-39 against 28.5-29.4
+ms, `dragon` 34-39 against 30-32. Nearly all of it is the RT shadows' trace, 5.7-9.2 ms against
+1.4-2.4: the effect read each spot light's cone the wrong way round here (`SpotLight::cone` is
+outer, inner), so the lamps lit only their inner cone; now they light their whole 84 degrees, and
+the shadow rays toward them follow (the screen-space contact rays are not it: off, the same).
+Narrower lamp cones or a shorter `range` in the glb would win it back. The caustics cost less
+(0.6-1.2 ms against 1.3-2.1).
 
 ## Build and run
 

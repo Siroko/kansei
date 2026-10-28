@@ -14,7 +14,7 @@ use kansei_core::simulations::fluid::{
 
 fn renderer() -> Option<Renderer> {
     let instance = wgpu::Instance::default();
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))?;
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
     let mut renderer = Renderer::new(RendererConfig::default());
     pollster::block_on(renderer.initialize_headless(&adapter));
     Some(renderer)
@@ -27,8 +27,8 @@ fn read(sim: &FluidSimulation, buffer: &wgpu::Buffer) -> Vec<[f32; 4]> {
     encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, buffer.size());
     queue.submit(Some(encoder.finish()));
     staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-    device.poll(wgpu::Maintain::Wait);
-    let data = bytemuck::cast_slice(&staging.slice(..).get_mapped_range()).to_vec();
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    let data = bytemuck::cast_slice(&staging.slice(..).get_mapped_range().unwrap()).to_vec();
     data
 }
 

@@ -136,7 +136,7 @@ impl FluidHeightfield {
             entries: &[entry(0, uniform), entry(3, texture(wgpu::TextureViewDimension::D2)), entry(4, wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None })],
         });
         let pipeline = |entry: &str, bgl: &wgpu::BindGroupLayout| {
-            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some(entry), bind_group_layouts: &[bgl], push_constant_ranges: &[] });
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some(entry), bind_group_layouts: &[Some(bgl)], immediate_size: 0 });
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some(entry), layout: Some(&layout), module: &module, entry_point: Some(entry), compilation_options: Default::default(), cache: None })
         };
         let heights_pipeline = pipeline("heights", &heights_bgl);

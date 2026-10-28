@@ -67,13 +67,13 @@ impl FluidParticleRenderer {
             primitive: Default::default(),
             depth_stencil: depth_format.map(|format| wgpu::DepthStencilState {
                 format,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::LessEqual,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
             multisample: wgpu::MultisampleState { count: sample_count.max(1), ..Default::default() },
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
