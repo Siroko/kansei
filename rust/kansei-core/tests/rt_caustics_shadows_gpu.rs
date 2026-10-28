@@ -7,10 +7,12 @@
 //!   marble sees it: the change never takes away more light than RtShadowsEffect put there (the
 //!   light before the composite's clamp stays above zero, but for photon noise);
 //! - a jar beside the marble, its shadow across the marble's: where the jar keeps the light off the
-//!   floor, the marble's shadow and caustics add and take nothing (they merge into the jar's
-//!   shadow, not stack on it);
+//!   floor, the marble's shadow takes nothing (it merges into the jar's shadow, not stack on it),
+//!   and its caustics add only the light the marble sends there (its reflection);
 //! - a marble round an opaque core, rolling: RtShadowsEffect's history leaves no trail of the
-//!   core's shadow behind it, and a still scene's shadows stay as steady as they were.
+//!   core's shadow behind it, and a still scene's shadows stay as steady as they were;
+//! - a marble round an opaque core, resting: the light its shell focuses into the core's shadow
+//!   (where RtShadowsEffect finds the lamp hidden) is all there, as without the visibility.
 //!
 //! Through the grid's cells and, where the adapter has ray queries, through hardware ray queries.
 //! Skipped (passes) when no adapter is available. `KANSEI_CAUSTICS_PPM=<dir>` writes the light
@@ -126,8 +128,9 @@ struct Shot {
 
 /// `rig` with the marble at x = `path[k]` in frame k (moving: `dynamic`), RtShadowsEffect's temporal
 /// blend floor `alpha`; `fresh`: the caustics' tile cleared for the last frame (one frame of
-/// photons, as a moving marble's tile holds).
-fn shoot(backend: RtBackend, rig: &Rig, path: &[f32], alpha: f32, fresh: bool) -> Option<Shot> {
+/// photons, as a moving marble's tile holds); `weighted`: the caustics read RtShadowsEffect's
+/// visibility.
+fn shoot(backend: RtBackend, rig: &Rig, path: &[f32], alpha: f32, fresh: bool, weighted: bool) -> Option<Shot> {
     let mut renderer = renderer()?;
     renderer.enable_rt_grid(SceneRtGridOptions { grid: RtGridOptions { dims: [64, 32, 64], cell: 0.4 / 64.0, fixed_origin: Some(GVec3::new(-0.2, -0.05, -0.2)), backend, ..Default::default() }, ..Default::default() });
     let mut scene = Scene::new();
@@ -174,7 +177,7 @@ fn shoot(backend: RtBackend, rig: &Rig, path: &[f32], alpha: f32, fresh: bool) -
     let mut caustics = RtCausticsEffect::new(renderer.device(), handle, RtCausticsOptions { texel: 0.0005, reach: rig.height, ..Default::default() });
     caustics.set_glass(1.5, [1.0; 3]);
     caustics.update_lights(scene.lights());
-    caustics.set_visibility(Some(shadows.visibility()));
+    caustics.set_visibility(weighted.then(|| shadows.visibility()));
     let mut last = Vec::new();
     for (k, &x) in path.iter().enumerate() {
         let moved = k > 0 && path[k - 1] != x;
@@ -252,7 +255,7 @@ fn penumbra(backend: RtBackend) {
     let mut worst = (0.0f32, 0usize);
     for k in 0..=8 {
         let edge = -reach + 2.0 * reach * k as f32 / 8.0;
-        let Some(shot) = shoot(backend, &slab_rig(edge), &[0.0; 32], 0.12, false) else { return eprintln!("no GPU adapter: skipping") };
+        let Some(shot) = shoot(backend, &slab_rig(edge), &[0.0; 32], 0.12, false, true) else { return eprintln!("no GPU adapter: skipping") };
         let (missing, negative) = below_zero(&shot, 1.0);
         let least = shot.pre.iter().copied().fold(f32::MAX, f32::min);
         eprintln!("slab edge {:+5.1} mm: least {least:+6.2}, {negative} pixels below -1, missing {missing:.5} of the lit light", edge * 1e3);
@@ -274,8 +277,9 @@ fn penumbra_light_stays_above_zero_through_hardware_ray_queries() {
 }
 
 /// The lamp low to the left, a jar (a box) beside the marble whose shadow falls across the
-/// marble's: the share of the marble's change landing where the jar keeps the light off the floor
-/// (RtShadowsEffect's light there under 2% of the floor's brightest), and the light below zero.
+/// marble's: the share of the marble's change taking and adding light where the jar keeps the
+/// light off the floor (RtShadowsEffect's light there under 2% of the floor's brightest), and the
+/// light below zero.
 fn beside_a_jar(backend: RtBackend) {
     let rig = Rig {
         height: RADIUS,
@@ -286,16 +290,26 @@ fn beside_a_jar(backend: RtBackend) {
         eye: GVec3::new(0.03, 0.12, 0.09),
         target: GVec3::new(0.01, 0.0, 0.0),
     };
-    let Some(shot) = shoot(backend, &rig, &[0.0; 32], 0.12, false) else { return eprintln!("no GPU adapter: skipping") };
+    let Some(shot) = shoot(backend, &rig, &[0.0; 32], 0.12, false, true) else { return eprintln!("no GPU adapter: skipping") };
     let top = shot.lit.iter().copied().fold(0.0, f32::max);
     let dark: Vec<bool> = shot.lit.iter().map(|v| *v < 0.02 * top).collect();
     let all: f32 = shot.change.iter().map(|c| c.abs()).sum();
-    let spilled: f32 = shot.change.iter().zip(&dark).filter(|(_, d)| **d).map(|(c, _)| c.abs()).sum();
+    let in_shadow = |f: fn(f32) -> f32| shot.change.iter().zip(&dark).filter(|(_, d)| **d).map(|(c, _)| f(*c)).sum::<f32>();
+    let (taken, added) = (in_shadow(|c| (-c).max(0.0)), in_shadow(|c| c.max(0.0)));
     let (missing, negative) = below_zero(&shot, 1.0);
-    eprintln!("beside a jar: {:.4} of the marble's change in the jar's shadow ({} dark pixels); missing {missing:.5} below zero, {negative} pixels; the shadows' frame against the next {:.5}", spilled / all.max(1e-6), dark.iter().filter(|d| **d).count(), shot.flicker);
+    eprintln!(
+        "beside a jar: of the marble's change, {:.4} taken and {:.4} added in the jar's shadow ({} dark pixels); missing {missing:.5} below zero, {negative} pixels; the shadows' frame against the next {:.5}",
+        taken / all.max(1e-6),
+        added / all.max(1e-6),
+        dark.iter().filter(|d| **d).count(),
+        shot.flicker
+    );
     picture("jar", &shot.pre, top);
     assert!(all > 0.0, "the marble changes the light");
-    assert!(spilled < 0.005 * all, "the marble's shadow and caustics stack on the jar's shadow ({:.4} of its change there)", spilled / all);
+    assert!(taken < 0.005 * all, "the marble's shadow stacks on the jar's shadow ({:.4} of its change there)", taken / all);
+    // the light added there is the marble's own, reflected off its side into the jar's shadow
+    // beside it (0.0095 of its change; 0.0004 with the first surface's reflections left out)
+    assert!(added < 0.02 * all, "the marble's caustics spill into the jar's shadow ({:.4} of its change there)", added / all);
     assert!(missing < 2e-4 && negative < 40, "and take away light that isn't there ({missing:.5}, {negative} pixels)");
     // RtShadowsEffect's history held near its rays: the jar's wide penumbra as steady as with the
     // old history (0.0045 of the light from frame to frame, pixel by pixel)
@@ -336,16 +350,16 @@ fn core_rig() -> Rig {
 /// pixel).
 fn rolling(backend: RtBackend) {
     let rig = core_rig();
-    let Some(steady) = shoot(backend, &rig, &[0.0; 44], 0.12, false) else { return eprintln!("no GPU adapter: skipping") };
+    let Some(steady) = shoot(backend, &rig, &[0.0; 44], 0.12, false, true) else { return eprintln!("no GPU adapter: skipping") };
     let rest = |frames: usize| {
         let mut path = vec![-0.048; 32];
         path.extend(std::iter::repeat_n(0.0, frames));
-        shoot(backend, &rig, &path, 0.12, true)
+        shoot(backend, &rig, &path, 0.12, true, true)
     };
     let (still, other) = (rest(12).unwrap(), rest(13).unwrap());
     let mut path = vec![-0.048; 32];
     path.extend((1..=12).map(|k| -0.048 + 0.004 * k as f32));
-    let moving = shoot(backend, &rig, &path, 0.12, false).unwrap();
+    let moving = shoot(backend, &rig, &path, 0.12, false, true).unwrap();
     let base: f32 = still.lit.iter().sum();
     let blur = |img: &[f32]| -> Vec<f32> {
         let at = |x: i32, y: i32| img[(y.clamp(0, H as i32 - 1) as u32 * W + x.clamp(0, W as i32 - 1) as u32) as usize];
@@ -385,4 +399,45 @@ fn a_rolling_marble_leaves_no_trail_through_the_grid() {
 #[test]
 fn a_rolling_marble_leaves_no_trail_through_hardware_ray_queries() {
     rolling(RtBackend::Hardware);
+}
+
+/// The marble round its core at rest, with and without RtShadowsEffect's visibility: the light the
+/// shell focuses lands in the core's shadow, where the straight ray to the lamp is blocked, so the
+/// visibility there is about zero. Weighed by it (the light added and taken alike) the focus would
+/// all but go (#262: the light added in the core's shadow 0.014 of the unweighted); only the light taken
+/// away is weighed, so it stays: the light added there, the brightest pixel, and the light below
+/// zero as without the visibility.
+fn focus(backend: RtBackend) {
+    let rig = core_rig();
+    let Some(weighted) = shoot(backend, &rig, &[0.0; 32], 0.12, false, true) else { return eprintln!("no GPU adapter: skipping") };
+    let unweighted = shoot(backend, &rig, &[0.0; 32], 0.12, false, false).unwrap();
+    // the core's shadow on the floor: RtShadowsEffect's light under a tenth of the floor's
+    let top = unweighted.lit.iter().copied().fold(0.0, f32::max);
+    let shade: Vec<bool> = unweighted.lit.iter().map(|v| *v < 0.1 * top).collect();
+    let gain = |s: &Shot| s.change.iter().zip(&shade).filter(|(_, d)| **d).map(|(c, _)| c.max(0.0)).sum::<f32>();
+    let brightest = |s: &Shot| s.pre.iter().copied().fold(0.0, f32::max);
+    let (g, u) = (gain(&weighted), gain(&unweighted));
+    let (b, bu) = (brightest(&weighted), brightest(&unweighted));
+    let (missing, negative) = below_zero(&weighted, 1.0);
+    eprintln!(
+        "the focus in the core's shadow ({} pixels): the light added {g:.0} weighted, {u:.0} unweighted ({:.3}); the brightest pixel {b:.1} and {bu:.1} (the lit floor's {top:.1}); missing {missing:.5} below zero, {negative} pixels",
+        shade.iter().filter(|d| **d).count(),
+        g / u.max(1e-6)
+    );
+    picture("focus-weighted", &weighted.pre, bu);
+    picture("focus-unweighted", &unweighted.pre, bu);
+    assert!(u > 0.0 && bu > 1.5 * top, "the shell focuses light into the core's shadow ({u:.0}, the brightest {bu:.1} over {top:.1})");
+    assert!(g > 0.85 * u, "the visibility takes the focus away ({g:.0} of {u:.0})");
+    assert!(b > 0.85 * bu, "and its brightest spot ({b:.1} of {bu:.1})");
+    assert!(missing < 2e-4 && negative < 40, "and takes away light that isn't there ({missing:.5}, {negative} pixels)");
+}
+
+#[test]
+fn the_focus_round_an_opaque_core_stays_through_the_grid() {
+    focus(RtBackend::Software);
+}
+
+#[test]
+fn the_focus_round_an_opaque_core_stays_through_hardware_ray_queries() {
+    focus(RtBackend::Hardware);
 }

@@ -180,7 +180,9 @@ fn run(backend: RtBackend, sun: bool, ior: f32, core: Option<[f32; 3]>, frames: 
     let (min, texel, dims, history) = caustics.tile(0).expect("the marble's tile is on screen");
     let (sent, photons, tiles) = caustics.photons_sent();
     eprintln!("tile at {min:?}, {dims:?} texels of {:.2} mm, {history} frames; last frame {sent} lights x casters, {photons} photons, {tiles} tiles", texel * 1e3);
-    let texels = read_layer(&renderer, caustics.map_texture(), 0, dims);
+    // the change: the light added and the light taken away
+    let [added, taken] = caustics.map_layers(0, 0).map(|layer| read_layer(&renderer, caustics.map_texture(), layer, dims));
+    let texels = added.iter().zip(&taken).map(|(a, t)| [a[0] + t[0], a[1] + t[1], a[2] + t[2], a[3]]).collect();
     let centres = (0..dims[0] * dims[1]).map(|i| [min[0] + ((i % dims[0]) as f32 + 0.5) * texel, min[1] + ((i / dims[0]) as f32 + 0.5) * texel]).collect();
     Some(Tile { texel, texels, history, centres })
 }

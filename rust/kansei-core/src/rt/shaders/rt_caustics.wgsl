@@ -13,12 +13,14 @@
 // lands), takes it away there. The tile thus holds what the glass changes of the direct light:
 // the light it focuses, and the shadow it leaves. Only surfaces that face up keep it, outside
 // every caster's box, at the height they landed at. Each photon splats a tent about as wide as
-// the photons lie apart there, into its light's layer of the tile, fixed-point atomics: rgb
-// (lux * scale), the weight and the weighted height. With `unoccluded`, the composite weighs each
-// light's layer by RtShadowsEffect's visibility at the surface, so the photons pass whatever
-// stands between the light and the caster (that visibility has it). Prefixed with the grid's
-// library (its bindings in group 1), RT_OPAQUE_WGSL, rt_caustics_lookup.wgsl and the water's
-// ripples (simulations::fluid::WATER_RIPPLES_WGSL).
+// the photons lie apart there, into its light's layers of the tile (the light added, then the
+// light taken away), fixed-point atomics: rgb (lux * scale), the weight and the weighted height.
+// With `unoccluded`, the composite weighs the light taken away by RtShadowsEffect's visibility at
+// the surface, so the photons it counts pass whatever stands between the light and the caster
+// (that visibility has it); the light added stays the photons' own, traced from the emitter
+// through the glass to where it lands, whatever stops it on the way stopping it. Prefixed with the
+// grid's library (its bindings in group 1), RT_OPAQUE_WGSL, rt_caustics_lookup.wgsl and the
+// water's ripples (simulations::fluid::WATER_RIPPLES_WGSL).
 
 struct CausticsParams {
     taskCount    : u32,
@@ -35,7 +37,7 @@ struct CausticsParams {
     glassTint    : vec3f,
     // metres the tints are the light left after
     tintDistance : f32,
-    // 1: the photons start at their caster's box (see above)
+    // 1: the light taken away is counted from the caster's box on (see above)
     unoccluded   : u32,
     // the rippled casters' ripples (TASK flag 2): their time (seconds) and amount
     time         : f32,
@@ -47,8 +49,8 @@ struct CausticsParams {
 // + u e1 + v e2; color its illuminance; emitterX, emitterY the tangents of its angular radius
 // along e1, e2), 1 or 2 a spot light (from origin, its emitter's centre, along axis + u e1 + v e2;
 // color its intensity, cd; emitterX, emitterY a disk's radius along two tangents (1) or a
-// rectangle's half sides (2)). `tile` the caster's, `layer` the light's at it, `seed` its jitter,
-// `bias` how far rays leave a surface (m).
+// rectangle's half sides (2)). `tile` the caster's, `layer` the light's added light's at it (the
+// light it takes away the next), `seed` its jitter, `bias` how far rays leave a surface (m).
 struct CausticTask {
     origin   : vec3f,
     kind     : u32,
@@ -242,7 +244,8 @@ fn photons(@builtin(global_invocation_id) gid : vec3u, @builtin(num_workgroups) 
         o = c + offset;
         d = normalize(aim - o);
     }
-    // unoccluded: from just before the caster's box, past what stands between it and the light
+    // unoccluded: the light taken away from just before the caster's box, past what stands between
+    // it and the light
     var tStart = 0.0;
     if (cp.unoccluded != 0u) {
         let grow = task.bias * 4.0;
@@ -260,12 +263,18 @@ fn photons(@builtin(global_invocation_id) gid : vec3u, @builtin(num_workgroups) 
     if (!first.found || !isGlass(first.triangle)) { return; }
     let h0 = o + d * first.t;
     if (!inBox(h0, tile.boxMin, tile.boxMax, task.bias * 4.0)) { return; }
+    // whether the photon's light reaches the glass: what it brings through the glass is its own,
+    // stopped by whatever stands between the emitter and the glass (the light it takes away is
+    // weighed by the visibility with `unoccluded`, which has that)
+    var reaches = true;
+    if (tStart > 0.0) {
+        reaches = !kansei_rt_trace(o, d, 0.0, tStart, KANSEI_RT_ANY_HIT | KANSEI_RT_SOLID).found;
+    }
     var flux : vec3f;
     var spread : f32;
     if (task.kind == 0u) {
-        // the sun reaches the plane only where nothing stands between (a room's walls), unless
-        // the visibility has that
-        if (cp.unoccluded == 0u && kansei_rt_trace(o, -d, 0.0, 1e5, KANSEI_RT_ANY_HIT | KANSEI_RT_SOLID).found) { return; }
+        // the sun reaches the plane only where nothing stands between (a room's walls)
+        if (reaches && kansei_rt_trace(o, -d, 0.0, 1e5, KANSEI_RT_ANY_HIT | KANSEI_RT_SOLID).found) { reaches = false; }
         flux = task.color * (task.du * task.dv);
         spread = 0.0;
     } else {
@@ -277,7 +286,7 @@ fn photons(@builtin(global_invocation_id) gid : vec3u, @builtin(num_workgroups) 
         flux = task.color * (window * window * cone * cone * omega);
         spread = sqrt(omega);
     }
-    if (max(flux.r, max(flux.g, flux.b)) <= 0.0) { return; }
+    if (max(flux.r, max(flux.g, flux.b)) <= 0.0 || (!reaches && cp.unoccluded == 0u)) { return; }
     // the tent: twice as wide as the photons lie apart where they land (m; the sun's are
     // parallel, a spot light's spread with the distance), so a few overlap every texel
     let apart = select(2.0 * sqrt(task.du * task.dv), 0.0, task.kind != 0u);
@@ -287,9 +296,10 @@ fn photons(@builtin(global_invocation_id) gid : vec3u, @builtin(num_workgroups) 
     if (straight.found && straight.normal.y > 0.2 && (task.flags & 1u) == 0u) {
         let p = h0 + d * straight.t;
         if (!inCaster(p)) {
-            deposit(task.tile, task.layer, p, -flux * straight.normal.y, apart + spread * (first.t + straight.t));
+            deposit(task.tile, task.layer + 1u, p, -flux * straight.normal.y, apart + spread * (first.t + straight.t));
         }
     }
+    if (!reaches) { return; }
     // through the glass: `depth` the glasses the photon is in (a core inside a shell: two), each
     // entered where the ray meets a triangle's front (its winding's normal) and left at a back
     var hit = first;
