@@ -34,6 +34,9 @@
 //!   2 x 2) from the GBuffer's surfaces, the hits lit by their exact direct light and one voxel
 //!   cone, the voxels past the grid's box, denoised by SVGF; an opt-in GI path beside voxel cones
 //!   (`gi::VoxelGIEffect`) and screen-space GI, with a reference path tracer through the grid.
+//! - [`RtShadowsEffect`] lights the surfaces that ask for it (`RT_SHADOWS_GBUFFER_WGSL`) by the
+//!   sun and the spot lights with ray-traced shadows: any-hit shadow rays through the grid toward
+//!   a point of each emitter (soft penumbrae, sharp contacts), screen-space contact rays, denoised.
 
 mod diffuse;
 mod effect;
@@ -42,6 +45,7 @@ mod mesh;
 mod query;
 mod scene;
 mod scene_grid;
+mod shadows;
 
 pub use diffuse::{RtDiffuseGiEffect, RtDiffuseGiOptions, RtGiDenoise, RtGiHitLighting, RtGiKernel, RtGiMode, RtGiResolution, RtGiShadows, RtGiStats, RtGiView};
 pub use effect::{RtGlass, RtReflectionStats, RtReflectionsEffect, RtReflectionsOptions, RtReflectionsView, RtTraceResolution};
@@ -49,6 +53,7 @@ pub use grid::{RtBackend, RtGrid, RtGridBindings, RtGridHandle, RtGridOptions, R
 pub use mesh::{split_large_triangles, transform_box, RtMesh};
 pub use scene::{RtInstance, RtScene};
 pub use scene_grid::{SceneRtGrid, SceneRtGridOptions, SceneRtGridStats};
+pub use shadows::{RtShadowsEffect, RtShadowsView, RT_SHADOWS_GBUFFER_WGSL, RT_SHADOW_MAX_LIGHTS};
 
 /// Ray tracing through an `RtGrid` from a compute pass: `KanseiRtGrid`, `KanseiRtHit` and
 /// `kansei_rt_trace(origin, dir, t_min, t_max, flags)`, the closest hit of a ray among the grid's
@@ -222,6 +227,8 @@ mod tests {
                 let reflections = metal_buffer_slots(&super::effect::trace_layout_entries(clipmap, backend));
                 assert!(gi <= 29 && reflections <= 29, "{backend:?}, clipmap {clipmap}: GI trace {gi}, reflections {reflections} of 29");
             }
+            let shadows = metal_buffer_slots(&super::shadows::trace_layout_entries(backend));
+            assert!(shadows <= 29, "{backend:?}: shadows trace {shadows} of 29");
         }
     }
 
@@ -284,6 +291,29 @@ mod tests {
         assert_eq!(struct_span(&svgf, "AtrousParams"), std::mem::size_of::<super::diffuse::AtrousParamsGpu>());
         let composite = validate("gi composite", &super::diffuse::composite_wgsl());
         assert_eq!(struct_span(&composite, "RtGiParams"), std::mem::size_of::<super::diffuse::RtGiParamsGpu>());
+    }
+
+    #[test]
+    fn shaders_validate_rt_shadows() {
+        for backend in BACKENDS {
+            let trace = validate_for(backend, "shadows trace", &super::shadows::trace_wgsl(backend));
+            assert_eq!(struct_span(&trace, "RtShadowParams"), super::shadows::params_size());
+            assert_eq!(struct_span(&trace, "RtShadowLight"), super::shadows::light_size());
+            assert_eq!(struct_span(&trace, "KanseiRtGrid"), std::mem::size_of::<RtGridGpu>());
+        }
+        for (name, code) in [("shadows filter", super::shadows::filter_wgsl()), ("shadows composite", super::shadows::composite_wgsl())] {
+            let module = validate(name, &code);
+            assert_eq!(struct_span(&module, "RtShadowParams"), super::shadows::params_size());
+            assert_eq!(struct_span(&module, "RtShadowLight"), super::shadows::light_size());
+        }
+        // the material hook
+        validate(
+            "gbuffer out rt lit",
+            &format!(
+                "{}\n{RT_SHADOWS_GBUFFER_WGSL}\n@fragment fn main() -> KanseiGBufferOut {{ return kansei_gbuffer_out_rt_lit(vec3f(0.0), vec3f(0.0), vec3f(0.0, 1.0, 0.0), vec3f(0.5), 0.6, 0.04, false); }}",
+                crate::materials::GBUFFER_OUT_WGSL
+            ),
+        );
     }
 
     #[test]
