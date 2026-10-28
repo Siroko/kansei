@@ -639,8 +639,11 @@ impl ApplicationHandler for App {
                     }
                 }
 
-                let surface = renderer.surface().unwrap();
-                let output = kansei_core::renderers::surface_texture(surface).expect("Surface texture");
+                // no surface texture this frame (occluded, outdated): skip it
+                let Some(output) = renderer.acquire_surface_texture() else {
+                    if let Some(ref w) = self.window { w.request_redraw(); }
+                    return;
+                };
                 let canvas_view = output.texture.create_view(&Default::default());
                 let mut encoder = device.create_command_encoder(&Default::default());
 
@@ -726,7 +729,7 @@ impl ApplicationHandler for App {
 
                 // egui
                 let raw_input = self.egui_state.as_mut().unwrap().take_egui_input(self.window.as_ref().unwrap());
-                let full_output = self.egui_ctx.run_ui(raw_input, |root| {
+                let mut full_output = self.egui_ctx.run_ui(raw_input, |root| {
                     egui::Panel::right("controls").min_size(220.0).show(root, |ui| {
                         ui.heading("Fluid Engine");
                         ui.label(format!("{:.1} FPS  ({:.2} ms)", self.current_fps, self.current_frame_ms));
@@ -789,6 +792,8 @@ impl ApplicationHandler for App {
                 queue.submit([enc.finish()]);
 
                 for id in &full_output.textures_delta.free { er.free_texture(id); }
+                // applied above (epaint asserts that a dropped delta was)
+                full_output.textures_delta.clear();
                 self.egui_renderer = Some(er);
                 self.egui_state.as_mut().unwrap().handle_platform_output(self.window.as_ref().unwrap(), full_output.platform_output);
                 queue.present(output);

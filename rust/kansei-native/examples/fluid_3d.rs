@@ -255,8 +255,11 @@ impl ApplicationHandler for App {
                     sim.update(dt, mouse_strength, mouse_pos, mouse_dir);
                 }
 
-                let surface = renderer.surface().unwrap();
-                let output = kansei_core::renderers::surface_texture(surface).expect("Surface texture");
+                // no surface texture this frame (occluded, outdated): skip it
+                let Some(output) = renderer.acquire_surface_texture() else {
+                    if let Some(ref w) = self.window { w.request_redraw(); }
+                    return;
+                };
                 let canvas_view = output.texture.create_view(&Default::default());
                 let mut encoder = renderer.create_command_encoder(&Default::default());
 
