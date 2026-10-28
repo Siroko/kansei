@@ -51,14 +51,21 @@
 //!   `shadows=rt` (`RtShadowsEffect`: rays through the grid of triangles toward a point of the
 //!   lamp's disk, denoised; the materials leave the lamp to it through `RT_SHADOWS_GBUFFER_WGSL`),
 //!   with `rts_res=half|full`, `rts_contact=<m>` (the screen-space contact rays, 0.25; 0 none) and
-//!   `rts_view=lit|visibility|direct|mask`;
+//!   `rts_view=lit|visibility|direct|mask`; its shadow rays pass through the glass ball, whose
+//!   caustics (`RtCausticsEffect`: photons from the lamp through the ball into a tile round it)
+//!   put back what the glass changes of that light, the light it focuses and the shadow it
+//!   leaves: `caustics=0` without them, `caustics_view=caustics` (the light they add and take,
+//!   over grey);
+//! - `glass_shadow=1`: the glass ball casts into the shadow maps (with `shadows=maps`, the solid
+//!   disc a shadow map gives glass); `roll=1`: the glass ball rolls back and forth across the rug;
+//!   `glass_radius=` (m): the glass ball's size (0.015 and `cam=marble`: a 3 cm marble on the rug);
 //! - the balls: `mirror=0`, `glass=0` (without either, and without `reflect`, `gi=rt` or `rt=1`, no
 //!   grid of triangles is built), `mirror_rough=0..1`, `glass_ior=` (1.5), `glass_rough=0..1`
 //!   (frosted), `glass_tint=r,g,b` (the light left after a metre inside), `glass_samples=` (paths
 //!   a frosted pixel a frame, 4), `rt_screen=0` (their rays' hits lit by the lamp and the voxels
 //!   even where the camera sees them), `rt_direct=0` (hits the camera doesn't see lit by the
 //!   voxels alone);
-//! - `cam=front|corner|low|floor|glass|chrome`;
+//! - `cam=front|corner|low|floor|glass|chrome|marble`;
 //! - `dragon=1|full`: the Stanford dragon (CC-BY-NC-4.0, see `www/assets/license.txt`): `1` the
 //!   decimated `.glb` (19k triangles), `full` the whole scan (871k triangles, 24 MB);
 //! - `animate=1`: the dragon (or, without it, the tall block) turns and slides, re-voxelized each
@@ -97,7 +104,7 @@ use kansei_core::postprocessing::{
 };
 use kansei_core::renderers::{Renderer, RendererConfig};
 use kansei_core::clusters::{ClusterLod, ClusterMesh, ClusterOptions};
-use kansei_core::rt::{
+use kansei_core::rt::{RtCausticsEffect, RtCausticsOptions, RtCausticsView, 
     RtDiffuseGiEffect, RtDiffuseGiOptions, RtGiDenoise, RtGiHitLighting, RtGiKernel, RtGiMode, RtGiResolution, RtGiShadows, RtGiView, RtGlass, RtGridOptions,
     RtReflectionsEffect, RtReflectionsOptions, RtReflectionsView, RtShadowsEffect, RtShadowsView, RtSurface, RtTraceResolution, SceneRtGridOptions,
     RT_SHADOWS_GBUFFER_WGSL,
@@ -178,6 +185,13 @@ const MIRROR_GI_ALBEDO: [f32; 3] = [0.02, 0.02, 0.02];
 /// The light the glass leaves after a metre inside (a faint green, as window glass).
 const GLASS_TINT: [f32; 3] = [0.82, 0.93, 0.88];
 const BALL_RADIUS: f32 = 0.4;
+/// Where the glass ball rests on the rug (x, z), its bottom a little over the rug's top.
+const GLASS_REST: [f32; 2] = [-0.1, -0.45];
+
+/// The glass ball's centre for its radius `r` (`glass_radius=`), `x` along from its rest.
+fn glass_centre(r: f32, x: f32) -> Vec3 {
+    Vec3::new(GLASS_REST[0] + x, 0.02 + r * 1.0125, GLASS_REST[1])
+}
 /// The balls' tessellation (the grid traces their triangles, shaded by their vertex normals).
 const BALL_SEGMENTS: u32 = 64;
 const BALL_RINGS: u32 = 48;
@@ -659,6 +673,9 @@ struct RtShadows {
     full: bool,
     /// metres the screen-space contact rays walk (0: none)
     contact: f32,
+    /// the glass ball's caustics (`RtCausticsEffect`), and whether they show alone
+    caustics: bool,
+    caustics_view: bool,
 }
 
 impl RtShadows {
@@ -668,6 +685,8 @@ impl RtShadows {
             full: param("rts_res").as_deref() == Some("full"),
             // (the effect's default)
             contact: param_or("rts_contact", 0.25f32).clamp(0.0, 2.0),
+            caustics: flag("caustics", true),
+            caustics_view: param("caustics_view").as_deref() == Some("caustics"),
         }
     }
 
@@ -676,13 +695,22 @@ impl RtShadows {
             "view" => rt_shadows_view(v).map(|x| self.view = x),
             "res" => Some(self.full = v == "full"),
             "contact" => v.parse::<f32>().ok().map(|x| self.contact = x.clamp(0.0, 2.0)),
+            "caustics" => Some(self.caustics = matches!(v, "1" | "true" | "on")),
+            "caustics_view" => Some(self.caustics_view = v == "caustics"),
             _ => None,
         }
         .is_some()
     }
 
     fn json(&self) -> String {
-        format!("{{\"view\":\"{}\",\"res\":\"{}\",\"contact\":{}}}", rt_shadows_view_name(self.view), if self.full { "full" } else { "half" }, self.contact)
+        format!(
+            "{{\"view\":\"{}\",\"res\":\"{}\",\"contact\":{},\"caustics\":{},\"caustics_view\":\"{}\"}}",
+            rt_shadows_view_name(self.view),
+            if self.full { "full" } else { "half" },
+            self.contact,
+            self.caustics,
+            if self.caustics_view { "caustics" } else { "lit" }
+        )
     }
 }
 
@@ -726,6 +754,11 @@ struct Config {
     glass_rough: f32,
     glass_tint: [f32; 3],
     glass_samples: u32,
+    /// The glass ball casts into the shadow maps (`glass_shadow=1`), and rolls (`roll=1`); its
+    /// radius (`glass_radius=`, m, set at load).
+    glass_shadow: bool,
+    glass_radius: f32,
+    roll: bool,
     /// The balls' (and the floor's) rays' hits lit by the lit image where the camera sees them
     /// (`rt_screen=`), else by the lamp and the voxels.
     screen_hits: bool,
@@ -825,7 +858,7 @@ fn probe_options(phone: bool) -> SdfProbeOptions {
 }
 
 /// The camera presets: (name, target, distance, azimuth, elevation).
-const CAMERAS: [(&str, [f32; 3], f32, f32, f32); 6] = [
+const CAMERAS: [(&str, [f32; 3], f32, f32, f32); 7] = [
     // the box's opening, framed as the Cornell box photographs are
     ("front", [0.0, 2.0, -2.0], 8.3, 0.0, 0.0),
     // inside, from the upper front-left corner toward the short block and the green wall
@@ -838,6 +871,8 @@ const CAMERAS: [(&str, [f32; 3], f32, f32, f32); 6] = [
     ("glass", [-0.1, 0.45, -0.45], 1.8, 0.92, 0.12),
     // close on the chrome ball from in front of the opening: it mirrors what is behind the camera
     ("chrome", [0.8, 1.6, -1.5], 2.2, -0.35, 0.1),
+    // close on the glass ball shrunk to a marble (glass_radius=0.015) and its caustics on the rug
+    ("marble", [-0.1, 0.03, -0.45], 0.12, 0.92, 0.5),
 ];
 
 struct State {
@@ -879,6 +914,8 @@ struct State {
     hdri_load_ms: (f64, f64),
     /// `env_spin`: degrees a second the HDRI turns.
     env_spin: f32,
+    /// Seconds the glass ball has rolled (`roll=1`).
+    roll_time: f32,
 }
 
 /// The `stats=1` overlay's numbers, refreshed every second.
@@ -954,6 +991,9 @@ fn config_from_url(phone: bool) -> Config {
         glass_rough: param_or("glass_rough", 0.0f32).clamp(0.0, 1.0),
         glass_tint: param("glass_tint").and_then(|v| parse_rgb(&v)).unwrap_or(GLASS_TINT),
         glass_samples: param_or("glass_samples", 4u32).clamp(1, 16),
+        glass_shadow: flag("glass_shadow", false),
+        glass_radius: param_or("glass_radius", BALL_RADIUS).clamp(0.005, BALL_RADIUS),
+        roll: flag("roll", false),
         screen_hits: flag("rt_screen", true),
         env: param("env").as_deref().and_then(Env::from_name).unwrap_or(Env::None),
         env_ev: param_or("env_ev", 0.0f32),
@@ -1059,6 +1099,15 @@ fn build_effects(renderer: &Renderer, config: &Config, phone: bool, stats: bool,
             effect.show_probes = config.view == View::Probes;
             effects.push(Box::new(effect));
         }
+    }
+    // the glass ball's caustics on the light RtShadowsEffect lets through it (the casters and the
+    // lights each frame)
+    if let (Direct::Rt, true, true, Some(grid)) = (config.direct, config.rt_shadows.caustics, config.glass, renderer.rt_grid()) {
+        let mut caustics = RtCausticsEffect::new(renderer.device(), grid.handle(), RtCausticsOptions::default());
+        // (its triangles carry its tint, the light left after a metre)
+        caustics.set_glass(config.glass_ior, [1.0; 3]);
+        caustics.view = if config.rt_shadows.caustics_view { RtCausticsView::Caustics } else { RtCausticsView::Lit };
+        effects.push(Box::new(caustics));
     }
     // the polished floor's reflections, the chrome ball and the glass, through the room's grid
     if let (true, Some(scene_gi), Some(grid)) = (config.traces(), renderer.voxel_gi(), renderer.rt_grid()) {
@@ -1193,6 +1242,10 @@ impl State {
                 r.visible = on;
             }
         }
+        if let Some(r) = self.glass.and_then(|i| self.scene.get_renderable_mut(i)) {
+            r.cast_shadow = config.glass_shadow;
+            r.dynamic = config.roll;
+        }
         self.set_ball_materials(config);
         if config.textured != previous.textured {
             // the voxelizer can't see a material change
@@ -1249,6 +1302,9 @@ impl State {
     /// on as they are).
     fn set_ball_materials(&mut self, config: Config) {
         self.config = config;
+        if let Some(caustics) = self.volume.effect_mut::<RtCausticsEffect>() {
+            caustics.set_glass(config.glass_ior, [1.0; 3]);
+        }
         for (index, material) in [(self.mirror, config.mirror_material()), (self.glass, config.glass_material())] {
             if let Some(r) = index.and_then(|i| self.scene.get_renderable_mut(i)) {
                 r.material.set_standard_lit(&self.renderer, &material);
@@ -1285,8 +1341,24 @@ impl State {
         if let Some(hdri) = &mut self.hdri {
             hdri.prepare(self.renderer.device(), self.renderer.queue());
         }
+        if let (true, Some(r)) = (self.config.roll, self.glass.and_then(|i| self.scene.get_renderable_mut(i))) {
+            // back and forth across the rug, turning as it rolls
+            self.roll_time += dt;
+            let radius = self.config.glass_radius;
+            let x = 0.5 * (radius / BALL_RADIUS).max(0.2) * (self.roll_time * 0.5).sin();
+            r.object.position = glass_centre(radius, x);
+            r.object.rotation.z = -x / radius;
+        }
         if let Some(shadows) = self.volume.effect_mut::<RtShadowsEffect>() {
             shadows.update_lights(self.scene.lights());
+        }
+        let ball = self.glass.and_then(|i| self.scene.get_renderable(i)).filter(|r| r.visible).map(|r| {
+            let c = glam::Vec3::new(r.object.position.x, r.object.position.y, r.object.position.z);
+            (c - glam::Vec3::splat(self.config.glass_radius), c + glam::Vec3::splat(self.config.glass_radius))
+        });
+        if let Some(caustics) = self.volume.effect_mut::<RtCausticsEffect>() {
+            caustics.update_lights(self.scene.lights());
+            caustics.set_casters(ball.as_slice());
         }
         if let Some(gi) = self.volume.effect_mut::<RtDiffuseGiEffect>() {
             gi.update_lights(self.scene.lights());
@@ -1397,13 +1469,21 @@ impl State {
         format!("{{\"mode\":\"{}\",\"ev\":{},\"rotation\":{},\"blur\":{},\"spin\":{},\"hdri\":{hdri}}}", c.env.name(), c.env_ev, c.env_rotation, c.env_blur, self.env_spin)
     }
 
+    /// The glass ball's caustics: the photons and the tile last frame (null when they don't run).
+    fn caustics_info(&self) -> String {
+        let Some(c) = self.volume.effect::<RtCausticsEffect>() else { return "null".into() };
+        let (pairs, photons, fed) = c.photons_sent();
+        let tile = c.tile(0).map_or("null".into(), |(_, texel, dims, history)| format!("{{\"texel_mm\":{:.2},\"dims\":{dims:?},\"history\":{history}}}", texel * 1e3));
+        format!("{{\"lights\":{pairs},\"photons\":{photons},\"fed\":{fed},\"tile\":{tile}}}")
+    }
+
     fn info(&self) -> String {
         let gi = self.renderer.voxel_gi();
         let passes: Vec<String> = self.stats.as_ref().map_or(Vec::new(), |s| s.passes.iter().map(|(l, ms)| format!("[\"{l}\",{ms:.3}]")).collect());
         // (+ 0.0: an empty sum is -0)
         let sum = |prefix: &str| self.stats.as_ref().map_or(0.0, |s| s.passes.iter().filter(|p| p.0.starts_with(prefix)).map(|p| p.1).sum::<f64>()) + 0.0;
         format!(
-            "{{\"env\":{},\"env_prepare_ms\":{:.3},\"env_background_ms\":{:.3},\"grid\":{},\"rtgi\":{},\"rtgi_ms\":{:.3},\"reflect\":{},\"balls\":{},\"rt_ms\":{:.3},\"reflect_ms\":{:.3},\"glass_ms\":{:.3},\"gi\":\"{}\",\"view\":\"{}\",\"voxels\":\"{}\",\"voxel_tier\":{},\"dims\":{},\"mib\":{:.1},\"dragon\":\"{}\",\"animate\":{},\"rug\":{},\"textured\":{},\"sdf_ao\":{},\"sdf_shadows\":\"{}\",\"shadows\":\"{}\",\"rt_shadows\":{},\"rt_shadows_ms\":{:.3},\"slice\":{},\"sdf\":{},\"sdf_ms\":{:.3},\"probes\":{},\"probe_dims\":{},\"probes_ms\":{:.3},\"triangles\":{},\"stats\":{},\"frame_ms\":{:.2},\"gpu_ms\":{:.3},\"gpu_span_ms\":{:.3},\"voxelize_ms\":{:.3},\"inject_ms\":{:.3},\"mips_ms\":{:.3},\"screen_ms\":{:.3},\"ssgi_ms\":{:.3},\"passes\":[{}]}}",
+            "{{\"env\":{},\"env_prepare_ms\":{:.3},\"env_background_ms\":{:.3},\"grid\":{},\"rtgi\":{},\"rtgi_ms\":{:.3},\"reflect\":{},\"balls\":{},\"rt_ms\":{:.3},\"reflect_ms\":{:.3},\"glass_ms\":{:.3},\"gi\":\"{}\",\"view\":\"{}\",\"voxels\":\"{}\",\"voxel_tier\":{},\"dims\":{},\"mib\":{:.1},\"dragon\":\"{}\",\"animate\":{},\"rug\":{},\"textured\":{},\"sdf_ao\":{},\"sdf_shadows\":\"{}\",\"shadows\":\"{}\",\"rt_shadows\":{},\"rt_shadows_ms\":{:.3},\"caustics\":{},\"caustics_ms\":{:.3},\"slice\":{},\"sdf\":{},\"sdf_ms\":{:.3},\"probes\":{},\"probe_dims\":{},\"probes_ms\":{:.3},\"triangles\":{},\"stats\":{},\"frame_ms\":{:.2},\"gpu_ms\":{:.3},\"gpu_span_ms\":{:.3},\"voxelize_ms\":{:.3},\"inject_ms\":{:.3},\"mips_ms\":{:.3},\"screen_ms\":{:.3},\"ssgi_ms\":{:.3},\"passes\":[{}]}}",
             self.env_info(),
             sum("Environment/Cube") + sum("Environment/Prefilter") + sum("Environment/SH"),
             sum("Environment/Background"),
@@ -1430,6 +1510,8 @@ impl State {
             self.config.direct.name(),
             self.config.rt_shadows.json(),
             sum("RtShadows/"),
+            self.caustics_info(),
+            sum("RtCaustics/"),
             self.config.slice,
             gi.and_then(|g| g.sdf()).is_some(),
             sum("VoxelGI/Sdf"),
@@ -1564,7 +1646,9 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         let mut ball = Renderable::new(sphere(), Material::standard_lit("Glass", &config.glass_material()));
         ball.rt = Some(RtSurface::glass(config.glass_tint));
         ball.cast_shadow = false;
-        ball.object.set_position(-0.1, BALL_RADIUS + 0.025, -0.45);
+        ball.object.position = glass_centre(config.glass_radius, 0.0);
+        let s = config.glass_radius / BALL_RADIUS;
+        ball.object.scale = Vec3::new(s, s, s);
         ball.visible = config.glass;
         glass = Some(scene.add(SceneNode::Renderable(ball)));
     }
@@ -1637,6 +1721,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         hdri,
         hdri_load_ms,
         env_spin: param_or("env_spin", 0.0f32),
+        roll_time: 0.0,
     };
     state.apply(config);
     log::info!("Kansei — GI box (WASM) ready: {}", state.info());

@@ -28,6 +28,9 @@ triangles (below) toward a point of the lamp's 15 cm disk, a new one every frame
 filters them and lights the pixels (Lambert plus GGX toward the disk). Penumbrae widen with the
 distance to the blocker; short screen-space rays darken the contacts the grid's cells miss. The
 shadow map is still drawn for what reads it (voxel GI's light injection, `rtgi_shadows=maps`).
+The rays pass through the glass ball; `rt::RtCausticsEffect` puts back what it changes of the
+lamp's light (`caustics=1`, the default): photons from the lamp through the ball, into a tile of
+texels round it, the light it focuses less the light that passed straight through.
 
 A chrome ball stands on the short block and a glass ball on the rug, ray traced through a grid of
 the room's triangles (below) whatever the GI: the chrome (`StandardLitOptions::mirror`) mirrors the
@@ -67,7 +70,8 @@ grid below; with `reflect=1`,
 `Material::standard_lit` with `StandardLitOptions::mirror` and `StandardLitOptions::glass`
 (`set_standard_lit` for the panel's changes), `RtSurface::glass`, and `RtReflectionsEffect`'s
 `set_glass` (`RtGlass`), `set_spot_lights`, `screen_hits` and `hit_indirect`; with `shadows=rt`,
-`RtShadowsEffect` (`update_lights`, `RtShadowsView`) and `rt::RT_SHADOWS_GBUFFER_WGSL`; with `env=`,
+`RtShadowsEffect` (`update_lights`, `RtShadowsView`) and `rt::RT_SHADOWS_GBUFFER_WGSL`, and
+`RtCausticsEffect` (`set_casters` with the glass ball's box, `update_lights`, `set_glass`); with `env=`,
 `environment::GradientEnvironment` and `HdrEnvironment` (`HdrEnvironmentSettings`, `prepare`),
 `Renderer::set_environment`, `PostProcessingEffect::set_environment`,
 `EnvironmentBackgroundEffect` and `Material::gradient_sky`.
@@ -93,7 +97,12 @@ grid below; with `reflect=1`,
 | `rts_res=half\|full` | the ray-traced shadows' rays: one for each 2 x 2 pixels (default) or one a pixel |
 | `rts_contact=<m>` | how far the ray-traced shadows' screen-space contact rays walk (default 0.25; 0: none) |
 | `rts_view=lit\|visibility\|direct\|mask` | the ray-traced shadows' debug views: the lamp's visibility, its direct light alone, the pixels it lights |
-| `cam=front\|corner\|low\|floor\|glass\|chrome` | starting camera (default front; `floor` looks down onto the floor, `glass` close on the glass ball, `chrome` close on the chrome ball) |
+| `caustics=0` | with `shadows=rt`, no glass caustics (`RtCausticsEffect`): the glass ball then casts no shadow, its light passing straight through |
+| `caustics_view=caustics` | the light the caustics add (brighter) and take (darker) over grey |
+| `glass_shadow=1` | the glass ball casts into the shadow maps (with `shadows=maps`, the solid disc a shadow map gives glass) |
+| `roll=1` | the glass ball rolls back and forth across the rug (its caustics cleared and fed every frame) |
+| `glass_radius=<m>` | the glass ball's radius (default 0.4; 0.015 with `cam=marble`: a 3 cm marble) |
+| `cam=front\|corner\|low\|floor\|glass\|chrome\|marble` | starting camera (default front; `floor` looks down onto the floor, `glass` close on the glass ball, `chrome` close on the chrome ball, `marble` 12 cm from the glass ball's rest, for `glass_radius=0.015`) |
 | `env=none\|gradient\|hdri` | what lies past the box's opening: black (default), a studio gradient on a dome, or the studio HDRI (fetched, 1.6 MB) |
 | `env_ev=<stops>` | the environment's intensity over its default (0) |
 | `env_rotation=<degrees>` | the HDRI's turn about the vertical |
