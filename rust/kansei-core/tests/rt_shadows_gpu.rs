@@ -26,9 +26,13 @@ const ALBEDO: f32 = 0.8;
 const SUN: f32 = 2.0;
 const SUN_DIR: GVec3 = GVec3::new(0.4, -1.0, 1.2);
 
+/// A headless renderer on the fast adapter of `WGPU_BACKEND`'s backend (the discrete GPU beside an
+/// integrated one, with its ray queries where it has them), named on stderr.
 fn renderer() -> Option<Renderer> {
-    let instance = wgpu::Instance::default();
-    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { power_preference: wgpu::PowerPreference::HighPerformance, ..Default::default() })).ok()?;
+    let info = adapter.get_info();
+    eprintln!("{} ({:?})", info.name, info.backend);
     let mut renderer = Renderer::new(RendererConfig { width: W, height: H, sample_count: 1, ..Default::default() });
     pollster::block_on(renderer.initialize_headless(&adapter));
     Some(renderer)
