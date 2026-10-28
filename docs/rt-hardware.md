@@ -138,9 +138,9 @@ that added the backend):
   the 5090 (Vulkan; DX12 0.21 → 0.021 ms); the effect's filter and composite cost the same on
   either.
 - `RtCausticsEffect`'s photons (`--example rt_caustics`: a 3 cm glass marble rolling on a table
-  under two spot lights, about 47k photons a frame, 1 cm cells, 2026-10-28) trace in
-  2.22 → 0.66 ms on the M4 Pro and 0.56 → 0.071 ms on the 5090 (Vulkan; DX12 0.65 → 0.057 ms).
-  A still marble's tile sends none.
+  under two spot lights, about 53k photons a frame from points of their emitters, 1 cm cells,
+  2026-10-28) trace in 2.9 → 0.83 ms on the M4 Pro and 0.56 → 0.10 ms on the 5090 (Vulkan;
+  DX12 0.64 → 0.090 ms). A still marble's tile sends none.
 
 ## The path tracer
 

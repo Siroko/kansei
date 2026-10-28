@@ -51,7 +51,7 @@ mod scene;
 mod scene_grid;
 mod shadows;
 
-pub use caustics::{RtCausticReceivers, RtCausticsEffect, RtCausticsOptions, RtCausticsView, RT_CAUSTICS_LOOKUP_WGSL, RT_CAUSTICS_MAX_CASTERS};
+pub use caustics::{RtCausticReceivers, RtCausticsEffect, RtCausticsOptions, RtCausticsView, RT_CAUSTICS_LOOKUP_WGSL, RT_CAUSTICS_MAX_CASTERS, RT_CAUSTICS_MAX_LIGHTS};
 pub use diffuse::{RtDiffuseGiEffect, RtDiffuseGiOptions, RtGiDenoise, RtGiHitLighting, RtGiKernel, RtGiMode, RtGiResolution, RtGiShadows, RtGiStats, RtGiView};
 pub use effect::{RtGlass, RtReflectionStats, RtReflectionsEffect, RtReflectionsOptions, RtReflectionsView, RtTraceResolution};
 pub use grid::{RtBackend, RtGrid, RtGridBindings, RtGridHandle, RtGridOptions, RtGridStats, RtPlacement, RtSource, RtSurface, RT_MAX_CELLS, RT_TRIANGLE_BYTES};

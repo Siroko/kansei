@@ -467,9 +467,11 @@ pub struct RtCausticsEffect {
     pub interval: u32,
     /// The photons leave points of the emitters (a spot light's disk facing the caster or
     /// `set_rect_emitter`'s rectangle, the sun's `sun_angle`), as `RtShadowsEffect`'s rays reach
-    /// them: the glass's shadow and caustics soften as its shadows do. Each cell of a 16 x 16 block takes
-    /// its own stratum of the emitter, so a moving caster's single frame of photons is already
-    /// smooth. Off, a point's crisp caustics.
+    /// them: the glass's shadow and caustics soften as its shadows do. Each cell of a 16 x 16
+    /// block takes its own stratum of the emitter and the light taken away lands on the cells'
+    /// even grid, so a moving caster's shadow is smooth in a single frame; the light the glass
+    /// bends lands where it sends it, mottled in a single frame under a large emitter until the
+    /// tile accumulates. Off, a point's crisp caustics.
     pub area_emitters: bool,
     /// The sun's angular radius (radians): `RtShadowsEffect::sun_angle`.
     pub sun_angle: f32,
@@ -671,8 +673,8 @@ impl RtCausticsEffect {
         (&self.map_view, &self.lookup)
     }
 
-    /// The map's texture (for reading it back), and the layer of the `light`th light (in
-    /// `update_lights`' order, counting the lights that send photons) at the `caster`th tile.
+    /// The map's layer of the `light`th light (in `update_lights`' order, counting the lights that
+    /// send photons) at the `caster`th tile.
     pub fn map_layer(&self, caster: usize, light: usize) -> u32 {
         (caster * self.lights.len().max(1) + light) as u32
     }
