@@ -4,7 +4,8 @@
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3, Vec4};
 
-use super::{RtBackend, RtGridHandle, RT_OPAQUE_WGSL};
+use super::shadows::RtShadowVisibility;
+use super::{RtBackend, RtGridHandle, RT_OPAQUE_WGSL, RT_SHADOW_MAX_LIGHTS};
 use crate::cameras::Camera;
 use crate::lights::Light;
 use crate::postprocessing::PostProcessingEffect;
@@ -12,6 +13,10 @@ use crate::renderers::GBuffer;
 
 /// The most glass casters one `RtCausticsEffect` keeps a tile for (`set_casters`).
 pub const RT_CAUSTICS_MAX_CASTERS: usize = 8;
+
+/// The most lights that send photons (the first directional and spot lights `update_lights`
+/// finds): as many as `RtShadowsEffect` shades.
+pub const RT_CAUSTICS_MAX_LIGHTS: usize = RT_SHADOW_MAX_LIGHTS;
 
 /// The caustics map read at a surface (`kansei_rt_caustics_lookup`, the uniform
 /// `KanseiRtCaustics`), for passes that light surfaces themselves: bind `RtCausticsEffect::map`.
@@ -90,6 +95,8 @@ struct ParamsGpu {
     focus_sharpen: f32,
     glass_tint: [f32; 3],
     tint_distance: f32,
+    unoccluded: u32,
+    _pad: [u32; 3],
 }
 
 /// The WGSL `CausticTask`.
@@ -118,7 +125,8 @@ struct TaskGpu {
     seed: u32,
     light: u32,
     bias: f32,
-    _pad: [u32; 2],
+    layer: u32,
+    _pad: u32,
 }
 
 /// The WGSL `KanseiRtCausticTile`.
@@ -145,7 +153,9 @@ pub(crate) struct LookupGpu {
     intensity: f32,
     texels: u32,
     scale: f32,
-    _pad: [u32; 3],
+    lights: u32,
+    _pad: [u32; 2],
+    shadow: [[u32; 4]; 2],
     tiles: [TileGpu; RT_CAUSTICS_MAX_CASTERS],
 }
 
@@ -159,6 +169,9 @@ struct CompositeGpu {
     view: u32,
     receivers: u32,
     rect: [f32; 4],
+    trace_size: [u32; 2],
+    downscale: u32,
+    weighted: u32,
 }
 
 /// The WGSL structs' sizes, for the tests.
@@ -406,6 +419,10 @@ struct Gpu {
     grid_group: Option<(u64, wgpu::BindGroup)>,
     /// the grid's backend the photons were made for
     backend: RtBackend,
+    /// the map's layers it was made for
+    layers: u32,
+    /// stand-ins for RtShadowsEffect's visibility and guide, bound (and unread) while it leaves none
+    lit: [wgpu::TextureView; 2],
 }
 
 /// Caustics: the light that glass (`RtSurface::glass`) focuses onto the surfaces under it, and
@@ -416,15 +433,20 @@ struct Gpu {
 /// projected from each light onto the planes at its bottom and `reach` below), a texel about a
 /// pixel wide where it is on screen (no finer than `RtCausticsOptions::texel`), placed on the
 /// world's multiples of its texel. Each light sends a grid of photons at a tile's caster
-/// (`photons_per_texel` across its box) through the renderer's ray tracing grid (either backend):
-/// a photon whose first hit is the caster's glass is reflected or refracted at every glass surface
+/// (`photons_per_texel` across its box) through the renderer's ray tracing grid (either backend),
+/// each from a point of its emitter as `RtShadowsEffect` samples it (`area_emitters`) toward
+/// where its cell's photon from the emitter's centre meets the plane the caster stands on: a
+/// photon whose first hit is the caster's glass is reflected or refracted at every glass surface
 /// it crosses (exact dielectric Fresnel, chosen at random; Beer-Lambert inside by the triangles'
 /// tint, `tint_distance`; total internal reflection) and adds its light where it lands, and the
 /// same photon taken straight through no glass takes its light away where the direct light (which
 /// passes through glass) lands. A tile thus holds the change the glass makes to the direct light:
 /// dark where the light is bent away or absorbed, bright where it is focused, coloured by a tinted
 /// core; in sum the light the glass reflects out of reach and absorbs, nothing more. It lights the
-/// surfaces that face up at the height the photons landed (`RtCausticReceivers`).
+/// surfaces that face up at the height the photons landed (`RtCausticReceivers`), a layer of the
+/// tile a light: with `set_visibility`, each light's only where `RtShadowsEffect` finds that light
+/// reaching the surface, so a caster's shadow and caustics merge into another object's shadow
+/// rather than stack on it.
 ///
 /// A still caster's tile accumulates `max_history` frames of photons, each with its own jitter,
 /// then sends none. One that moves, or whose lights move, is cleared and fed again every frame
@@ -433,8 +455,8 @@ struct Gpu {
 ///
 /// Put it after `RtShadowsEffect` (and the GI), whose direct light it corrects; its `intensity`
 /// matches the shadows'. A photon costs a ray to its caster and, when it hits the glass, one
-/// straight on and one a surface it crosses; directional lights cost one more, back toward the
-/// light.
+/// straight on and one a surface it crosses; without `set_visibility`, directional lights cost
+/// one more, back toward the light.
 pub struct RtCausticsEffect {
     enabled: bool,
     pub view: RtCausticsView,
@@ -443,11 +465,11 @@ pub struct RtCausticsEffect {
     pub intensity: f32,
     /// Frames between a tile's photons while it accumulates (1: every frame).
     pub interval: u32,
-    /// The emitters' size (a spot light's disk or `set_rect_emitter`'s rectangle, the sun's
-    /// `sun_angle`) blurs where the photons land by the penumbra it casts past the glass, as
-    /// `RtShadowsEffect`'s rays reaching all of it soften its shadows (the photons themselves
-    /// leave its centre: an even grid, smooth from the first frame); off, a point's crisp
-    /// caustics.
+    /// The photons leave points of the emitters (a spot light's disk facing the caster or
+    /// `set_rect_emitter`'s rectangle, the sun's `sun_angle`), as `RtShadowsEffect`'s rays reach
+    /// them: the glass's shadow and caustics soften as its shadows do. Each cell of a 16 x 16 block takes
+    /// its own stratum of the emitter, so a moving caster's single frame of photons is already
+    /// smooth. Off, a point's crisp caustics.
     pub area_emitters: bool,
     /// The sun's angular radius (radians): `RtShadowsEffect::sun_angle`.
     pub sun_angle: f32,
@@ -465,9 +487,18 @@ pub struct RtCausticsEffect {
     casters: Vec<(Vec3, Vec3)>,
     glass: (f32, [f32; 3]),
     lights: Vec<CausticLight>,
+    /// each light's slot in `RtShadowsEffect`'s visibility (its directional lights, then its spot
+    /// lights)
+    shadow_slots: Vec<u32>,
     rects: Vec<(usize, [f32; 2])>,
+    visibility: Option<RtShadowVisibility>,
+    /// whether last frame's photons were weighed by the visibility (and so left the occluders
+    /// between the lights and the casters to it)
+    weighted: bool,
     planner: Planner,
     sent: (usize, u32, usize),
+    /// the map's layers: a light's at a caster's tile is `caster * lights + light`
+    layers: u32,
     map: wgpu::Texture,
     map_view: wgpu::TextureView,
     lookup: wgpu::Buffer,
@@ -480,17 +511,7 @@ impl RtCausticsEffect {
     pub fn new(device: &wgpu::Device, grid: RtGridHandle, options: RtCausticsOptions) -> Self {
         let texels = options.tile_texels.clamp(16, 2048).next_multiple_of(8);
         let options = RtCausticsOptions { tile_texels: texels, texel: options.texel.max(1e-5), ..options };
-        let map = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("RtCaustics/Map"),
-            size: wgpu::Extent3d { width: texels, height: texels, depth_or_array_layers: RT_CAUSTICS_MAX_CASTERS as u32 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba16Float,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let map_view = map.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
+        let (map, map_view) = Self::make_map(device, texels, 1);
         let lookup = device.create_buffer(&wgpu::BufferDescriptor { label: Some("RtCaustics/Lookup"), size: std::mem::size_of::<LookupGpu>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor { label: Some("RtCaustics/Sampler"), mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default() });
         Self {
@@ -509,15 +530,35 @@ impl RtCausticsEffect {
             casters: Vec::new(),
             glass: (1.5, [1.0; 3]),
             lights: Vec::new(),
+            shadow_slots: Vec::new(),
             rects: Vec::new(),
+            visibility: None,
+            weighted: false,
             planner: Planner { tiles: vec![None; RT_CAUSTICS_MAX_CASTERS], ..Default::default() },
             sent: (0, 0, 0),
+            layers: 1,
             map,
             map_view,
             lookup,
             sampler,
             gpu: None,
         }
+    }
+
+    /// The map: `layers` layers of `texels` a side.
+    fn make_map(device: &wgpu::Device, texels: u32, layers: u32) -> (wgpu::Texture, wgpu::TextureView) {
+        let map = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("RtCaustics/Map"),
+            size: wgpu::Extent3d { width: texels, height: texels, depth_or_array_layers: layers },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = map.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
+        (map, view)
     }
 
     /// The boxes (world min, max) of the glass casters, at most [`RT_CAUSTICS_MAX_CASTERS`], each
@@ -543,19 +584,34 @@ impl RtCausticsEffect {
         self.rects.push((index, [width, height]));
     }
 
-    /// The scene's lights (`Scene::lights`), each frame they may change: its directional and spot
-    /// lights send photons. A change clears the tiles.
+    /// The scene's lights (`Scene::lights`), each frame they may change: the directional and spot
+    /// lights `RtShadowsEffect` shades (the first [`RT_CAUSTICS_MAX_LIGHTS`]: its directional
+    /// lights, then its spot lights) send photons. A change clears the tiles.
     pub fn update_lights<'a>(&mut self, lights: impl IntoIterator<Item = &'a Light>) {
+        let lights: Vec<&Light> = lights.into_iter().collect();
+        let suns = lights.iter().filter(|l| matches!(l, Light::Directional(_))).count();
         self.lights.clear();
+        self.shadow_slots.clear();
         let mut spots = 0;
+        let mut sun = 0;
         for light in lights {
             match light {
                 Light::Directional(l) => {
+                    sun += 1;
+                    if sun > RT_CAUSTICS_MAX_LIGHTS {
+                        continue;
+                    }
                     let c = l.effective_color();
                     self.lights.push(CausticLight::Sun { direction: Vec3::new(l.direction.x, l.direction.y, l.direction.z).normalize_or(Vec3::NEG_Y), color: Vec3::new(c.x, c.y, c.z) });
+                    self.shadow_slots.push(sun as u32 - 1);
                 }
                 Light::Spot(l) => {
+                    spots += 1;
+                    if suns + spots > RT_CAUSTICS_MAX_LIGHTS {
+                        continue;
+                    }
                     let c = l.effective_color();
+                    self.shadow_slots.push((suns + spots) as u32 - 1);
                     self.lights.push(CausticLight::Spot {
                         position: Vec3::new(l.position.x, l.position.y, l.position.z),
                         direction: Vec3::new(l.direction.x, l.direction.y, l.direction.z).normalize_or(Vec3::NEG_Z),
@@ -563,13 +619,23 @@ impl RtCausticsEffect {
                         range: l.range.max(1e-3),
                         cone: l.cone(),
                         radius: l.source_radius.max(0.0),
-                        rect: self.rects.iter().find(|r| r.0 == spots).map(|r| r.1),
+                        rect: self.rects.iter().find(|r| r.0 == spots - 1).map(|r| r.1),
                     });
-                    spots += 1;
                 }
                 Light::Point(_) | Light::Area(_) => {}
             }
         }
+    }
+
+    /// Weigh the light each light's photons add and take at a surface by `RtShadowsEffect`'s
+    /// visibility of that light there (`RtShadowsEffect::visibility`; it must render before this
+    /// effect, in the same frame), so the caustics and the shadow the glass leaves add and take
+    /// only light that reaches the surface: where another object shadows it they merge into that
+    /// shadow. The photons then leave the occluders between the lights and the casters to the
+    /// visibility. `None`: every surface under a tile takes the map whole, and the photons find
+    /// those occluders themselves.
+    pub fn set_visibility(&mut self, visibility: Option<RtShadowVisibility>) {
+        self.visibility = visibility;
     }
 
     /// Clear every tile: their photons start over.
@@ -597,11 +663,18 @@ impl RtCausticsEffect {
         &self.options
     }
 
-    /// The map (a layer a tile; rgb: the irradiance the caustics add, lux, signed; a: the height
-    /// the photons landed at over the tile's) and its uniform (`KanseiRtCaustics`), for
-    /// `RT_CAUSTICS_LOOKUP_WGSL`.
+    /// The map (a layer a light at each caster's tile, `caster * lights + light`; rgb: the
+    /// irradiance that light's photons add, lux, signed; a: the height they landed at over the
+    /// tile's) and its uniform (`KanseiRtCaustics`), for `RT_CAUSTICS_LOOKUP_WGSL`. The map grows
+    /// (a new texture) when casters or lights are added: bind it anew each frame.
     pub fn map(&self) -> (&wgpu::TextureView, &wgpu::Buffer) {
         (&self.map_view, &self.lookup)
+    }
+
+    /// The map's texture (for reading it back), and the layer of the `light`th light (in
+    /// `update_lights`' order, counting the lights that send photons) at the `caster`th tile.
+    pub fn map_layer(&self, caster: usize, light: usize) -> u32 {
+        (caster * self.lights.len().max(1) + light) as u32
     }
 
     /// The map's texture (for reading it back).
@@ -621,8 +694,19 @@ impl RtCausticsEffect {
         self.sent
     }
 
-    /// The lights' photon grids at the tiles fed this frame.
+    /// How far below its caster's box a tile reaches (m).
+    fn reach(&self, lo: Vec3, hi: Vec3) -> f32 {
+        if self.options.reach > 0.0 {
+            self.options.reach
+        } else {
+            0.5 * (hi.y - lo.y)
+        }
+    }
+
+    /// The lights' photon grids at the tiles fed this frame, each into its light's layer of its
+    /// caster's.
     fn tasks(&self, fed: &[(usize, f32)]) -> Vec<TaskGpu> {
+        let lights = self.lights.len() as u32;
         let mut tasks = Vec::new();
         let basis = |a: Vec3| {
             let any = if a.y.abs() < 0.9 { Vec3::Y } else { Vec3::X };
@@ -650,10 +734,14 @@ impl RtCausticsEffect {
                             v = [v[0].min(b), v[1].max(b)];
                             t = t.min(c.dot(dir));
                         }
+                        // the sun's disk, as the tangent of its angular radius; the grid wider by
+                        // how far its edge shifts the shadow over the box and below it
+                        let disk = if self.area_emitters { self.sun_angle.max(0.0).tan() } else { 0.0 };
+                        let margin = disk * ((hi - lo).length() + self.reach(lo, hi));
+                        let (u, v) = ([u[0] - margin, u[1] + margin], [v[0] - margin, v[1] + margin]);
                         let side = side_for((u[1] - u[0]).max(v[1] - v[0]));
                         // the photons' plane just outside the box, toward the light
                         let origin = dir * (t - 0.05 * (hi - lo).length() - 1e-3);
-                        let blur = if self.area_emitters { self.sun_angle.max(0.0).tan() } else { 0.0 };
                         tasks.push(TaskGpu {
                             origin: origin.to_array(),
                             kind: 0,
@@ -665,12 +753,14 @@ impl RtCausticsEffect {
                             v0: v[0],
                             color: color.to_array(),
                             du: (u[1] - u[0]) / side as f32,
-                            emitter_x: (e1 * blur).to_array(),
+                            emitter_x: (e1 * disk).to_array(),
                             dv: (v[1] - v[0]) / side as f32,
+                            emitter_y: (e2 * disk).to_array(),
                             tile: k as u32,
                             seed: tile.history,
                             light: index as u32,
                             bias,
+                            layer: k as u32 * lights + index as u32,
                             ..Default::default()
                         });
                     }
@@ -686,6 +776,7 @@ impl RtCausticsEffect {
                         }
                         let (e1, e2) = basis(axis);
                         let (mut u, mut v) = ([f32::MAX, f32::MIN], [f32::MAX, f32::MIN]);
+                        let (mut near, mut far) = (f32::MAX, 0.0f32);
                         let mut behind = false;
                         for q in &corners {
                             let w = *q - p;
@@ -694,8 +785,20 @@ impl RtCausticsEffect {
                                 behind = true;
                                 break;
                             }
+                            (near, far) = (near.min(z), far.max(z));
                             u = [u[0].min(w.dot(e1) / z), u[1].max(w.dot(e1) / z)];
                             v = [v[0].min(w.dot(e2) / z), v[1].max(w.dot(e2) / z)];
+                        }
+                        // the emitter's edge sees the box shifted (in these tangents) by up to its
+                        // radius over the box's depth, less over the depth the photons land at
+                        let extent = match (self.area_emitters, rect) {
+                            (false, _) => 0.0,
+                            (true, Some([w, h])) => 0.5 * w.hypot(h),
+                            (true, None) => radius,
+                        };
+                        if !behind {
+                            let margin = extent * (1.0 / near - 1.0 / (far + self.reach(lo, hi)));
+                            (u, v) = ([u[0] - margin, u[1] + margin], [v[0] - margin, v[1] + margin]);
                         }
                         // the cone (a square round its axis, in the same tangents)
                         let dz = d.dot(axis);
@@ -712,16 +815,20 @@ impl RtCausticsEffect {
                             continue;
                         }
                         let side = side_for((u[1] - u[0]).max(v[1] - v[0]) * distance);
-                        // its emitter: a rectangle (`set_rect_emitter`) or its disk, as a square
-                        let (a, b) = basis(d);
-                        let (ex, ey) = match (self.area_emitters, rect) {
-                            (true, Some([w, h])) => (a * w * 0.5, b * h * 0.5),
-                            (true, None) => (a * radius, b * radius),
-                            (false, _) => (Vec3::ZERO, Vec3::ZERO),
+                        // its emitter, as RtShadowsEffect samples it: a rectangle facing along its
+                        // axis (`set_rect_emitter`; kind 2, its half sides) or its disk facing the
+                        // caster (kind 1, its radius along two tangents)
+                        let (kind, ex, ey) = match (self.area_emitters, rect) {
+                            (true, Some([w, h])) => {
+                                let (a, b) = basis(d);
+                                (2, a * w * 0.5, b * h * 0.5)
+                            }
+                            (true, None) => (1, e1 * radius, e2 * radius),
+                            (false, _) => (1, Vec3::ZERO, Vec3::ZERO),
                         };
                         tasks.push(TaskGpu {
                             origin: p.to_array(),
-                            kind: 1,
+                            kind,
                             axis: axis.to_array(),
                             side,
                             e1: e1.to_array(),
@@ -741,6 +848,7 @@ impl RtCausticsEffect {
                             seed: tile.history,
                             light: index as u32,
                             bias,
+                            layer: k as u32 * lights + index as u32,
                             ..Default::default()
                         });
                     }
@@ -784,6 +892,9 @@ impl RtCausticsEffect {
         let storage_tex = |view_dimension| wgpu::BindingType::StorageTexture { access: wgpu::StorageTextureAccess::WriteOnly, format: wgpu::TextureFormat::Rgba16Float, view_dimension };
         let layout = |label, entries: &[wgpu::BindGroupLayoutEntry]| device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some(label), entries });
         let backend = self.grid.backend();
+        if self.map.depth_or_array_layers() != self.layers {
+            (self.map, self.map_view) = Self::make_map(device, self.options.tile_texels, self.layers);
+        }
         let [photon_entries, grid_entries] = photon_layout_entries(backend);
         let photon_bgl = layout("RtCaustics/Photons", &photon_entries);
         let grid_bgl = layout("RtCaustics/Grid", &grid_entries);
@@ -802,6 +913,9 @@ impl RtCausticsEffect {
                 entry(7, texture(true, array)),
                 entry(8, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)),
                 entry(9, uniform),
+                entry(10, texture(false, d2)),
+                entry(11, texture(false, d2)),
+                entry(12, texture(false, d2)),
             ],
         );
         let pipeline = |label: &str, code: &str, entry_point: &str, layouts: &[&wgpu::BindGroupLayout]| {
@@ -815,7 +929,7 @@ impl RtCausticsEffect {
         let composite = pipeline("RtCaustics/Composite", &resolve_code, "composite", &[&composite_bgl]);
         let buffer = |label, size: u64, usage| device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage, mapped_at_creation: false });
         let texels = self.options.tile_texels;
-        let layers = RT_CAUSTICS_MAX_CASTERS as u32;
+        let layers = self.layers;
         let accumulator = buffer("RtCaustics/Accumulator", (texels * texels * layers) as u64 * 5 * 4, wgpu::BufferUsages::STORAGE);
         let params = buffer("RtCaustics/Params", std::mem::size_of::<ParamsGpu>() as u64, wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST);
         let tasks = buffer("RtCaustics/Tasks", (std::mem::size_of::<TaskGpu>() * MAX_TASKS) as u64, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST);
@@ -863,6 +977,20 @@ impl RtCausticsEffect {
             resolve_group,
             grid_group: None,
             backend,
+            layers,
+            lit: [wgpu::TextureFormat::Rgba16Float, wgpu::TextureFormat::Rgba32Float].map(|format| {
+                let texture = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("RtCaustics/Lit"),
+                    size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                });
+                texture.create_view(&Default::default())
+            }),
         });
         // the accumulator starts at zero; the tiles start over
         self.planner.tiles = vec![None; RT_CAUSTICS_MAX_CASTERS];
@@ -877,11 +1005,27 @@ impl PostProcessingEffect for RtCausticsEffect {
     }
 
     fn render(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, gbuffer: &GBuffer, input: &wgpu::TextureView, depth: &wgpu::TextureView, output: &wgpu::TextureView, camera: &Camera, width: u32, height: u32) {
+        // a layer a light at each caster's tile: the map grows to hold them
+        let lights = self.lights.len().max(1) as u32;
+        let needed = self.casters.len().max(1) as u32 * lights;
+        if needed > self.layers {
+            self.layers = needed.next_power_of_two();
+        }
         // made again for a grid whose backend changed (the effect's handle follows its grid)
-        if self.gpu.as_ref().is_none_or(|g| g.backend != self.grid.backend()) {
+        if self.gpu.as_ref().is_none_or(|g| g.backend != self.grid.backend() || g.layers != self.layers) {
             self.init_gpu(device);
         }
         self.grid.prepare_trace(device, queue);
+        // RtShadowsEffect's visibility this frame: the photons leave the occluders before the
+        // casters to it (a change of mode starts the tiles over)
+        let visibility = match self.receivers {
+            RtCausticReceivers::RtLit => self.visibility.as_ref().and_then(|v| v.frame(camera.frame())),
+            RtCausticReceivers::All => None,
+        };
+        if visibility.is_some() != self.weighted {
+            self.weighted = visibility.is_some();
+            self.clear();
+        }
         let proj = camera.projection_matrix.to_glam();
         let view = camera.view_matrix.to_glam();
         let eye = view.inverse().w_axis.truncate();
@@ -895,7 +1039,10 @@ impl PostProcessingEffect for RtCausticsEffect {
         self.sent = (tasks.len(), photons, fed_tiles.len());
         let scale = self.fixed_point(&tasks);
         let finest = self.options.texel;
-        let mut lookup = LookupGpu { enabled: self.enabled as u32, count: RT_CAUSTICS_MAX_CASTERS as u32, intensity: self.intensity.max(0.0), texels: self.options.tile_texels, scale, ..Default::default() };
+        let mut lookup = LookupGpu { enabled: self.enabled as u32, count: RT_CAUSTICS_MAX_CASTERS as u32, intensity: self.intensity.max(0.0), texels: self.options.tile_texels, scale, lights: self.lights.len() as u32, ..Default::default() };
+        for (l, &slot) in self.shadow_slots.iter().enumerate() {
+            lookup.shadow[l / 4][l % 4] = slot;
+        }
         for (k, tile) in self.planner.tiles.iter_mut().enumerate() {
             let Some(t) = tile else { continue };
             let texel = finest * (1u32 << t.level) as f32;
@@ -930,6 +1077,8 @@ impl PostProcessingEffect for RtCausticsEffect {
             focus_sharpen: self.focus_sharpen.clamp(0.1, 1.0),
             glass_tint: self.glass.1,
             tint_distance: self.tint_distance.max(1e-6),
+            unoccluded: self.weighted as u32,
+            _pad: [0; 3],
         };
         let gpu = self.gpu.as_mut().unwrap();
         queue.write_buffer(&gpu.params, 0, bytemuck::bytes_of(&params));
@@ -941,7 +1090,12 @@ impl PostProcessingEffect for RtCausticsEffect {
             RtCausticReceivers::All => 1,
         };
         let rect = screen_rect(proj * view, &lookup, [width as f32, height as f32]);
-        queue.write_buffer(&gpu.composite_params, 0, bytemuck::bytes_of(&CompositeGpu { inv_proj: proj.inverse().to_cols_array(), inv_view: view.inverse().to_cols_array(), size: [width as f32, height as f32], view: self.view as u32, receivers, rect }));
+        let (trace_size, downscale) = visibility.as_ref().map_or(([1, 1], 1), |v| (v.trace_size, v.downscale));
+        queue.write_buffer(
+            &gpu.composite_params,
+            0,
+            bytemuck::bytes_of(&CompositeGpu { inv_proj: proj.inverse().to_cols_array(), inv_view: view.inverse().to_cols_array(), size: [width as f32, height as f32], view: self.view as u32, receivers, rect, trace_size, downscale, weighted: visibility.is_some() as u32 }),
+        );
         // the grid's group, made anew when its buffers (or its acceleration structure) are
         let (bindings, generation) = self.grid.bindings();
         if gpu.grid_group.as_ref().is_none_or(|(g, _)| *g != generation) {
@@ -968,15 +1122,16 @@ impl PostProcessingEffect for RtCausticsEffect {
                 let d = lookup.tiles[k].dims;
                 (w.max(d[0]), h.max(d[1]))
             });
-            pass.dispatch_workgroups(w.min(texels).div_ceil(8), h.min(texels).div_ceil(8), RT_CAUSTICS_MAX_CASTERS as u32);
+            pass.dispatch_workgroups(w.min(texels).div_ceil(8), h.min(texels).div_ceil(8), self.layers);
             drop(pass);
+            // each fed tile's layers, one a light
             for &k in &fed_tiles {
                 let d = lookup.tiles[k].dims;
-                let origin = wgpu::Origin3d { x: 0, y: 0, z: k as u32 };
+                let origin = wgpu::Origin3d { x: 0, y: 0, z: k as u32 * lights };
                 encoder.copy_texture_to_texture(
                     wgpu::TexelCopyTextureInfo { texture: &gpu.scratch, mip_level: 0, origin, aspect: wgpu::TextureAspect::All },
                     wgpu::TexelCopyTextureInfo { texture: &self.map, mip_level: 0, origin, aspect: wgpu::TextureAspect::All },
-                    wgpu::Extent3d { width: d[0], height: d[1], depth_or_array_layers: 1 },
+                    wgpu::Extent3d { width: d[0], height: d[1], depth_or_array_layers: lights },
                 );
             }
         }
@@ -994,6 +1149,9 @@ impl PostProcessingEffect for RtCausticsEffect {
                 wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(&self.map_view) },
                 wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::Sampler(&self.sampler) },
                 wgpu::BindGroupEntry { binding: 9, resource: self.lookup.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(visibility.as_ref().map_or(&gpu.lit[0], |v| &v.vis[0])) },
+                wgpu::BindGroupEntry { binding: 11, resource: wgpu::BindingResource::TextureView(visibility.as_ref().map_or(&gpu.lit[0], |v| &v.vis[1])) },
+                wgpu::BindGroupEntry { binding: 12, resource: wgpu::BindingResource::TextureView(visibility.as_ref().map_or(&gpu.lit[1], |v| &v.guide)) },
             ],
         });
         let stamp = crate::profiling::gpu_pass("RtCaustics/Composite");
