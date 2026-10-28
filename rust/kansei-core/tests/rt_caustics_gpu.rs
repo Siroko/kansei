@@ -13,13 +13,14 @@
 //!   and moving the marble a texel or a fraction of one moves its caustics without changing them
 //!   (no crawling).
 //!
-//! Through the grid's cells and, where the adapter has ray queries, through hardware ray queries
-//! (`RtBackend::Hardware`). Skipped (passes) when no adapter is available.
+//! Under a spot light straight above and under a slanting sun. Through the grid's cells and,
+//! where the adapter has ray queries, through hardware ray queries (`RtBackend::Hardware`).
+//! Skipped (passes) when no adapter is available.
 
 use glam::Vec3 as GVec3;
 use kansei_core::cameras::Camera;
 use kansei_core::geometries::{BoxGeometry, IcosphereGeometry};
-use kansei_core::lights::{Light, SpotLight};
+use kansei_core::lights::{DirectionalLight, Light, SpotLight};
 use kansei_core::materials::{Binding, Material, MaterialOptions, ShaderStages, GBUFFER_OUT_WGSL};
 use kansei_core::math::Vec3;
 use kansei_core::objects::{Renderable, Scene, SceneNode};
@@ -33,6 +34,9 @@ const RADIUS: f32 = 0.015;
 /// The spot light straight above the marble: its height (m) and intensity (cd).
 const LAMP: f32 = 0.5;
 const CANDELA: f32 = 20.0;
+/// The sun's illuminance (lux, facing it) and the way its light travels.
+const SUN: f32 = 80.0;
+const SUN_DIR: GVec3 = GVec3::new(0.25, -1.0, 0.1);
 
 fn renderer() -> Option<Renderer> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
@@ -118,7 +122,7 @@ struct Tile {
 
 /// The marble (index `ior`; `core`: a tinted sphere of half its radius inside it) on the floor at
 /// x = `x`, `frames` frames of the shadows and the caustics.
-fn run(backend: RtBackend, ior: f32, core: Option<[f32; 3]>, frames: usize, x: f32) -> Option<Tile> {
+fn run(backend: RtBackend, sun: bool, ior: f32, core: Option<[f32; 3]>, frames: usize, x: f32) -> Option<Tile> {
     let mut renderer = renderer()?;
     renderer.enable_rt_grid(SceneRtGridOptions { grid: RtGridOptions { dims: [64, 32, 64], cell: 0.4 / 64.0, fixed_origin: Some(glam::Vec3::new(-0.2, -0.05, -0.2)), backend, ..Default::default() }, ..Default::default() });
     let mut scene = Scene::new();
@@ -134,7 +138,9 @@ fn run(backend: RtBackend, ior: f32, core: Option<[f32; 3]>, frames: usize, x: f
         scene.add(SceneNode::Renderable(inner));
     }
     let spot = SpotLight::new(Vec3::new(0.0, LAMP, 0.0), Vec3::new(0.0, -1.0, 0.0), Vec3::new(1.0, 1.0, 1.0), CANDELA, 100.0, 50f32.to_radians(), 60f32.to_radians());
-    scene.add(SceneNode::Light(Light::Spot(spot)));
+    let d = SUN_DIR.normalize();
+    let sunlight = DirectionalLight::new(Vec3::new(d.x, d.y, d.z), Vec3::new(1.0, 1.0, 1.0), SUN);
+    scene.add(SceneNode::Light(if sun { Light::Directional(sunlight) } else { Light::Spot(spot) }));
     let gbuffer = GBuffer::new(renderer.device(), W, H, 1);
     let mut camera = Camera::new(50.0, 0.01, 10.0, W as f32 / H as f32);
     camera.set_position(0.0, 0.08, 0.08);
@@ -179,22 +185,40 @@ fn run(backend: RtBackend, ior: f32, core: Option<[f32; 3]>, frames: usize, x: f
     Some(Tile { texel, texels, history, centres })
 }
 
-/// The spot light's flux into the marble (lm): its intensity times the solid angle the sphere
-/// fills, seen from the lamp (inside the cone's full intensity).
-fn flux_into_marble() -> f32 {
+/// The light's flux into the marble (lm): the spot light's intensity times the solid angle the
+/// sphere fills, seen from the lamp (inside the cone's full intensity), or the sun's illuminance
+/// times its cross-section.
+fn flux_into_marble(sun: bool) -> f32 {
+    if sun {
+        return SUN * std::f32::consts::PI * RADIUS * RADIUS;
+    }
     let d = LAMP - RADIUS;
     CANDELA * 2.0 * std::f32::consts::PI * (1.0 - (1.0 - (RADIUS / d).powi(2)).sqrt())
 }
 
-/// The direct light on the floor under the lamp (lux).
-fn direct_under_lamp() -> f32 {
+/// The direct light on the floor under the lamp or the sun (lux).
+fn direct_under_lamp(sun: bool) -> f32 {
+    if sun {
+        return SUN * -SUN_DIR.normalize().y;
+    }
     CANDELA / (LAMP * LAMP)
 }
 
-/// The tile's mean in 1 mm rings round (x, 0), and the spread of its texels from 6 to 12 mm out
+/// Where the marble's shadow is centred on the floor (x, z) for a marble at x: under it, or along
+/// the sun's slant from its centre.
+fn shadow_centre(sun: bool, x: f32) -> [f32; 2] {
+    if !sun {
+        return [x, 0.0];
+    }
+    let d = SUN_DIR.normalize();
+    let s = RADIUS / -d.y;
+    [x + d.x * s, d.z * s]
+}
+
+/// The tile's mean in 1 mm rings round `at` (x, z), and the spread of its texels from 6 to 12 mm out
 /// (all shadow).
-fn rings(tile: &Tile, x: f32) -> ([f32; 16], f32) {
-    let r = |c: &[f32; 2]| ((c[0] - x).powi(2) + c[1] * c[1]).sqrt();
+fn rings(tile: &Tile, at: [f32; 2]) -> ([f32; 16], f32) {
+    let r = |c: &[f32; 2]| (c[0] - at[0]).hypot(c[1] - at[1]);
     let mut sums = [(0.0f32, 0u32); 16];
     for (t, c) in tile.texels.iter().zip(&tile.centres) {
         let k = ((r(c) / 0.001) as usize).min(15);
@@ -207,27 +231,28 @@ fn rings(tile: &Tile, x: f32) -> ([f32; 16], f32) {
     (sums.map(|(s, n)| s / n.max(1) as f32), rms)
 }
 
-fn conservation(backend: RtBackend) {
+fn conservation(backend: RtBackend, sun: bool) {
+    eprintln!("{}", if sun { "under the sun" } else { "under the spot light" });
     // index 1: no change at all
-    let Some(tile) = run(backend, 1.0, None, 8, 0.0) else { return eprintln!("no GPU adapter: skipping") };
+    let Some(tile) = run(backend, sun, 1.0, None, 8, 0.0) else { return eprintln!("no GPU adapter: skipping") };
     assert_eq!(tile.history, 8, "a still marble's tile accumulates");
     let area = tile.texel * tile.texel;
     let sum: f32 = tile.texels.iter().map(|t| t[1]).sum::<f32>() * area;
     let worst = tile.texels.iter().map(|t| t[1].abs()).fold(0.0, f32::max);
-    let flux = flux_into_marble();
-    eprintln!("index 1: the tile's sum {sum:.2e} lm of {flux:.2e} through the marble, its largest texel {worst:.3} lux of {:.1} direct", direct_under_lamp());
+    let flux = flux_into_marble(sun);
+    eprintln!("index 1: the tile's sum {sum:.2e} lm of {flux:.2e} through the marble, its largest texel {worst:.3} lux of {:.1} direct", direct_under_lamp(sun));
     assert!(sum.abs() < 0.01 * flux, "index-matched glass changes no light ({sum} of {flux})");
-    assert!(worst < 0.02 * direct_under_lamp(), "nor any texel's ({worst} lux)");
+    assert!(worst < 0.02 * direct_under_lamp(sun), "nor any texel's ({worst} lux)");
 
     // clear glass: the light moves, little is lost
-    let tile = run(backend, 1.5, None, 32, 0.0).unwrap();
+    let tile = run(backend, sun, 1.5, None, 32, 0.0).unwrap();
     let area = tile.texel * tile.texel;
     let sum: f32 = tile.texels.iter().map(|t| t[1]).sum::<f32>() * area;
     let brightest = tile.texels.iter().map(|t| t[1]).fold(f32::MIN, f32::max);
     let darkest = tile.texels.iter().map(|t| t[1]).fold(f32::MAX, f32::min);
-    let direct = direct_under_lamp();
+    let direct = direct_under_lamp(sun);
     let with = 1.0 + sum / flux;
-    let (profile, rms) = rings(&tile, 0.0);
+    let (profile, rms) = rings(&tile, shadow_centre(sun, 0.0));
     eprintln!("index 1.5: the light through the marble's footprint with the glass {with:.3} of without; texels {darkest:.1}..{brightest:.1} lux over {direct:.1} direct");
     eprintln!("1 mm rings: {:?}; the shadow 6-12 mm out varies {rms:.2} lux", profile.map(|v| v.round()));
     assert!(sum <= 0.01 * flux && sum >= -0.2 * flux, "clear glass loses only what its surfaces reflect away ({sum} of {flux})");
@@ -240,11 +265,11 @@ fn conservation(backend: RtBackend) {
     assert!(rms < 0.1 * direct, "the shadow is smooth ({rms:.2} lux from texel to texel)");
 
     // a red core: the light through it red
-    let r = |c: [f32; 2]| (c[0] * c[0] + c[1] * c[1]).sqrt();
-    let tile = run(backend, 1.5, Some([0.9, 0.05, 0.05]), 32, 0.0).unwrap();
+    let centre = shadow_centre(sun, 0.0);
+    let tile = run(backend, sun, 1.5, Some([0.9, 0.05, 0.05]), 32, 0.0).unwrap();
     let (mut red, mut green) = (0.0, 0.0);
     for (t, c) in tile.texels.iter().zip(&tile.centres) {
-        if r(*c) < 0.5 * RADIUS {
+        if (c[0] - centre[0]).hypot(c[1] - centre[1]) < 0.5 * RADIUS {
             red += t[0];
             green += t[1];
         }
@@ -257,13 +282,16 @@ fn conservation(backend: RtBackend) {
     // texel; for a fraction of one (where the rings' texel centres sample the focus's steep edge
     // elsewhere) the light within 6.5 mm, its rim in the flat shadow
     let texel = tile.texel;
-    let within = |tile: &Tile, x: f32| tile.texels.iter().zip(&tile.centres).filter(|(_, c)| (c[0] - x).hypot(c[1]) < 0.0065).map(|(t, _)| t[1]).sum::<f32>() * texel * texel;
-    let still = run(backend, 1.5, None, 32, 0.0).unwrap();
-    let (still_rings, _) = rings(&still, 0.0);
+    let within = |tile: &Tile, x: f32| {
+        let at = shadow_centre(sun, x);
+        tile.texels.iter().zip(&tile.centres).filter(|(_, c)| (c[0] - at[0]).hypot(c[1] - at[1]) < 0.0065).map(|(t, _)| t[1]).sum::<f32>() * texel * texel
+    };
+    let still = run(backend, sun, 1.5, None, 32, 0.0).unwrap();
+    let (still_rings, _) = rings(&still, shadow_centre(sun, 0.0));
     let still_within = within(&still, 0.0);
     for x in [0.0, texel, 0.37 * texel] {
-        let tile = run(backend, 1.5, None, 1, x).unwrap();
-        let (profile, rms) = rings(&tile, x);
+        let tile = run(backend, sun, 1.5, None, 1, x).unwrap();
+        let (profile, rms) = rings(&tile, shadow_centre(sun, x));
         let inside = within(&tile, x);
         eprintln!("one frame, the marble {:.2} mm along: 1 mm rings {:?}, within 6.5 mm {:.3e} lm (still {still_within:.3e}), the shadow varies {rms:.2} lux", x * 1e3, profile.map(|v| v.round()), inside);
         assert!(rms < 0.05 * direct, "a rolling marble's shadow is smooth ({rms:.2} lux from texel to texel)");
@@ -277,10 +305,20 @@ fn conservation(backend: RtBackend) {
 
 #[test]
 fn caustics_through_the_grid_conserve_light() {
-    conservation(RtBackend::Software);
+    conservation(RtBackend::Software, false);
 }
 
 #[test]
 fn caustics_through_hardware_ray_queries_conserve_light() {
-    conservation(RtBackend::Hardware);
+    conservation(RtBackend::Hardware, false);
+}
+
+#[test]
+fn sun_caustics_through_the_grid_conserve_light() {
+    conservation(RtBackend::Software, true);
+}
+
+#[test]
+fn sun_caustics_through_hardware_ray_queries_conserve_light() {
+    conservation(RtBackend::Hardware, true);
 }
