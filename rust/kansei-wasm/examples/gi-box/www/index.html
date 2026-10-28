@@ -95,7 +95,7 @@
         }));
         pane.addBinding(p, 'voxels', { label: 'voxel tier', options: { low: 'low', medium: 'medium', high: 'high' } }).on('change', custom(() => set_voxels(p.voxels)));
         pane.addBinding(p, 'view', { options: { lit: 'lit', 'indirect only': 'indirect', 'voxels (debug)': 'voxels', 'SDF slice (debug)': 'sdf', 'probes (debug)': 'probes' } }).on('change', custom(() => set_view(p.view)));
-        pane.addBinding(p, 'camera', { options: { front: 'front', 'inside corner': 'corner', 'low angle': 'low', 'down onto the floor': 'floor', 'through the glass ball': 'glass', 'close on the chrome ball': 'chrome' } }).on('change', () => set_camera(p.camera));
+        pane.addBinding(p, 'camera', { options: { front: 'front', 'inside corner': 'corner', 'low angle': 'low', 'down onto the floor': 'floor', 'through the glass ball': 'glass', 'close on the chrome ball': 'chrome', 'close on a marble (glass_radius=0.015)': 'marble' } }).on('change', () => set_camera(p.camera));
         const sdf = pane.addFolder({ title: 'Distance field' });
         sdf.addBinding(p, 'sdfAo', { label: 'AO on GI', min: 0, max: 1, step: 0.05 }).on('change', custom(() => set_sdf_ao(p.sdfAo)));
         sdf.addBinding(p, 'sdfShadows', { label: 'voxel shadows', options: { 'shadow maps': 'off', 'field where no map': 'fallback', 'field always': 'always' } }).on('change', custom(() => set_sdf_shadows(p.sdfShadows)));

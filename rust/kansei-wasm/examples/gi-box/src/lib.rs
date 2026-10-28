@@ -58,13 +58,14 @@
 //!   over grey);
 //! - `glass_shadow=1`: the glass ball casts into the shadow maps (with `shadows=maps`, the solid
 //!   disc a shadow map gives glass); `roll=1`: the glass ball rolls back and forth across the rug;
+//!   `glass_radius=` (m): the glass ball's size (0.015 and `cam=marble`: a 3 cm marble on the rug);
 //! - the balls: `mirror=0`, `glass=0` (without either, and without `reflect`, `gi=rt` or `rt=1`, no
 //!   grid of triangles is built), `mirror_rough=0..1`, `glass_ior=` (1.5), `glass_rough=0..1`
 //!   (frosted), `glass_tint=r,g,b` (the light left after a metre inside), `glass_samples=` (paths
 //!   a frosted pixel a frame, 4), `rt_screen=0` (their rays' hits lit by the lamp and the voxels
 //!   even where the camera sees them), `rt_direct=0` (hits the camera doesn't see lit by the
 //!   voxels alone);
-//! - `cam=front|corner|low|floor|glass|chrome`;
+//! - `cam=front|corner|low|floor|glass|chrome|marble`;
 //! - `dragon=1|full`: the Stanford dragon (CC-BY-NC-4.0, see `www/assets/license.txt`): `1` the
 //!   decimated `.glb` (19k triangles), `full` the whole scan (871k triangles, 24 MB);
 //! - `animate=1`: the dragon (or, without it, the tall block) turns and slides, re-voxelized each
@@ -184,8 +185,13 @@ const MIRROR_GI_ALBEDO: [f32; 3] = [0.02, 0.02, 0.02];
 /// The light the glass leaves after a metre inside (a faint green, as window glass).
 const GLASS_TINT: [f32; 3] = [0.82, 0.93, 0.88];
 const BALL_RADIUS: f32 = 0.4;
-/// Where the glass ball rests on the rug.
-const GLASS_REST: [f32; 3] = [-0.1, BALL_RADIUS + 0.025, -0.45];
+/// Where the glass ball rests on the rug (x, z), its bottom a little over the rug's top.
+const GLASS_REST: [f32; 2] = [-0.1, -0.45];
+
+/// The glass ball's centre for its radius `r` (`glass_radius=`), `x` along from its rest.
+fn glass_centre(r: f32, x: f32) -> Vec3 {
+    Vec3::new(GLASS_REST[0] + x, 0.02 + r * 1.0125, GLASS_REST[1])
+}
 /// The balls' tessellation (the grid traces their triangles, shaded by their vertex normals).
 const BALL_SEGMENTS: u32 = 64;
 const BALL_RINGS: u32 = 48;
@@ -748,8 +754,10 @@ struct Config {
     glass_rough: f32,
     glass_tint: [f32; 3],
     glass_samples: u32,
-    /// The glass ball casts into the shadow maps (`glass_shadow=1`), and rolls (`roll=1`).
+    /// The glass ball casts into the shadow maps (`glass_shadow=1`), and rolls (`roll=1`); its
+    /// radius (`glass_radius=`, m, set at load).
     glass_shadow: bool,
+    glass_radius: f32,
     roll: bool,
     /// The balls' (and the floor's) rays' hits lit by the lit image where the camera sees them
     /// (`rt_screen=`), else by the lamp and the voxels.
@@ -850,7 +858,7 @@ fn probe_options(phone: bool) -> SdfProbeOptions {
 }
 
 /// The camera presets: (name, target, distance, azimuth, elevation).
-const CAMERAS: [(&str, [f32; 3], f32, f32, f32); 6] = [
+const CAMERAS: [(&str, [f32; 3], f32, f32, f32); 7] = [
     // the box's opening, framed as the Cornell box photographs are
     ("front", [0.0, 2.0, -2.0], 8.3, 0.0, 0.0),
     // inside, from the upper front-left corner toward the short block and the green wall
@@ -863,6 +871,8 @@ const CAMERAS: [(&str, [f32; 3], f32, f32, f32); 6] = [
     ("glass", [-0.1, 0.45, -0.45], 1.8, 0.92, 0.12),
     // close on the chrome ball from in front of the opening: it mirrors what is behind the camera
     ("chrome", [0.8, 1.6, -1.5], 2.2, -0.35, 0.1),
+    // close on the glass ball shrunk to a marble (glass_radius=0.015) and its caustics on the rug
+    ("marble", [-0.1, 0.03, -0.45], 0.12, 0.92, 0.5),
 ];
 
 struct State {
@@ -982,6 +992,7 @@ fn config_from_url(phone: bool) -> Config {
         glass_tint: param("glass_tint").and_then(|v| parse_rgb(&v)).unwrap_or(GLASS_TINT),
         glass_samples: param_or("glass_samples", 4u32).clamp(1, 16),
         glass_shadow: flag("glass_shadow", false),
+        glass_radius: param_or("glass_radius", BALL_RADIUS).clamp(0.005, BALL_RADIUS),
         roll: flag("roll", false),
         screen_hits: flag("rt_screen", true),
         env: param("env").as_deref().and_then(Env::from_name).unwrap_or(Env::None),
@@ -1333,16 +1344,17 @@ impl State {
         if let (true, Some(r)) = (self.config.roll, self.glass.and_then(|i| self.scene.get_renderable_mut(i))) {
             // back and forth across the rug, turning as it rolls
             self.roll_time += dt;
-            let x = GLASS_REST[0] + 0.5 * (self.roll_time * 0.5).sin();
-            r.object.position.x = x;
-            r.object.rotation.z = -(x - GLASS_REST[0]) / BALL_RADIUS;
+            let radius = self.config.glass_radius;
+            let x = 0.5 * (radius / BALL_RADIUS).max(0.2) * (self.roll_time * 0.5).sin();
+            r.object.position = glass_centre(radius, x);
+            r.object.rotation.z = -x / radius;
         }
         if let Some(shadows) = self.volume.effect_mut::<RtShadowsEffect>() {
             shadows.update_lights(self.scene.lights());
         }
         let ball = self.glass.and_then(|i| self.scene.get_renderable(i)).filter(|r| r.visible).map(|r| {
             let c = glam::Vec3::new(r.object.position.x, r.object.position.y, r.object.position.z);
-            (c - glam::Vec3::splat(BALL_RADIUS), c + glam::Vec3::splat(BALL_RADIUS))
+            (c - glam::Vec3::splat(self.config.glass_radius), c + glam::Vec3::splat(self.config.glass_radius))
         });
         if let Some(caustics) = self.volume.effect_mut::<RtCausticsEffect>() {
             caustics.update_lights(self.scene.lights());
@@ -1634,7 +1646,9 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         let mut ball = Renderable::new(sphere(), Material::standard_lit("Glass", &config.glass_material()));
         ball.rt = Some(RtSurface::glass(config.glass_tint));
         ball.cast_shadow = false;
-        ball.object.set_position(GLASS_REST[0], GLASS_REST[1], GLASS_REST[2]);
+        ball.object.position = glass_centre(config.glass_radius, 0.0);
+        let s = config.glass_radius / BALL_RADIUS;
+        ball.object.scale = Vec3::new(s, s, s);
         ball.visible = config.glass;
         glass = Some(scene.add(SceneNode::Renderable(ball)));
     }
