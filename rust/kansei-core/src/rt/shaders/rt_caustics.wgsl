@@ -17,7 +17,8 @@
 // (lux * scale), the weight and the weighted height. With `unoccluded`, the composite weighs each
 // light's layer by RtShadowsEffect's visibility at the surface, so the photons pass whatever
 // stands between the light and the caster (that visibility has it). Prefixed with the grid's
-// library (its bindings in group 1), RT_OPAQUE_WGSL and rt_caustics_lookup.wgsl.
+// library (its bindings in group 1), RT_OPAQUE_WGSL, rt_caustics_lookup.wgsl and the water's
+// ripples (simulations::fluid::WATER_RIPPLES_WGSL).
 
 struct CausticsParams {
     taskCount    : u32,
@@ -36,9 +37,10 @@ struct CausticsParams {
     tintDistance : f32,
     // 1: the photons start at their caster's box (see above)
     unoccluded   : u32,
+    // the rippled casters' ripples (TASK flag 2): their time (seconds) and amount
+    time         : f32,
+    ripples      : f32,
     _pad0        : u32,
-    _pad1        : u32,
-    _pad2        : u32,
 }
 
 // A light's photons at a caster: kind 0 a directional light (along axis through the plane origin
@@ -71,7 +73,9 @@ struct CausticTask {
     light    : u32,
     bias     : f32,
     layer    : u32,
-    _pad0    : u32,
+    // 1: the light passing straight on is not taken away (TASK_ADD_ONLY); 2: its glass's
+    // horizontal faces carry the water's ripples (TASK_RIPPLED, kansei_water_ripples)
+    flags    : u32,
 }
 
 // a tile's texel weight in fixed point
@@ -280,7 +284,7 @@ fn photons(@builtin(global_invocation_id) gid : vec3u, @builtin(num_workgroups) 
     spread *= 2.0;
     // straight on through no glass: the direct light the glass changes, taken away
     let straight = kansei_rt_trace(h0, d, 0.0, cp.maxDistance, KANSEI_RT_SOLID);
-    if (straight.found && straight.normal.y > 0.2) {
+    if (straight.found && straight.normal.y > 0.2 && (task.flags & 1u) == 0u) {
         let p = h0 + d * straight.t;
         if (!inCaster(p)) {
             deposit(task.tile, task.layer, p, -flux * straight.normal.y, apart + spread * (first.t + straight.t));
@@ -319,7 +323,14 @@ fn photons(@builtin(global_invocation_id) gid : vec3u, @builtin(num_workgroups) 
             return;
         }
         let entering = front;
-        let m = kansei_rt_shading_normal(hit.triangle, hit.bary, hit.normal);
+        var m = kansei_rt_shading_normal(hit.triangle, hit.bary, hit.normal);
+        if ((task.flags & 2u) != 0u && abs(m.y) > 0.5) {
+            // the water's ripples, on the side the photon meets
+            let up = select(-m, m, m.y > 0.0);
+            let s = kansei_water_ripples(h.xz, cp.time) * cp.ripples;
+            let r = normalize(up - vec3f(s.x, 0.0, s.y));
+            m = select(-r, r, m.y > 0.0);
+        }
         let etaI = select(1.0, cp.glassIor, depth > 0u);
         let etaT = select(select(cp.glassIor, 1.0, depth <= 1u), cp.glassIor, entering);
         let f = fresnelDielectric(clamp(-dot(dir, m), 0.0, 1.0), etaI, etaT);

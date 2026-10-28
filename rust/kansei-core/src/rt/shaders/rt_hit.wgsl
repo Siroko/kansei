@@ -24,6 +24,8 @@ const KANSEI_RT_ANY_HIT : u32 = 1u;
 const KANSEI_RT_SOLID : u32 = 2u;
 // glass triangles (KANSEI_RT_GLASS) are hit; without it rays pass straight through them
 const KANSEI_RT_GLASS_HITS : u32 = 4u;
+// coarse copies of surfaces drawn finely (KANSEI_RT_APPROXIMATE) are passed through
+const KANSEI_RT_NO_APPROXIMATE : u32 = 8u;
 const KANSEI_RT_BARY_EPSILON : f32 = 1e-6;
 
 fn kansei_rt_bounds_min() -> vec3f {

@@ -29,11 +29,12 @@ fn kansei_rt_trace(o: vec3f, d: vec3f, tMin: f32, tMax: f32, flags: u32) -> Kans
     }
     let solid = (flags & KANSEI_RT_SOLID) != 0u;
     let glassHits = (flags & KANSEI_RT_GLASS_HITS) != 0u;
+    let noApproximate = (flags & KANSEI_RT_NO_APPROXIMATE) != 0u;
     var rayFlags = RAY_FLAG_NONE;
     if ((flags & KANSEI_RT_ANY_HIT) != 0u) {
         rayFlags |= RAY_FLAG_TERMINATE_ON_FIRST_HIT;
     }
-    if (solid && glassHits) {
+    if (solid && glassHits && !noApproximate) {
         // nothing to decide per candidate
         rayFlags |= RAY_FLAG_FORCE_OPAQUE;
     }
@@ -45,6 +46,9 @@ fn kansei_rt_trace(o: vec3f, d: vec3f, tMin: f32, tMax: f32, flags: u32) -> Kans
         let id = c.primitive_index;
         let surface = kansei_rt_surface(id);
         if ((surface & KANSEI_RT_GLASS) != 0u && !glassHits) {
+            continue;
+        }
+        if ((surface & KANSEI_RT_APPROXIMATE) != 0u && noApproximate) {
             continue;
         }
         if ((surface & KANSEI_RT_ALPHA) != 0u && !solid) {

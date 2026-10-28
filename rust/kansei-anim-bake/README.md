@@ -78,7 +78,8 @@ with a config that has a `character` section (see `src/main.rs`).
 
 Traversals, jumps, falls and landings are played on command, not found by the search. Name them
 in the config's `actions`, by kind (`hurdle`, `vault`, `mantle`, `climb`, `jump`, `fall`,
-`land`). They get only `ACTION_TAG`, so the search skips them, and the pack stores what
+`land`, and for the parkour moves' poses `barhang`, `barswing`, `pullup`, `hangidle`, `shimmy`,
+`wallrun`: nothing is read from those but the clip). They get only `ACTION_TAG`, so the search skips them, and the pack stores what
 `motion_matching::traversal::ActionClip::analyze` reads from each:
 - the obstacle's height, from the root joint, which rides the surface the character is on;
 - its front ledge, from the hands planted on its top (`joints.left_hand`/`right_hand`);

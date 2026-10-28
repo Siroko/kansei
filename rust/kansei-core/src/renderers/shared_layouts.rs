@@ -20,6 +20,51 @@ pub struct SharedLayouts {
     /// Group 2 of cluster pipelines (`clusters::ClusterLod`): `mesh_bgl`'s matrices, then the
     /// packed cluster mesh, the view's draw list and the instance records (vertex-stage storage).
     pub cluster_mesh_bgl: wgpu::BindGroupLayout,
+    /// What materials with the same WGSL, bindings and options share: one shader module, layout
+    /// and set of pipelines for all of them (`Material` looks here before compiling), so a hundred
+    /// parts of one model, each its own `Material` for its own uniforms and textures, cost one
+    /// program.
+    pub programs: std::sync::Arc<MaterialPrograms>,
+}
+
+/// A program materials share: its module and layouts.
+#[derive(Clone)]
+pub struct MaterialProgram {
+    pub module: wgpu::ShaderModule,
+    pub material_bgl: wgpu::BindGroupLayout,
+    pub pipeline_layout: wgpu::PipelineLayout,
+    pub depth_pipeline_layout: wgpu::PipelineLayout,
+}
+
+/// The programs and pipelines materials share (`SharedLayouts::programs`), by the hash of their
+/// WGSL, bindings and options, and the pipelines by that and what else made them.
+#[derive(Default)]
+pub struct MaterialPrograms {
+    programs: std::sync::Mutex<std::collections::HashMap<u64, MaterialProgram>>,
+    pipelines: std::sync::Mutex<std::collections::HashMap<(u64, String), wgpu::RenderPipeline>>,
+}
+
+impl MaterialPrograms {
+    /// The program for `key`, made by `make` the first time.
+    pub fn program(&self, key: u64, make: impl FnOnce() -> MaterialProgram) -> MaterialProgram {
+        let mut programs = self.programs.lock().unwrap();
+        programs.entry(key).or_insert_with(make).clone()
+    }
+
+    /// The pipeline of program `key` that `what` describes, made by `make` the first time.
+    pub fn pipeline(&self, key: u64, what: String, make: impl FnOnce() -> wgpu::RenderPipeline) -> wgpu::RenderPipeline {
+        if let Some(p) = self.pipelines.lock().unwrap().get(&(key, what.clone())) {
+            return p.clone();
+        }
+        let p = make();
+        self.pipelines.lock().unwrap().insert((key, what), p.clone());
+        p
+    }
+
+    /// How many programs and pipelines are shared.
+    pub fn counts(&self) -> (usize, usize) {
+        (self.programs.lock().unwrap().len(), self.pipelines.lock().unwrap().len())
+    }
 }
 
 impl SharedLayouts {
@@ -242,6 +287,6 @@ impl SharedLayouts {
             entries: &[matrix(0), matrix(1), storage(2), storage(3), storage(4)],
         });
 
-        Self { camera_bgl, mesh_bgl, shadow_bgl, cluster_mesh_bgl }
+        Self { camera_bgl, mesh_bgl, shadow_bgl, cluster_mesh_bgl, programs: Default::default() }
     }
 }

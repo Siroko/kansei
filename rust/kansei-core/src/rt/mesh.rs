@@ -64,6 +64,28 @@ impl RtMesh {
     }
 }
 
+/// A mesh for the grid that the GPU writes (`Renderable::rt_mesh`): a STORAGE buffer of
+/// `RtMesh::gpu_words` whose vertices (and indices) a compute pass rewrites in place, the
+/// triangles it has room for, and bounds holding every place they may move to. A triangle with a
+/// NaN vertex (or none of an area) is left out of the grid.
+#[derive(Clone, Debug)]
+pub struct RtGpuMesh {
+    pub buffer: wgpu::Buffer,
+    pub triangles: u32,
+    pub min: Vec3,
+    pub max: Vec3,
+}
+
+impl RtGpuMesh {
+    /// `mesh`'s words in a buffer a compute pass may write (STORAGE), with `mesh`'s triangle count
+    /// and the bounds given.
+    pub fn new(device: &wgpu::Device, label: &str, mesh: &RtMesh, min: Vec3, max: Vec3) -> Self {
+        use wgpu::util::DeviceExt;
+        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(label), contents: bytemuck::cast_slice(&mesh.gpu_words()), usage: wgpu::BufferUsages::STORAGE });
+        Self { buffer, triangles: mesh.triangle_count(), min, max }
+    }
+}
+
 /// A unit vector, octahedral, as WGSL's `pack2x16snorm` packs the two coordinates
 /// (`kansei_rt_unpack_normal` reads it).
 fn pack_octahedral(n: [f32; 3]) -> u32 {

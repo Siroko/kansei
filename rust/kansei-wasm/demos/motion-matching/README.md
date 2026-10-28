@@ -16,6 +16,12 @@ the clip tools.
 `www/kimodo.html` is a second page on the same module, for packs of generated clips (see
 [Generated animation (Kimodo)](#generated-animation-kimodo)).
 
+`www/room.html` is a third, the same character in a furnished room lit by ray-traced direct
+light and global illumination, with mirrors, a glass dragon, an aquarium of SPH water, furniture to vault and
+climb, fog and dust (see
+[The room](#the-room)). The character and its controls are shared by the pages (`src/character.rs`,
+`src/player.rs`); the room is `src/room/`.
+
 ## A pack
 
 Bake one from glTF clips and a skinned mesh with [`kansei-anim-bake`](../../../kansei-anim-bake/README.md).
@@ -111,12 +117,306 @@ character is in it:
   of it: E, the gamepad's X, or a click on its prompt; R (Y) by it drains the lake.
 - **The mill** (`at=18,2.6,110` looks along the shore at it) turns in the north shallows.
 
+## The room
+
+`www/room.html` (`start_room`) puts the character in a 32 x 28 m loft gallery, 8 m high
+(`src/room/`), authored in Blender and loaded from `www/assets/room/room.glb` (see
+[The room's source](#the-rooms-source)). It loads the same packs as `www/index.html`
+(`www/pack/`, `pack=`, `hero=`). Without one a capsule stands in for the character (drawn by the
+same skinned material, in the mirrors and the shadows) under the HUD's "no motion pack" message,
+and the room renders as it does with one.
+
+- **The room.** A polished concrete floor, white plaster walls and a red brick one to the east,
+  four tall steel-framed windows to the west, a 6 x 12 m skylight in a board-formed concrete
+  ceiling crossed by steel I-beams, four concrete columns; a lounge in the windows' light, a
+  dining table under a pendant, steel shelves, a kitchen island, sculptures on white plinths, three
+  canvases, the glass dragon on a marble drum under the skylight, the aquarium by the windows and
+  a parkour course (`layout.rs` reads it all from the glb). Its 107k triangles are drawn as a mesh
+  per material (47 draws), the surfaces PBR (`pbr.rs`: colour, normal, occlusion/roughness/
+  metallic) on the uvs Blender gives them (tiling ones box-mapped there by a geometry-nodes
+  modifier), with a slow noise over metres against the tiling.
+- **The light.** A low sun (9000 lx at 24°, 3600 K) through the windows, the skylight (a cool
+  7500 K spot light whose emitter is the 6 x 12 m opening, 32000 cd), four warm 2700 K lamps
+  under glowing shades (three floor lamps and the dining table's pendant), a narrow display spot
+  on the dragon from a beam 10 m behind it (1.5 Mcd, 11°, about 7000 lx on the plinth: a
+  theatre's follow spot, else its pool and the dragon's caustics drown in the skylight's; a 3 cm
+  emitter: sharp shadows and caustics; `display_spot`, `display_cd`), low enough that the dragon's
+  light falls forward on the plinth's top, and the sky the
+  windows show, which also lights the rays leaving through them (`SkyLighting`, its SH built on
+  the CPU from the gradient). Exposure EV100 9, AgX.
+- **Ray-traced direct light** (`kansei_core::rt::RtShadowsEffect`, new with this page). Surfaces
+  that leave their direct light to it (`kansei_gbuffer_out_rt_lit`: the emissive alpha holds their
+  roughness) are lit by the sun and every spot light with shadow rays through the grid of
+  triangles: toward a point of the sun's disk (`sun_soft`, 1.2° by default), of a spot light's disk
+  or of a rectangle (the skylight, `set_rect_emitter`), so penumbras widen with distance from the
+  occluder as an area light's do. One ray per light per 2 x 2 pixels (`shadow_res=full` for every
+  pixel), accumulated over frames and filtered (an à-trous wavelet with depth and normal stops),
+  upsampled by depth and normal; then Lambert plus a GGX specular toward the emitter's point
+  nearest the reflected ray (on surfaces the traced reflections don't cover). Short screen-space
+  rays (`contact_length`, 25 cm) add the contacts the 30 cm grid misses: chair legs, the feet.
+  `shadows=maps` goes back to shadow maps (cascades and the spot lights' PCSS atlas) in the
+  materials. Its debug views (`rt_view=visibility|direct|mask`) show one light's visibility, the
+  direct light alone and which pixels it lights.
+- **The GI.** The hybrid by default (`RtDiffuseGiEffect`: a ray for each 2 x 2 pixels through the
+  grid, the hits lit by the lights, shadowed by the maps, `gi_shadows=rays` for rays, and a voxel
+  cone, SVGF 3 x 3), over voxel GI's volume of the room. G (or `gi=`) cycles the others: voxel
+  cones (`voxel`), voxel cones with screen-space GI in front for the near field (`voxel+ssgi`,
+  `VoxelGIOptions::near_field`), irradiance probes traced in the volume's distance field
+  (`probes`, `SceneVoxelGi::enable_probes`; `probe_spacing` in voxels, 6 by default, and
+  `probes_per_frame`, 0 for all, in the panel), the probes with the screen-space near field
+  (`probes+ssgi`), screen space alone (`ssgi`, dark here: it bounces only what is on screen) and
+  none. All read the same exposure. The volume sees the window sky past it
+  (`use_sky_lighting`), for the cones and the probes' rays that leave through the windows. The
+  probe lattice puts probes in the volume's half-metre margin outside the one-sided walls and
+  above the ceiling, where they see the sky; at the default backface limit (0.25) the lookups
+  reached them through the one-voxel shell and lit a band along the top of the walls. Those
+  probes see the shell's back faces, so the room drops them at 0.1. The room's materials add no
+  sky ambient of their own, so the effects take none out (`ambient: 0`). In the probe modes the
+  volume is lit every third frame (`SceneVoxelGi::lighting_interval`: the probes blend its light
+  over tens of frames anyway) and the probes are looked up at half resolution and upsampled
+  (`Probes/Apply`; their update is `Probes/Update`): the GI's passes 2.0-2.5 to 1.1 ms with
+  `probes`, 3.8-4.1 to 3.0-3.2 with `probes+ssgi` (the screen-space trace 1.2 of it).
+- **Reflections and glass.** The marble, the lacquered wood, a mirror on the north wall and a
+  brushed one (roughness 0.1) on the east wall reflect through `RtReflectionsEffect`, and the glass
+  Stanford dragon (index of refraction 1.5) through its glass pass. Only glossy pixels (roughness
+  under 0.45) take traced reflections: a rough lobe's few rays come out as speckle, and its blur is
+  what the lights' GGX and the GI give anyway. A reflected point the camera also sees takes the
+  lit image there (sharp, with every light and the GI); the effect checks it is the same surface
+  (position and normal), and where something thin in front hides it (a leg over the floor) it
+  takes the same surface a few pixels aside, so the floor in the mirror doesn't streak behind
+  each leg. The other hits are lit by the lights (shadow rays) and voxel GI, textured: the
+  surfaces' colour maps and the hero's base colour are drawn into a 256-texel array
+  (`assets::albedo_array`), each surface's grid triangles carry their box-mapped uvs and a layer
+  (`RtSurface::with_albedo_layer`), and `RtReflectionsEffect::set_albedo_texture` reads it, a
+  hit's albedo the surface's mean times the texel over the layer's mean. The surfaces' means are
+  measured from the textures at start, for the grid and voxel GI alike.
+- **The water, ray traced** (`fluid_render=rt`, the default; `screen` draws it with the old
+  screen-space composite). The aquarium's water surface (its marching-cubes mesh) goes into the GBuffer as
+  glass (`FluidSurfaceEffect::surface_renderable_glass`, index of refraction 1.33, a turquoise tint
+  a metre, small wind ripples on its normal, `fluid_ripples`), and the glass pass refracts through
+  it like the dragon: Beer-Lambert in the water to the tank's stones and the room behind it in
+  the grid. Surfaces marked `kansei_self_lit` light themselves there (`RtSurface::with_self_lit`):
+  the pass reads them from the GBuffer's background image (the scene before the water was drawn)
+  plus a wide voxel cone for its indirect light, not tracing its lights. The water is in the grid too, as
+  glass: `FluidHeightfield` finds the top of the fluid in each column of its density field (spray
+  left out) and writes a mesh 30 cm apart over it (`Renderable::rt_mesh`), coarse because the
+  grid's cost is triangles a cell, marked `RtSurface::with_approximate` so the glass pass doesn't
+  bend twice at it; the mirrors show the water through it, and the caustics' photons refract at
+  it, rippled as the glass material is. Its reflection is traced with the other surfaces' (`RtGlass::
+  reflections_in_trace`: half resolution, accumulated), and the glass pass traces half the glass
+  pixels a frame (`RtGlass::checkerboard`, the others from the traced ones beside them):
+  together they took the glass pass from 34 to 4.6 ms in `dragon`. The tank's panes are not
+  traced (two more interfaces a pixel: the glass pass took 27 ms with the tank filling the screen):
+  the water's own surface refracts at its walls, a thin steel frame round it.
+- **Caustics** (`kansei_core::rt::RtCausticsEffect`; `caustics`). Each glass caster has a tile
+  of its own round it (the dragon's box, and a slab round the water's surface: a caster's box takes
+  what lands inside it for its own core, and the tank's bed must keep the light), a texel about a
+  pixel wide where it is on screen, reaching 1.2 m below it (the tank's bed and the floor round
+  its stand). The sun and the spot lights send photons at each caster from points of their
+  emitters (`caustics_area`; the skylight from its opening): refracted through the glass
+  (Fresnel, absorption, total internal reflection), they add their light where they land, and the
+  same photons taken straight on take it away where the direct light lands, so the tile holds
+  what the glass changes: the light it focuses on the plinth and the shadow it leaves, weighed by
+  the RT shadows' visibility of each light. A still caster's tile accumulates 64 frames and then
+  stops. The water's is a game's: its photons bend at the glass material's wind ripples too
+  (`RtCausticsEffect::set_rippled`: the grid's copy of the surface is too coarse to focus
+  anything), its tile never settles (`set_changing`, the last two feeds), and it only adds the
+  light it focuses (`set_add_only`: the tank's panes aren't in the grid, so the light it would take
+  from the floor beyond comes in through them). The caustics are added to the surfaces
+  `RtShadowsEffect` lights, on screen, and at the reflections' and the glass's hits
+  (`RtReflectionsEffect::set_caustics`, the map set each frame: it grows with the casters).
+  Physical, the glass's light is a faint dappling: `game` takes it 3x as bright with its splats
+  half as wide (`caustics_glass_gain`, `caustics_sharpen`; `focus_gain`, `focus_sharpen`). Fed
+  every other frame while they accumulate (`caustics_every`), four times as seldom with the tank
+  and the dragon out of view: 0.6-1.2 ms.
+- **The water's surface and box** (the panel's Fluid → surface resolution & box; `room.info().fluid`
+  reads back what it is built at). The surface is interpolated marching cubes over a surface field
+  of `fluid_res` voxels along the box's longest side (256: 72 x 91 x 256 voxels of 1.6 cm over
+  the tank's 1.15 x 1.45 x 4.1 m box), at most `fluid_mc_max` triangles (500000), a lone particle a droplet
+  of `fluid_drop` (4.1 cm) and each splatted over `fluid_splat` (13.6 cm, the smoothing); the
+  ray tracing grid's copy is a height-field mesh `fluid_rt_spacing` apart (30 cm, 4 x 14
+  vertices). The box (`fluid_min_x` ... `fluid_max_z`, world metres, the tank's own unless the URL
+  names it; `fluid_bounds_show` draws it) is the simulation's bounds and the surface's. A change
+  makes the field, the marching cubes, the height field and the grid's copy again, live (a slider
+  sends when let go); a new box also refits the simulation's neighbour grid and fills the tank
+  again with the water within it (squeezed in instead, the water outside blew up). The droplet
+  and splat radii are live. Cost with the water running (`dragon`, `fluid_rest=0`): 128 voxels
+  24.8 ms, 192 25.3, 256 27.1, 320 28.7, 384 32.7; the grid's mesh at 15 cm +0.6 ms (its triangles
+  in the reflections' and the glass's traces), 50 cm the same as 30; the triangles' cap costs
+  nothing until the surface needs them. At rest (the default) the surface isn't extracted, so
+  its resolution costs nothing per frame.
+- **Glass and water quality** (the panel's preset, `quality=`). `game` (the default): the
+  checkerboard, the glass's reflections at half resolution, the glass's caustics 3x and sharper,
+  photons from the lights' centres, every other frame. `high`: every glass pixel and its own
+  reflection, physical caustics from the lights' emitters, every frame.
+- **Furniture** from Poly Haven, CC0 (lounge and arm chairs, an ottoman, coffee and side tables,
+  a pendant, stools, steel shelves, a cabinet, plants, vases, pillows, five sculptures), decimated
+  in Blender (a live Decimate modifier each), and pieces modelled there (the sofa, the tables, the
+  floor lamps, the aquarium, the plinths). Each model with more than 500 triangles has a
+  `_SHADOW` copy of about 400: it casts the shadow maps' shadows and is what the ray tracing grid
+  traces (24.8k triangles in all: the furniture's full meshes in the grid had cost the rays half
+  again). Colliders are the glb's `_COL` boxes.
+- **Parkour.** The north-east blocks (a crate, a rail, a block, a two-block stack, a 2.2 m
+  platform behind a step, two ledges with a gap), the island, a bench and the dragon's drum:
+  Space vaults, hurdles, mantles and climbs them as on the course. The south-east is the
+  [parkour course](#parkour), tagged in the glb (`kansei_traversal`): four platforms with
+  1.0-1.4 m gaps to jump (`platform`, a chain in order), a 2.8 m tower whose top edges are ledges
+  to hang from and shimmy round (`ledge`), a 5 m wall to run along (`wallrun`) and three bars to
+  swing from (`bar`). The page reads them into the controller's parkour
+  (`layout::parkour_pieces`, `ParkourFeatures::from_pieces`; the console logs how many edges,
+  bars, wall faces and platforms it found). `room_check()` (`room.check()`) probes each piece as
+  the traversal does and says whether it gets the traversal meant (the course's platforms:
+  mantle, the tower: climb; walls and bars not checked); all pass. `room_parkour()`
+  (`room.parkour()`) lists every tagged piece with its bounds and properties.
+- **One-sided walls.** The walls, the floor and the ceiling face in and discard their back faces,
+  so from outside (O, or `cam=outside`) the camera looks through them into the room. The grid hits
+  a triangle from either side, so the rays from inside meet the walls as they should. Thick boxes
+  outside keep the character in.
+- **The character in the rays.** The grid takes geometry as built, not as the vertex shader skins
+  it, so a low-poly copy of the body shown stands in for it there (`look::Proxy`, `grid_only`):
+  each body's mesh (the hero's, or the pack's mannequin) simplified to 1500 triangles
+  (`proxy_tris=` another count), keeping original vertices so their joints and weights still
+  apply, and skinned on the CPU with the shown body's palette whenever a bone has moved 3 cm
+  (`Geometry::revision` tells the grid). C switches the copy with the body. The hero's copy
+  carries its uvs and the base colour's layer, so the mirrors show its jacket, face and jeans: it
+  is simplified with its uv seams kept (`assets::simplify_seamed`; welded by position, the
+  triangles along the seams read the texture across the atlas and the mirrored face and jacket
+  came out mangled), letting a seam move only where the uvs on both sides agree, which reaches
+  1500 at the same cost (kept fixed, the seams stop it at about 2250, 1.5 ms more). The
+  mannequin's is welded, one colour with smooth normals. `proxy_view=1` draws the copy for the
+  camera beside the body, textured as the rays see it. They cast the ray-traced shadow, show in the
+  mirrors and the glass, and occlude the GI's rays. Walking, the grid rebuilds every frame
+  (about 0.8-1.6 ms); standing, never. `rt_body=0` leaves the copy out.
+- **The aquarium.** A 1 x 4 m tank on an oak and steel stand by the west windows, its water the
+  lake's SPH at its scale and tuning (30 780 particles, 85% full), the container the glb's
+  `AQUA_Water` box. It rests: culled out of view, asleep once its fastest particle is under
+  0.15 m/s. Running (`fluid_rest=0`) it costs about 1 ms of simulation a frame and its surface
+  extraction.
+- **Fog and dust.** A faint haze fills the room (a box `LocalFogVolume`), lit by the sun through
+  the cascades and the skylight through its map, so the windows throw shafts. 65536 dust motes
+  fill the room and drift in a slow curl flow (a compute shader), pushed by the character, drawn
+  from a sprite atlas a compute shader makes at startup (soft motes, fibres, flecks and bokeh
+  discs, with mips), tumbling, blurred into bokeh by the depth of field. They are lit only by
+  direct light through its shadows, so they show in the shafts and vanish in shade: the sun's
+  through the windows and through the skylight (the brightest, looking toward the sun), and the
+  core of each spot light's cone (the skylight's column, the lamps' pools; a wide spot lighting
+  every mote read as snow). `dust_bright` (2.5) is radiance per lux before the phase function,
+  calibrated at EV 9; `dust_count=` sets how many.
+- **Post.** TAA, depth of field focused on the character (or the screen's centre, or a distance),
+  bloom, AgX tone mapping with white balance, contrast, saturation, lift/gain, vignette, grain and
+  chromatic aberration, motion blur off by default.
+
+The panel (Tweakpane, P hides it, collapsed on small screens) holds every setting, its starting
+values from the URL: presets for the look (golden hour, midday, overcast, night lamps, gallery),
+the camera, the depth of field and the post-processing (neutral, warm cinematic, cool moody,
+filmic contrast, bleach bypass, vintage); a preset sets several controls and editing one makes it
+"custom". Its folders: Scene (the floor's roughness, mirrors, the dragon's glass), Lights, Shadows / GI
+/ reflections, Fog and dust, Fluid (the aquarium: simulate, show, sleep, SPH or PBF, the fill with a
+Reset button, time scale, substeps, the solvers' parameters, gravity, the legs' push, the
+surface's look; all live but the fill), Depth of field, Post-processing, Resolution (the canvas
+height, native to 540p, the pixel ratio and the scene's scale, TAA upscaling; kept in the URL)
+and Stats. `src/room/settings.rs` lists them all with their defaults: each is also a URL
+parameter of the same name (`?gi=voxel&ev=8.5`), and `room.set(name, value)` sets one
+live. `cam=` names a view, the glb's `CAM_<name>` cameras: `hall`, `dragon`, `aquarium`, `mirror`,
+`windows`, `lounge`, `dining`, `gallery`, `parkour`, `course`, `outside` and `caustics` (any other
+follows the character). `panel=0` and `hud=0` start without the panel and the text, for captures; `refl_screen=0` lights every reflected hit by the traced path (no lit-image lookups) and `refl_indirect=` scales the voxels' light at those hits with the hybrid GI on; `vox_sky=0` leaves the window sky out of the voxel volume; `aquarium=0`,
+`dragon=0`, `rt_body=0` leave those out; `lod_px=` is the dragon's cluster LOD error on screen (pixels, 1 by default; 0 the whole mesh) and `grid_lod_cm=` its cut's in the grid the glass refracts through (3 cm: about 3 900 of its 19 300 triangles); `perf=1` (or the backquote key, or Stats → performance overlay) shows kansei_wasm's performance overlay (fps, CPU and GPU ms with graphs, draws, triangles, pipelines, GPU memory; click it for every pass, the draws and triangles by pass and by material, memory by label and pipelines by material; `kanseiPerf.report()` gives them as data); `stats=1` shows each pass's GPU time and the CPU sections
+(also in `room.info()`), `profile=1` logs the profile every 3 s.
+
+Keys, on top of the shared ones: O inside / outside, G the GI, T the shadows, F the fog, N the dust,
+P the panel. On `window.room`: `info()`, `settings()`, `set(name, value)` and `check()`.
+
+### The room's source
+
+The room is a Blender scene kept outside this repository (its .blend, its textures and the
+scripts that made it: `room_build.py` builds it, `export_glb.py` exports it; the README there
+lists the contract below in full). Only the exported glb lands here, packed by
+`tools/room_glb.py`: each material's occlusion and metallic-roughness maps as one ORM image, every
+image encoded to KTX2 (Basis Universal: colour as ETC1S, normals and ORM as UASTC) with
+`rust/tools/ktx2`, through `KHR_texture_basisu` (encoded images cached by content, so a re-export
+encodes only what changed):
+
+```sh
+/Applications/Blender.app/Contents/MacOS/Blender -b room.blend --python export_glb.py
+python3 tools/room_glb.py <kansei-assets>/room/export/room.glb   # writes www/assets/room/room.glb
+```
+
+What the page reads from the glb (`layout.rs`), by names and custom properties (glTF extras):
+
+- every mesh, merged with the others of its material (and one-sided or not) into one renderable;
+- `<name>_COL`: a box in the collision world (the floor and thick walls outside are added);
+- `<name>_SHADOW` (a child): what its parent casts into the shadow maps and what the grid traces;
+- `<name>_CUT` (Blender's boolean cutters) and `kansei: preview` (Blender-only stand-ins): skipped;
+- `kansei`: `shell` (one-sided), `mirror` (`kansei_roughness`), `glass`, `aquarium` (the water's
+  box, `fill`), `caustics` (ignored: an older glb's caustics map; their tiles follow the casters
+  now), `dragon` (an empty: where, yaw,
+  `length`), `spawn` (an arrow: the character's start and heading);
+- materials: base colour × factor, normal map × strength, the ORM image, roughness factor, alpha
+  clip for cut-outs, emission; `kansei_reflective`, `kansei_macro`, `kansei_shade` (a lamp shade
+  that follows the lamp settings), `kansei_self_lit` on objects;
+- lights by `kansei_light`: `sun` (its direction sets `sun_elev`/`sun_azim` unless the URL does),
+  `skylight` (an area light: its `width`/`length` are the RT shadows' and caustics' emitter, the
+  first spot light), `lamp` (spot lights), `display` (the dragon's spot, the last); their
+  intensities and colours are the page's settings;
+- cameras `CAM_<name>`: the fixed views (`distance` the orbit's);
+- `kansei_traversal` on parkour pieces: `vault`, `hurdle`, `mantle`, `climb` (checked by
+  `room_check()` from `kansei_from` m south of the piece at `kansei_from_y`), and the course's
+  `platform` (`kansei_chain`, `kansei_chain_index`), `ledge` (`kansei_grab`, `kansei_corners`),
+  `wallrun` (`kansei_run_faces`, `kansei_run_axis`) and `bar` (`kansei_bar_height`,
+  `kansei_bar_axis`), listed by `room_parkour()`.
+
+The room: 107 347 triangles (architecture 1 200, furniture 105 463, parkour 384, mirrors 48,
+aquarium 252), 47 materials, 111 KTX2 images (25.7 MB; the glb 29.8 MB), 24.8k triangles in the
+grid. All CC0, listed in [`www/assets/room/LICENSE.md`](www/assets/room/LICENSE.md): models from
+[Poly Haven](https://polyhaven.com), surfaces from [ambientCG](https://ambientcg.com), the
+canvases and the rest modelled or made for it. The dragon is the GI box's (`www/assets/` links to
+`examples/gi-box/www/assets/`): "Stanford Dragon (Vrip)" by 3D graphics 101, CC-BY-NC-4.0. The
+page credits them.
+
+### What a frame costs
+
+1080p (`dpr=1`), M4 Pro, headless Chrome without vsync (`stats=1`, `perf=1`), the defaults
+(`game`: hybrid GI, ray-traced shadows, reflections and glass, caustics of the glass and the water,
+fog, dust, depth of field, TAA, bloom), no pack, the water asleep. The Blender room against the
+procedural one it replaced, alternated in one session (the GPU shared with other sessions: tens
+of percent between runs), GPU ms per frame:
+
+| view | procedural room | Blender room |
+|---|---|---|
+| `hall` | 16.9-19.2 | 19.6-19.8 |
+| `dragon` | 22.4-26.8 | 22.0-24.2 |
+| `mirror` | 14.3-17.1 | 18.0-18.9 |
+| `windows` | 13.1-14.5 | 17.6-19.1 |
+| `outside` | 12.8-12.9 | 13.4-15.1 |
+| draws / triangles a frame (`hall`) | 336 / 937k | 293 / 556k |
+| the GBuffer's triangles | 705k | 265k |
+
+The triangles drawn fell by 40% (the GBuffer's by 62%), but the grid is denser per cell (the room
+is smaller: 24.8k triangles in 110 x 36 x 100 cells against 29.4k in 140 x 36 x 140), so the
+rays cost more: the hybrid GI's trace 3.1-3.6 against 4.0-5.1 ms, the RT shadows' 0.8-0.9
+against 1.4-2.4. The aquarium is most of the rest: without it (`aquarium=0`) `mirror` is
+15.5 ms; in its own view (`aquarium`) it costs about 7 ms asleep (its glass pass, its photons,
+the rays through the grid's water) and 15-20 ms running (`fluid_rest=0`: the SPH steps about
+2-3 ms, the surface field and marching cubes, a moving grid). Its surface is 128 voxels along
+the tank (3.2 cm): at 256 the marching cubes' draw alone was 3-9 ms. Before the `_SHADOW`
+proxies stood in for the furniture in the grid it traced 43k triangles and `hall` was 21.6 ms;
+with the tank's panes traced as glass, its own view 54 ms.
+
+On `development`'s engine (wgpu 30, its `RtShadowsEffect` and `RtCausticsEffect`), against this
+page before it, alternated in one session (the water running): `hall` 37-39 against 28.5-29.4
+ms, `dragon` 34-39 against 30-32. Nearly all of it is the RT shadows' trace, 5.7-9.2 ms against
+1.4-2.4: the effect read each spot light's cone the wrong way round here (`SpotLight::cone` is
+outer, inner), so the lamps lit only their inner cone; now they light their whole 84 degrees, and
+the shadow rays toward them follow (the screen-space contact rays are not it: off, the same).
+Narrower lamp cones or a shorter `range` in the glb would win it back. The caustics cost less
+(0.6-1.2 ms against 1.3-2.1).
+
 ## Build and run
 
 ```sh
 cd rust/kansei-wasm/demos/motion-matching
 wasm-pack build --target web --release
-python3 -m http.server 8080   # then open http://localhost:8080/www/ (or www/kimodo.html)
+python3 -m http.server 8080   # then open http://localhost:8080/www/ (or www/kimodo.html, www/room.html)
 ```
 
 The crate builds with WASM SIMD (`.cargo/config.toml`), since the search runs on the CPU.
@@ -128,7 +428,8 @@ The crate builds with WASM SIMD (`.cargo/config.toml`), since the search runs on
 |---|---|---|
 | move (relative to the camera) | WASD, arrows | left stick (tilt sets the pace) |
 | run | Shift | B, right trigger |
-| jump, or traverse what is ahead | Space | A |
+| jump, or traverse what is ahead; by a wall, run along it; hanging, climb up; on a wall, jump off; on a bar, let go | Space | A |
+| let go (of a ledge or a bar), drop off a wall | X | right bumper |
 | strafe (face the camera's way) | Q | left bumper |
 | fire the water cannon (by it; hold to pour) | E, or click the prompt | X |
 | drain the lake (by the cannon) | R | Y |
@@ -172,6 +473,107 @@ URL parameters:
 - The lake's exports (the P panel's, `cannon_prompt()`, `cannon_fire(down)`, `lake_fill()`,
   `lake_regions()`) come from the lake crate and are in this module too: see the
   [lake's README](../lake/README.md).
+
+## Parkour
+
+On top of the traversals, the controller (`motion_matching::traversal::parkour`) does the moves a
+level tags for it (`traversal::features`: a glb node's `kansei_traversal`, read by
+`ParkourPiece::from_extras`; the room's course has them all):
+
+- **Platform to platform.** Space toward a `platform` (the next of its `kansei_chain` first) or any
+  top across a gap jumps at it: the run-up turns toward it and the take-off's speed is solved so
+  the arc lands a little in from its near edge, upward at the jump clip's own take-off speed (so
+  the body's rise carries on). The landing is picked by the pace the player asks for and must fit
+  on what it lands on (a run-out that would walk off a platform's far edge gives way to a
+  shorter one).
+- **Hanging from a ledge.** Climbing a tagged `ledge` stops hanging from it, and a fall or a jump
+  that brings the body to an edge catches it. The hang is the climb clip's own hanging frame
+  (`parkour::hang_poses`), held and breathing a frame either way, the hands pinned on the top and
+  the feet on the face below by IK (`MotionMatcher::reach`); with a `hangidle` clip in the pack
+  (generated, braced on the face or free, by its name's `Braced`) the hang settles into that loop
+  once still, placed by its hips. A/D (the stick to either side)
+  shimmy along the edge and round its outer corners, hands and feet stepping in turn, each pinned
+  where it lands; Space climbs up (the climb clip on from its hang, warped onto the edge); X lets
+  go. The climbs' and mantles' ledges are refined from the hands (`parkour::refine_grips`) so the
+  wrists grip the face rather than sink into the top, and hands that still sink into what they
+  vault or climb are pushed out of it. With air catches in the pack (`catch` actions: GASP's
+  `Traversal/Catch/*` clips, which fall onto a 3 m top and catch it), a fall onto an edge plays
+  the captured catch from just before the hands meet it into its hang (`Catch_Cliff`), and Space
+  climbs up with that clip's own climb.
+- **Air mantle.** Falling against the face of a top within a reach of the feet (0.1-0.9 m above
+  them, room to stand on it, not a ledge to hang from, not on a jump aimed elsewhere) catches it
+  and mantles up (`Catch_Mantle_*`: the one whose depth at the catch and pace fit, and whose
+  run-out stays on that top).
+- **Wall runs.** Running along a `wallrun` face (or jumping into it along it) and pressing Space
+  runs along the wall: the run loop at the wall-run speed, the body leaning away from the wall
+  about its feet, the planted feet pinned flat on it, the wall-side hand kept out of it; light
+  gravity at first, then more, up to 1.3 s; the lean comes off before the run ends. Space jumps
+  off, away from the wall (into another wall run, or a catch); X drops off.
+- **Bars.** A jump at a `bar` aims the hips through the place hanging from it puts them, and the
+  hands catch it as the body passes: the body swings about the bar as a damped pendulum, pumped
+  by W/S, the hands pinned to it. With bar clips in the pack (`barhang`, `barswing` actions:
+  generated, see [Generated animation](#generated-animation-kimodo)) the pose is the hang clip
+  still or the swing clip phase-locked to the pendulum (its frame from the swing's phase, the body
+  turned about the bar by what the pendulum swings beyond the clip); without them, the climb's
+  hanging frame swung as a whole. Space lets go at the swing's speed (hanging still, with a
+  `pullup` clip in the pack, it pulls up instead and hangs again after), X straight down.
+
+Every change of move keeps what shows continuous: the root's velocity (`MotionMatcher::
+blend_root`), its place and turn (`blend_position`, `blend_rotation`) ease out over a few frames
+instead of jumping, a catch onto a clip whose root sits elsewhere under the body re-roots it
+(`reroot`), and the pose is refreshed the frame the move starts (`refresh`).
+
+**The packs.** The moves work with the GASP pack as it is (`gasp-locomotion.kmm`): jumps, the
+hang, shimmy, corners and climbs come from its jump and climb clips; the wall run from its run
+loop; the bars from the climb's hang. The bar clips come from Kimodo
+(`kansei-anim-bake/genanim/prompts/parkour.json`, retargeted onto the mannequin, route B) and go
+into a private pack with the GASP clips, e.g. the GASP bake config plus:
+
+```json
+"export": ["export", "../genanim/export-parkour-b"],
+"include": ["...", "Jump/M_Neutral_Jump_F_Start_Across_*", "Jump/M_Neutral_Jump_F_Start_Sprint_*", "Parkour/Gen_*"],
+"actions": { "...": [], "barhang": ["Parkour/Gen_Bar_Hang_*"], "barswing": ["Parkour/Gen_Bar_Swing_*"],
+             "pullup": ["Parkour/Gen_Bar_PullUp_*"], "hangidle": ["Parkour/Gen_Hang_Idle_*"],
+             "shimmy": ["Parkour/Gen_Shimmy_*"], "wallrun": ["Parkour/Gen_Wall_Run_*"] }
+```
+
+GASP's air catches and its sprint and roll landings join the same pack (export them with
+`Traversal/Catch/*/M_Neutral_*` and `Jump/M_Neutral_*` in the export config):
+
+```json
+"export": ["export", "export-extras", "../genanim/export-parkour-b"],
+"actions": { "...": [], "land": ["...", "Jump/M_Neutral_Jump_F_Land_Sprint_*", "Jump/M_Neutral_Jump_F_Land_Roll_*"],
+             "catch": ["Traversal/Catch/Cliff/M_Neutral_*", "Traversal/Catch/Mantle/M_Neutral_*"] }
+```
+
+Captured hang clips from Mixamo (downloaded by hand, put on the mannequin by
+`kansei-anim-bake/mixamo`; Mixamo's terms forbid AI/ML use, so never into Kimodo) go into the same
+private pack:
+- `hangidle` takes its braced idle (`Hang_Idle_Braced_Against_Wall`) and free one (`Hang_Idle_Ledge`);
+- `shimmy` takes its braced and free shimmies. With shimmy clips in the pack, the shimmy plays the
+  one for the hang (braced or not, by `Braced` in its name) and the way it goes (`Left`/`Right`),
+  at the stick's pace, the hang moving along the edge at the clip's own speed.
+
+Their other clips (catches, hops, drops, climb-ups, wall runs, swings) are baked but not wired yet.
+
+(`wallrun` is baked but not played yet: the generated wall runs read as leaping beside the wall,
+so the GASP-based one stays; Kimodo's shimmies, which paddle their legs, are left out of `shimmy`;
+see the PR.) Packs with the new action kinds don't load in older builds or
+the TS port.
+
+**Testing it.** `render=forward` (the panel's render, top) draws the room with its direct lights
+and shadow maps and the post-processing only, no ray tracing and no GI (a flat fill in their
+place): the frame rate a character's animation is tuned at. `parkour_eval` measures the moves on a
+pack against the course (the room's, built in code), at 30, 60 and 120 fps and with 100 ms frame
+hitches: limbs off their targets, planted-foot slide, hands and feet inside the level, and pops
+(the largest jump in the hips', spine's and head's velocity over 1/30 s windows, against the
+run's 99th percentile; `clips=1` prints the captured clips' own, the floor: their take-offs reach
+1-3 m/s and their landings 4-9):
+
+```sh
+cargo run -p kansei-core --release --example parkour_eval -- <pack.kmm> [only=<name part>] [trace=1] [csv=<dir>] [clips=1]
+cargo run -p kansei-core --release --example pack_actions -- <pack.kmm> [track=<clip>] [clip=<clip>]
+```
 
 ## Foot slide
 

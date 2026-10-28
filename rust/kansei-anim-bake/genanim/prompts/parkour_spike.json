@@ -1,0 +1,84 @@
+{
+ "set": "parkour_spike",
+ "note": "End-effector constrained parkour (effectors.py): hands on a bar or ledge, feet on a wall, placed by geometry. Never put Epic GASP data in here (README.md).",
+ "model": "kimodo-soma-rp-v1.1",
+ "description": "A spike: can constraints make Kimodo's parkour touch what the level holds?",
+ "defaults": {
+  "samples": 2,
+  "seed": 4000,
+  "cfg": [
+   2.0,
+   2.0
+  ],
+  "diffusion_steps": 100,
+  "every": 5
+ },
+ "clips": [
+  {
+   "name": "Parkour/Bar_Hang",
+   "prompt": "A person hangs from a horizontal bar above their head with both hands, arms straight, legs hanging down, swaying slightly.",
+   "duration": 4.0,
+   "effectors": {
+    "kind": "bar_hang",
+    "height": 2.3,
+    "grip": 0.5
+   }
+  },
+  {
+   "name": "Parkour/Bar_Swing",
+   "prompt": "A person hanging from a horizontal bar with both hands swings their whole body forward and back like a pendulum.",
+   "duration": 5.0,
+   "effectors": {
+    "kind": "bar_swing",
+    "height": 2.3,
+    "grip": 0.5,
+    "amplitude": 0.6,
+    "period": 2.2,
+    "every": 2
+   }
+  },
+  {
+   "name": "Parkour/Shimmy_Left",
+   "prompt": "A person hangs from a ledge by both hands with their legs hanging down and shimmies sideways to their left, moving one hand at a time.",
+   "duration": 5.0,
+   "effectors": {
+    "kind": "shimmy",
+    "height": 2.3,
+    "grip": 0.5,
+    "step": 0.3,
+    "step_time": 0.9,
+    "direction": 1.0
+   }
+  },
+  {
+   "name": "Parkour/Wall_Run_Right",
+   "prompt": "A person runs along a wall on their right side, taking several steps on the wall with their body leaning away from it, then drops back to the ground and keeps running.",
+   "legs": [
+    {
+     "time": 0.6,
+     "speed": [
+      5.0,
+      5.0
+     ]
+    },
+    {
+     "time": 1.0,
+     "speed": 5.0
+    },
+    {
+     "time": 1.0
+    }
+   ],
+   "effectors": {
+    "kind": "wall_run",
+    "speed": 5.0,
+    "side": -1.0,
+    "lean": 0.8,
+    "start": 0.6,
+    "time": 1.0,
+    "step_time": 0.2,
+    "rise": 0.9
+   }
+  }
+ ]
+}

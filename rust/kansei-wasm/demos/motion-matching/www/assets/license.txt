@@ -1,0 +1,1 @@
+../../../../examples/gi-box/www/assets/license.txt

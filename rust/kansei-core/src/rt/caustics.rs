@@ -25,9 +25,10 @@ pub const RT_CAUSTICS_LOOKUP_WGSL: &str = include_str!("shaders/rt_caustics_look
 /// The photons' WGSL, through a grid traced by `backend` (its bindings in group 1).
 pub(crate) fn photons_wgsl(backend: RtBackend) -> String {
     super::hoist_wgsl_enables(&format!(
-        "{}\n{}\n{RT_OPAQUE_WGSL}\n{RT_CAUSTICS_LOOKUP_WGSL}\n{}",
+        "{}\n{}\n{RT_OPAQUE_WGSL}\n{RT_CAUSTICS_LOOKUP_WGSL}\n{}\n{}",
         backend.wgsl(),
         backend.bindings_wgsl(1, 0),
+        crate::simulations::fluid::WATER_RIPPLES_WGSL,
         include_str!("shaders/rt_caustics.wgsl")
     ))
 }
@@ -96,7 +97,9 @@ struct ParamsGpu {
     glass_tint: [f32; 3],
     tint_distance: f32,
     unoccluded: u32,
-    _pad: [u32; 3],
+    time: f32,
+    ripples: f32,
+    _pad: u32,
 }
 
 /// The WGSL `CausticTask`.
@@ -126,8 +129,14 @@ struct TaskGpu {
     light: u32,
     bias: f32,
     layer: u32,
-    _pad: u32,
+    /// TASK_ADD_ONLY
+    flags: u32,
 }
+
+/// `CausticTask::flags`: the light passing straight on is left as it is (`set_add_only`).
+const TASK_ADD_ONLY: u32 = 1;
+/// `CausticTask::flags`: its glass's upward faces carry the water's ripples (`set_rippled`).
+const TASK_RIPPLED: u32 = 2;
 
 /// The WGSL `KanseiRtCausticTile`.
 #[repr(C)]
@@ -253,6 +262,18 @@ fn footprint(lo: Vec3, hi: Vec3, lights: &[CausticLight], reach: f32) -> ([f32; 
     let centre = (lo + hi) * 0.5;
     let widest = (hi.x - lo.x).max(hi.z - lo.z).max(hi.y - lo.y).max(1e-4);
     let spread = 8.0 * widest;
+    // (only the spot lights that reach the box: within their range and cone, as the photons)
+    let half = 0.5 * (hi - lo).length();
+    let reaches = |light: &CausticLight| match *light {
+        CausticLight::Sun { .. } => true,
+        CausticLight::Spot { position: p, direction: d, range, cone: (outer, _), .. } => {
+            let to = centre - p;
+            let distance = to.length();
+            let angle = d.normalize_or(Vec3::NEG_Y).dot(to / distance.max(1e-6)).clamp(-1.0, 1.0).acos();
+            distance <= range && (distance <= half || angle <= outer + (half / distance).min(1.0).asin())
+        }
+    };
+    let lights: Vec<CausticLight> = lights.iter().copied().filter(reaches).collect();
     let mut grow = |p: Vec3| {
         let x = p.x.clamp(centre.x - spread, centre.x + spread);
         let z = p.z.clamp(centre.z - spread, centre.z + spread);
@@ -261,7 +282,7 @@ fn footprint(lo: Vec3, hi: Vec3, lights: &[CausticLight], reach: f32) -> ([f32; 
     for k in 0..8 {
         let q = Vec3::new(if k & 1 == 0 { lo.x } else { hi.x }, if k & 2 == 0 { lo.y } else { hi.y }, if k & 4 == 0 { lo.z } else { hi.z });
         for plane in [lo.y, lo.y - reach] {
-            for light in lights {
+            for light in &lights {
                 match *light {
                     CausticLight::Sun { direction: d, .. } => {
                         if d.y < -1e-3 {
@@ -269,7 +290,10 @@ fn footprint(lo: Vec3, hi: Vec3, lights: &[CausticLight], reach: f32) -> ([f32; 
                         }
                     }
                     CausticLight::Spot { position: p, .. } => {
-                        if p.y > q.y + 1e-4 {
+                        // (not from a light hardly above the corner: within 15 degrees of level
+                        // it throws the corner across the room, light that mostly glances off
+                        // the glass and lands spread thin)
+                        if (p.y - q.y) > 0.26 * (q - p).length() {
                             grow(p + (q - p) * ((plane - p.y) / (q.y - p.y)));
                         }
                     }
@@ -329,6 +353,9 @@ struct Planner {
     fed_lights: Vec<CausticLight>,
     tiles: Vec<Option<Tile>>,
     frame: u32,
+    /// the casters whose glass changes inside a still box (`RtCausticsEffect::set_changing`):
+    /// their tiles' history held at this many frames
+    changing: Vec<Option<u32>>,
 }
 
 impl Planner {
@@ -392,6 +419,9 @@ impl Planner {
                 tile.history = 0;
             }
             (tile.lo, tile.hi, tile.live) = (lo, hi, true);
+            if let Some(&Some(frames)) = self.changing.get(k) {
+                tile.history = tile.history.min(frames);
+            }
             let due = tile.history == 0 || self.frame.is_multiple_of(interval.max(1));
             if tile.history < options.max_history.max(1) && due {
                 fed.push((k, 1.0 / (tile.history + 1) as f32));
@@ -484,6 +514,10 @@ pub struct RtCausticsEffect {
     /// left after: 1, as the glass's own (`kansei_gbuffer_out_glass`); a centimetre for a marble's
     /// coloured core to colour its light.
     pub tint_distance: f32,
+    /// The rippled casters' (`set_rippled`) ripples: their amount (1: as `FluidGlassSurface`'s)
+    /// and their time (seconds; the glass material's, so both see the same surface).
+    pub ripples: f32,
+    pub time: f32,
     options: RtCausticsOptions,
     grid: RtGridHandle,
     casters: Vec<(Vec3, Vec3)>,
@@ -493,6 +527,10 @@ pub struct RtCausticsEffect {
     /// lights)
     shadow_slots: Vec<u32>,
     rects: Vec<(usize, [f32; 2])>,
+    /// the casters that only add light (`set_add_only`) and those whose glass ripples
+    /// (`set_rippled`)
+    add_only: Vec<bool>,
+    rippled: Vec<bool>,
     visibility: Option<RtShadowVisibility>,
     /// whether last frame's photons were weighed by the visibility (and so left the occluders
     /// between the lights and the casters to it)
@@ -527,6 +565,8 @@ impl RtCausticsEffect {
             focus_gain: 1.0,
             focus_sharpen: 1.0,
             tint_distance: 1.0,
+            time: 0.0,
+            ripples: 1.0,
             options,
             grid,
             casters: Vec::new(),
@@ -534,6 +574,8 @@ impl RtCausticsEffect {
             lights: Vec::new(),
             shadow_slots: Vec::new(),
             rects: Vec::new(),
+            add_only: Vec::new(),
+            rippled: Vec::new(),
             visibility: None,
             weighted: false,
             planner: Planner { tiles: vec![None; RT_CAUSTICS_MAX_CASTERS], ..Default::default() },
@@ -640,6 +682,41 @@ impl RtCausticsEffect {
         self.visibility = visibility;
     }
 
+    /// The `caster`th caster's glass changes inside its still box (a fluid's surface in the grid,
+    /// rippling): its tile never settles but keeps taking photons (every `interval` frames),
+    /// blended over about the last `frames` (at least 1). `None`: it settles as the others.
+    pub fn set_changing(&mut self, caster: usize, frames: Option<u32>) {
+        if caster >= RT_CAUSTICS_MAX_CASTERS {
+            return;
+        }
+        self.planner.changing.resize(RT_CAUSTICS_MAX_CASTERS, None);
+        self.planner.changing[caster] = frames.map(|f| f.max(1));
+    }
+
+    /// The `caster`th caster only adds the light its glass focuses: the light passing straight on
+    /// is not taken away where it lands. For an open surface over a body whose sides the grid
+    /// doesn't hold (water in a tank whose panes aren't traced): the light its photons would take
+    /// from beyond it comes in through those sides. Not physical (the light focused is added on
+    /// top), a game's water.
+    pub fn set_add_only(&mut self, caster: usize, on: bool) {
+        if caster < RT_CAUSTICS_MAX_CASTERS {
+            self.add_only.resize(RT_CAUSTICS_MAX_CASTERS, false);
+            self.add_only[caster] = on;
+        }
+    }
+
+    /// The `caster`th caster's glass is water: its faces that look up or down bend the photons as
+    /// the water's wind ripples (`simulations::fluid::WATER_RIPPLES_WGSL`, `ripples` of them, at
+    /// `time`) too, so its caustics are their net of lines, moving with them (with
+    /// `set_changing`, as the glass material's ripples do; a coarse copy of a fluid's surface in
+    /// the grid focuses nothing itself).
+    pub fn set_rippled(&mut self, caster: usize, on: bool) {
+        if caster < RT_CAUSTICS_MAX_CASTERS {
+            self.rippled.resize(RT_CAUSTICS_MAX_CASTERS, false);
+            self.rippled[caster] = on;
+        }
+    }
+
     /// Clear every tile: their photons start over.
     pub fn clear(&mut self) {
         for tile in self.planner.tiles.iter_mut().flatten() {
@@ -721,6 +798,8 @@ impl RtCausticsEffect {
             let corners: Vec<Vec3> = (0..8).map(|i| Vec3::new(if i & 1 == 0 { lo.x } else { hi.x }, if i & 2 == 0 { lo.y } else { hi.y }, if i & 4 == 0 { lo.z } else { hi.z })).collect();
             let texel = tile.texel(self.options.texel);
             let bias = (1e-3 * (hi - lo).length()).max(1e-5);
+            let flag = |set: &[bool], bit| if set.get(k).copied().unwrap_or(false) { bit } else { 0 };
+            let flags = flag(&self.add_only, TASK_ADD_ONLY) | flag(&self.rippled, TASK_RIPPLED);
             let side_for = |across: f32| ((across / texel * self.options.photons_per_texel).ceil() as u32).clamp(8, self.options.photons.clamp(8, 1024));
             for (index, light) in self.lights.iter().enumerate() {
                 match *light {
@@ -763,6 +842,7 @@ impl RtCausticsEffect {
                             light: index as u32,
                             bias,
                             layer: k as u32 * lights + index as u32,
+                            flags,
                             ..Default::default()
                         });
                     }
@@ -851,6 +931,7 @@ impl RtCausticsEffect {
                             light: index as u32,
                             bias,
                             layer: k as u32 * lights + index as u32,
+                            flags,
                             ..Default::default()
                         });
                     }
@@ -1080,7 +1161,9 @@ impl PostProcessingEffect for RtCausticsEffect {
             glass_tint: self.glass.1,
             tint_distance: self.tint_distance.max(1e-6),
             unoccluded: self.weighted as u32,
-            _pad: [0; 3],
+            time: self.time,
+            ripples: self.ripples.max(0.0),
+            _pad: 0,
         };
         let gpu = self.gpu.as_mut().unwrap();
         queue.write_buffer(&gpu.params, 0, bytemuck::bytes_of(&params));
@@ -1255,5 +1338,44 @@ mod tests {
         let before = step(&[marble(0.003)], &moved, 11).1.unwrap();
         let after = step(&[marble(0.004)], &moved, 12).1.unwrap();
         assert_eq!((before.min, before.dims, before.level), (after.min, after.dims, after.level));
+    }
+
+    #[test]
+    fn spot_lights_that_miss_the_caster_leave_its_footprint_alone() {
+        let (lo, hi) = (Vec3::new(-0.5, 1.0, -0.5), Vec3::new(0.5, 1.2, 0.5));
+        let over = vec![spot(Vec3::new(0.0, 3.0, 0.0))];
+        let alone = footprint(lo, hi, &over, 1.0);
+        // a lamp beside it, level with it and pointing down (its light grazes the box), and one
+        // out of range
+        let lamp = CausticLight::Spot { position: Vec3::new(3.0, 1.25, 0.0), direction: Vec3::NEG_Y, color: Vec3::ONE, range: 10.0, cone: (0.5, 0.3), radius: 0.0, rect: None };
+        let far = CausticLight::Spot { position: Vec3::new(0.0, 30.0, 0.0), direction: Vec3::NEG_Y, color: Vec3::ONE, range: 10.0, cone: (0.6, 0.4), radius: 0.0, rect: None };
+        assert_eq!(footprint(lo, hi, &[over[0], lamp, far], 1.0), alone);
+        // above it to one side and aimed at it, a lamp spreads it
+        let aimed = CausticLight::Spot { position: Vec3::new(2.0, 3.0, 0.0), direction: (Vec3::new(0.0, 1.1, 0.0) - Vec3::new(2.0, 3.0, 0.0)).normalize(), color: Vec3::ONE, range: 10.0, cone: (0.5, 0.3), radius: 0.0, rect: None };
+        assert_ne!(footprint(lo, hi, &[over[0], aimed], 1.0), alone);
+    }
+
+    #[test]
+    fn a_changing_casters_tile_keeps_blending() {
+        let view_proj = Mat4::perspective_rh(1.0, 1.0, 0.1, 10.0) * Mat4::look_at_rh(Vec3::new(0.0, 1.2, 0.5), Vec3::new(0.0, 0.75, 0.0), Vec3::Y);
+        let eye = Vec3::new(0.0, 1.2, 0.5);
+        let options = RtCausticsOptions { max_history: 4, ..Default::default() };
+        let water = (Vec3::new(-0.015, 0.75, -0.015), Vec3::new(0.015, 0.78, 0.015));
+        let lights = vec![spot(Vec3::new(0.0, 1.5, 0.0))];
+        let mut changing = vec![None; RT_CAUSTICS_MAX_CASTERS];
+        changing[0] = Some(2);
+        let mut planner = Planner { tiles: vec![None; RT_CAUSTICS_MAX_CASTERS], changing, ..Default::default() };
+        let blends: Vec<f32> = (0..8)
+            .map(|f| {
+                planner.frame = f;
+                let fed = planner.plan(&options, &[water], &lights, 1, view_proj, eye, 0.002);
+                for &(k, _) in &fed {
+                    planner.tiles[k].as_mut().unwrap().history += 1;
+                }
+                fed.first().map_or(0.0, |x| x.1)
+            })
+            .collect();
+        // 1, 1/2, then a third every frame, never settling
+        assert_eq!(blends, vec![1.0, 0.5, 1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0]);
     }
 }

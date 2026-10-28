@@ -55,7 +55,7 @@ pub use caustics::{RtCausticReceivers, RtCausticsEffect, RtCausticsOptions, RtCa
 pub use diffuse::{RtDiffuseGiEffect, RtDiffuseGiOptions, RtGiDenoise, RtGiHitLighting, RtGiKernel, RtGiMode, RtGiResolution, RtGiShadows, RtGiStats, RtGiView};
 pub use effect::{RtGlass, RtReflectionStats, RtReflectionsEffect, RtReflectionsOptions, RtReflectionsView, RtTraceResolution};
 pub use grid::{RtBackend, RtGrid, RtGridBindings, RtGridHandle, RtGridOptions, RtGridStats, RtPlacement, RtSource, RtSurface, RT_MAX_CELLS, RT_TRIANGLE_BYTES};
-pub use mesh::{split_large_triangles, transform_box, RtMesh};
+pub use mesh::{split_large_triangles, transform_box, RtGpuMesh, RtMesh};
 pub use scene::{RtInstance, RtScene};
 pub use scene_grid::{SceneRtGrid, SceneRtGridOptions, SceneRtGridStats};
 pub use shadows::{RtShadowVisibility, RtShadowsEffect, RtShadowsView, RT_SHADOWS_GBUFFER_WGSL, RT_SHADOW_MAX_LIGHTS};
@@ -229,7 +229,7 @@ mod tests {
         for backend in BACKENDS {
             for clipmap in [true, false] {
                 let gi = metal_buffer_slots(&super::diffuse::trace_layout_entries(clipmap, backend));
-                let reflections = metal_buffer_slots(&super::effect::trace_layout_entries(clipmap, backend));
+                let reflections = metal_buffer_slots(&super::effect::trace_layout_entries(clipmap, backend)).max(metal_buffer_slots(&super::effect::glass_layout_entries(clipmap, backend)));
                 assert!(gi <= 29 && reflections <= 29, "{backend:?}, clipmap {clipmap}: GI trace {gi}, reflections {reflections} of 29");
             }
             let shadows = metal_buffer_slots(&super::shadows::trace_layout_entries(backend));
@@ -250,7 +250,8 @@ mod tests {
             for clipmap in [true, false] {
                 let gi = sampled_textures(&super::diffuse::trace_layout_entries(clipmap, backend));
                 let reflections = sampled_textures(&super::effect::trace_layout_entries(clipmap, backend));
-                assert!(gi <= 16 && reflections <= 16, "{backend:?}, clipmap {clipmap}: GI trace {gi}, reflections {reflections} of 16");
+                let glass = sampled_textures(&super::effect::glass_layout_entries(clipmap, backend));
+                assert!(gi <= 16 && reflections <= 16 && glass <= 16, "{backend:?}, clipmap {clipmap}: GI trace {gi}, reflections {reflections}, glass {glass} of 16");
             }
         }
     }
