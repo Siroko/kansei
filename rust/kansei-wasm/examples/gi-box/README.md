@@ -21,6 +21,14 @@ denoiser, the hits' lighting and shadows, a reference path tracer through the gr
 (`mode`, with `accumulate` for a converged image) and debug views (the indirect light, the signal,
 SVGF's variance and history, the rays' cost).
 
+With `shadows=rt` the lamp's direct light is ray traced instead of read from its shadow map: the
+materials leave it out of their colour and mark their GBuffer pixels for `rt::RtShadowsEffect`
+(`kansei_gbuffer_out_rt_lit`), which sends a shadow ray for each 2 x 2 pixels through the grid of
+triangles (below) toward a point of the lamp's 15 cm disk, a new one every frame, accumulates and
+filters them and lights the pixels (Lambert plus GGX toward the disk). Penumbrae widen with the
+distance to the blocker; short screen-space rays darken the contacts the grid's cells miss. The
+shadow map is still drawn for what reads it (voxel GI's light injection, `rtgi_shadows=maps`).
+
 A chrome ball stands on the short block and a glass ball on the rug, ray traced through a grid of
 the room's triangles (below) whatever the GI: the chrome (`StandardLitOptions::mirror`) mirrors the
 room, sharp or rough; the glass (`StandardLitOptions::glass`, `RtSurface::glass`) reflects it by
@@ -51,7 +59,8 @@ grid below; with `reflect=1`,
 `kansei_gbuffer_out_specular` (the floor's F0 and roughness); for the balls,
 `Material::standard_lit` with `StandardLitOptions::mirror` and `StandardLitOptions::glass`
 (`set_standard_lit` for the panel's changes), `RtSurface::glass`, and `RtReflectionsEffect`'s
-`set_glass` (`RtGlass`), `set_spot_lights`, `screen_hits` and `hit_indirect`.
+`set_glass` (`RtGlass`), `set_spot_lights`, `screen_hits` and `hit_indirect`; with `shadows=rt`,
+`RtShadowsEffect` (`update_lights`, `RtShadowsView`) and `rt::RT_SHADOWS_GBUFFER_WGSL`.
 
 | URL parameter | Effect |
 |---|---|
@@ -70,7 +79,10 @@ grid below; with `reflect=1`,
 | `slice=<metres>` | height of the `view=sdf` slice (default 0.6) |
 | `sdf_ao=<0..1>` | strength of the distance field's AO on the GI (default 0) |
 | `sdf_shadows=off\|fallback\|always` | the voxels' shadows through the distance field: never (default), where no shadow map covers them, or always |
-| `shadows=map\|sdf` | the direct light's shadows from the shadow atlas (default) or the distance field |
+| `shadows=maps\|sdf\|rt` | the direct light's shadows from the shadow atlas (default, PCSS), the distance field, or ray traced (`RtShadowsEffect`, below; builds the grid) |
+| `rts_res=half\|full` | the ray-traced shadows' rays: one for each 2 x 2 pixels (default) or one a pixel |
+| `rts_contact=<m>` | how far the ray-traced shadows' screen-space contact rays walk (default 0.25; 0: none) |
+| `rts_view=lit\|visibility\|direct\|mask` | the ray-traced shadows' debug views: the lamp's visibility, its direct light alone, the pixels it lights |
 | `cam=front\|corner\|low\|floor\|glass` | starting camera (default front; `floor` looks down onto the floor, `glass` close on the glass ball) |
 | `mirror=0`, `glass=0` | no chrome ball, no glass ball (without both, `reflect`, `gi=rt` and `rt=1`, no grid is built and voxel GI runs only for its modes) |
 | `mirror_rough=<0..1>` | the chrome's roughness (default 0, a mirror) |

@@ -31,13 +31,13 @@
             start, info, presets, set_preset, set_gi, set_voxels, set_view, set_dragon, set_animate,
             set_rug, set_textured, set_camera, set_stats, set_sdf_ao, set_sdf_shadows, set_shadows, set_slice,
             set_reflections, set_reflection_view, set_reflection_grid, set_reflection_resolution, set_rtgi,
-            set_mirror, set_glass, set_mirror_rough, set_glass_ior, set_glass_rough, set_screen_hits,
+            set_mirror, set_glass, set_mirror_rough, set_glass_ior, set_glass_rough, set_screen_hits, set_rt_shadows,
         } from '../pkg/kansei_wasm_gi_box.js';
         await init();
         await start('kansei');
 
         // for scripted captures: window.kansei.set_preset('best') and so on
-        window.kansei = { info, presets, set_preset, set_gi, set_voxels, set_view, set_dragon, set_animate, set_rug, set_textured, set_camera, set_stats, set_sdf_ao, set_sdf_shadows, set_shadows, set_slice, set_reflections, set_reflection_view, set_reflection_grid, set_reflection_resolution, set_rtgi, set_mirror, set_glass, set_mirror_rough, set_glass_ior, set_glass_rough, set_screen_hits };
+        window.kansei = { info, presets, set_preset, set_gi, set_voxels, set_view, set_dragon, set_animate, set_rug, set_textured, set_camera, set_stats, set_sdf_ao, set_sdf_shadows, set_shadows, set_slice, set_reflections, set_reflection_view, set_reflection_grid, set_reflection_resolution, set_rtgi, set_mirror, set_glass, set_mirror_rough, set_glass_ior, set_glass_rough, set_screen_hits, set_rt_shadows };
         const params = new URLSearchParams(location.search);
         const read = () => JSON.parse(info());
         let s = read();
@@ -98,7 +98,16 @@
         const sdf = pane.addFolder({ title: 'Distance field' });
         sdf.addBinding(p, 'sdfAo', { label: 'AO on GI', min: 0, max: 1, step: 0.05 }).on('change', custom(() => set_sdf_ao(p.sdfAo)));
         sdf.addBinding(p, 'sdfShadows', { label: 'voxel shadows', options: { 'shadow maps': 'off', 'field where no map': 'fallback', 'field always': 'always' } }).on('change', custom(() => set_sdf_shadows(p.sdfShadows)));
-        sdf.addBinding(p, 'shadows', { label: 'direct shadows', options: { 'shadow atlas': 'map', 'distance field': 'sdf' } }).on('change', custom(() => set_shadows(p.shadows)));
+        // the lamp's shadows: the shadow atlas, the distance field, or rays through the grid of
+        // triangles (built at load: without it, choosing rays reloads the page with shadows=rt)
+        pane.addBinding(p, 'shadows', { label: 'direct shadows', index: 3, options: { 'shadow maps (PCSS)': 'maps', 'distance field': 'sdf', 'ray traced': 'rt' } }).on('change', custom(() => {
+            if (p.shadows === 'rt' && !s.grid) {
+                params.set('shadows', 'rt');
+                location.search = params.toString();
+                return;
+            }
+            set_shadows(p.shadows);
+        }));
         sdf.addBinding(p, 'slice', { label: 'slice height', min: 0, max: 4, step: 0.05 }).on('change', () => set_slice(p.slice));
         const scene = pane.addFolder({ title: 'Scene' });
         scene.addBinding(p, 'dragon', { options: { off: 'off', '19k triangles': 'light', '871k triangles': 'full' } }).on('change', async () => { p.preset = ''; await set_dragon(p.dragon); sync(); });
@@ -118,7 +127,14 @@
         rtFolder.addBinding(rt, 'mode', { options: { hybrid: 'hybrid', 'reference (path traced)': 'reference' } }).on('change', () => rtgi('mode', rt.mode));
         rtFolder.addBinding(rt, 'accum', { label: 'accumulate' }).on('change', () => rtgi('accum', rt.accum));
         rtFolder.addBinding(rt, 'view', { label: 'debug view', options: { lit: 'lit', indirect: 'indirect', signal: 'signal', variance: 'variance', history: 'history', cost: 'cost' } }).on('change', () => rtgi('view', rt.view));
-        const showRt = () => { rtFolder.hidden = p.gi !== 'rt'; };
+        // the ray-traced shadows' settings, shown while they run
+        const rts = { ...s.rt_shadows };
+        const rtsFolder = pane.addFolder({ title: 'RT shadows', expanded: true });
+        const rtShadows = (key, value) => { set_rt_shadows(key, String(value)); sync(); };
+        rtsFolder.addBinding(rts, 'res', { label: 'trace', options: { 'half (1 ray / 2x2)': 'half', 'full (1 ray / pixel)': 'full' } }).on('change', () => rtShadows('res', rts.res));
+        rtsFolder.addBinding(rts, 'contact', { label: 'contact rays (m)', min: 0, max: 1, step: 0.05 }).on('change', (e) => { if (e.last !== false) rtShadows('contact', rts.contact); });
+        rtsFolder.addBinding(rts, 'view', { label: 'debug view', options: { lit: 'lit', visibility: 'visibility', 'direct light': 'direct', 'lit mask': 'mask' } }).on('change', () => rtShadows('view', rts.view));
+        const showRt = () => { rtFolder.hidden = p.gi !== 'rt'; rtsFolder.hidden = p.shadows !== 'rt'; };
         showRt();
         // the chrome and glass balls, ray traced whatever the GI
         if (s.balls) {
@@ -154,6 +170,7 @@
                 `voxel GI: voxelize ${i.voxelize_ms.toFixed(3)}, inject ${i.inject_ms.toFixed(3)}, mips ${i.mips_ms.toFixed(3)}, screen ${i.screen_ms.toFixed(3)} ms\n` +
                 `SSGI ${i.ssgi_ms.toFixed(3)} ms` + (i.sdf ? `, distance field ${i.sdf_ms.toFixed(3)} ms` : '') + (i.probes ? `, probes ${i.probe_dims.join('x')} ${i.probes_ms.toFixed(3)} ms` : '') + '\n' +
                 (i.grid ? `rt grid: ${i.grid.triangles} triangles, ${i.grid.references} refs, ${i.grid.big} big, ${i.grid.mib} MiB; ${i.grid.rebuilt ? 'rebuilt' : 'kept'} (${i.grid.rebuilds}), GPU ${i.rt_ms.toFixed(3)} ms\n` : '') +
+                (i.shadows === 'rt' ? `RT shadows: ${i.rt_shadows_ms.toFixed(3)} ms (${i.rt_shadows.res})\n` : '') +
                 (i.rtgi.on ? `hybrid GI: ${i.rtgi_ms.toFixed(3)} ms, ${i.rtgi.mib} MiB; ${i.rtgi.rays} rays, ${i.rtgi.rays ? (100 * i.rtgi.hits / i.rtgi.rays).toFixed(0) : 0}% hit, ${i.rtgi.rays ? (i.rtgi.cost / i.rtgi.rays).toFixed(1) : 0} cells + triangles a ray` + (i.rtgi.accum ? `, ${i.rtgi.accumulated} frames accumulated` : '') + '\n' : '') +
                 (i.balls ? `mirror & glass: glass ${i.glass_ms.toFixed(3)} ms, ${i.balls.glass_pixels} pixels, ${i.balls.glass_pixels ? (i.balls.glass_cost / i.balls.glass_pixels).toFixed(1) : 0} cells + triangles a pixel; reflections ${i.reflect_ms.toFixed(3)} ms, ${i.balls.rays} rays\n` : '') +
                 (i.reflect ? `reflections: trace + resolve ${i.reflect_ms.toFixed(3)} ms; ${i.reflect.rays} rays, ${i.reflect.rays ? (100 * i.reflect.hits / i.reflect.rays).toFixed(0) : 0}% hit, ${i.reflect.rays ? ((i.reflect.cells + i.reflect.tests) / i.reflect.rays).toFixed(1) : 0} cells + triangles a ray\n` : '') + top;
