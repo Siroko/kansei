@@ -164,7 +164,9 @@ impl Character {
         let (walk_tags, run_tags) = if gait && walk != 0 && run != 0 { (idle | walk, idle | run) } else { (!ACTION_TAG, !ACTION_TAG) };
         let matcher = MotionMatcher::new(&db, MotionMatchingSettings::default(), GVec3::ZERO, 0.0);
         log::info!("{} action clips", actions.len());
-        let controller = CharacterController::new(matcher, actions);
+        let mut controller = CharacterController::new(matcher, actions);
+        // the hands the hangs and bars pin (and refine the climbs' grips with)
+        controller.find_hands(&db);
         let ledge = DebugBoxes::new(renderer, scene, "Ledge", 2, glow([3000.0, 400.0, 200.0]), true);
         log::info!("motion pack: {} clips, {} frames, {} joints", db.clips.len(), db.frame_count(), db.joint_count());
         Ok(Self { db, controller, bodies, ledge, showing: 0, bones, trajectory, walk_tags, run_tags })
@@ -192,7 +194,7 @@ impl Character {
     /// to toe, up the foot's parents and down to its first child), and the hips.
     pub fn leg_capsules(&self) -> Vec<(GVec3, GVec3, f32)> {
         let matcher = &self.controller.matcher;
-        let (character, model, skeleton) = (matcher.character(), matcher.model(), matcher.output_skeleton(&self.db));
+        let (character, model, skeleton) = (matcher.shown(), matcher.model(), matcher.output_skeleton(&self.db));
         let at = |j: usize| character.transform_point(model[j].translation);
         let mut legs = Vec::new();
         for side in 0..2 {
@@ -211,7 +213,7 @@ impl Character {
     /// joint whose parent is not the root.
     pub fn bones_world(&self) -> Vec<(usize, GVec3, GVec3)> {
         let matcher = &self.controller.matcher;
-        let (character, model, skeleton) = (matcher.character(), matcher.model(), matcher.output_skeleton(&self.db));
+        let (character, model, skeleton) = (matcher.shown(), matcher.model(), matcher.output_skeleton(&self.db));
         let root = self.joint(self.db.roles.root);
         skeleton
             .parents

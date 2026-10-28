@@ -1,19 +1,21 @@
-//! The room page (`www/room.html`, [`start_room`]): the motion-matched character in a 40 x 40 m
-//! loft lit by ray tracing.
+//! The room page (`www/room.html`, [`start_room`]): the motion-matched character in a 32 x 28 m
+//! loft gallery lit by ray tracing, authored in Blender and loaded from `www/assets/room/room.glb`
+//! (`layout`: its names and custom properties place the lights, views, mirrors, aquarium, dragon
+//! and parkour; see the README's "The room's source").
 //!
-//! - The light: the low sun through three tall steel windows to the west (warm, its shadows ray
-//!   traced through a cone), a skylight over the pond (a cool area light: a spot light whose
+//! - The light: the low sun through four tall steel windows to the west (warm, its shadows ray
+//!   traced through a cone), a skylight over the dragon (a cool area light: a spot light whose
 //!   emitter the ray-traced shadows sample as the opening's rectangle), and warm lamps under glowing
 //!   shades. A sky behind the windows lights what the rays find through them.
 //! - Ray-traced direct light and shadows (`rt::RtShadowsEffect`, `shadows=rt`, the default): soft
 //!   where the emitter is large, sharp at contacts, screen-space contact rays for feet and props;
 //!   `shadows=maps` falls back to the shadow maps. The GI: the hybrid (`RtDiffuseGiEffect`, `gi=rt`),
 //!   voxel cones, screen space or none.
-//! - Two mirrors, a polished floor (white marble slabs or an oak herringbone) and a glass Stanford
-//!   dragon on a black marble plinth in a pond, all ray traced (`RtReflectionsEffect`); the pond is
-//!   the engine's SPH water the character wades into (`pond`).
-//! - CC0 furniture (Poly Haven) and surfaces (ambientCG), KTX2 (`assets`, `tools/room_assets.py`);
-//!   concrete and oak blocks to vault, mantle and climb (`layout`).
+//! - Two mirrors and a glass Stanford dragon on a marble drum, ray traced (`RtReflectionsEffect`);
+//!   an aquarium of the engine's SPH water by the windows, its surface ray-traced glass, the sun
+//!   through it throwing caustics on the floor (`aquarium`, `RtCausticsEffect`).
+//! - CC0 furniture (Poly Haven) and surfaces (ambientCG), KTX2; blocks to vault, mantle and climb,
+//!   and a course tagged for moves to come (`layout::check_traversals`, `room_parkour`).
 //! - Subtle volumetric fog lit by the same lights, and dust motes from a compute shader drawn with
 //!   sprites it generates at start (`dust`).
 //! - Post-processing: AgX (or another curve), bloom, a cinematic depth of field focused on the
@@ -29,7 +31,7 @@ mod dust;
 mod layout;
 mod look;
 mod pbr;
-mod pond;
+mod aquarium;
 mod settings;
 
 use std::cell::RefCell;
@@ -60,16 +62,16 @@ use kansei_core::rt::{
     RtCausticsEffect, RtCausticsOptions, RtCausticsView, RtDiffuseGiEffect, RtDiffuseGiOptions, RtGiResolution, RtGiShadows, RtGlass, RtGridOptions, RtReflectionsEffect, RtReflectionsOptions,
     RtShadowsEffect, RtShadowsView, RtSurface, RtTraceResolution, SceneRtGridOptions,
 };
+use kansei_core::animation::motion_matching::traversal::features::ParkourFeatures;
 use kansei_core::shadows::CascadedShadowOptions;
 use kansei_wasm::{param, param_or, set_text, Canvas, Frame};
 
 use crate::player::Player;
 use crate::{fetch_bytes, load_character, set_page, Page};
-use assets::Assets;
 use dust::Dust;
-use layout::{Layout, HALF, HEIGHT, START, START_HEADING};
+use layout::Layout;
 use look::{Proxy, RoomLit};
-use pond::Pond;
+use aquarium::Aquarium;
 use settings::{kelvin, Settings};
 
 /// The renderer's profile over the last second (`stats`).
@@ -99,9 +101,8 @@ struct RoomState {
     controls: CameraControls,
     volume: PostProcessingVolume,
     player: Player,
-    assets: Assets,
     layout: Layout,
-    pond: Option<Pond>,
+    aquarium: Option<Aquarium>,
     dust: Option<Dust>,
     proxy: Option<Proxy>,
     dragon: Option<usize>,
@@ -114,8 +115,8 @@ struct RoomState {
     settings: Settings,
     /// The settings as last applied (what changed since).
     applied: Option<Settings>,
-    /// A fixed view (`VIEWS`), or following the character.
-    view: Option<&'static str>,
+    /// A fixed view (the glb's `CAM_<name>`, `layout.views`' index), or following the character.
+    view: Option<usize>,
     stats: Option<Stats>,
     profile_since: f64,
     time: f32,
@@ -128,18 +129,23 @@ impl Page for RoomState {
     }
 }
 
-/// The room's box, for voxel GI and the grid: the walls, the floor (and the pond's bed under it)
-/// and the ceiling with the skylight's well, with a margin.
-const BOUNDS_MIN: [f32; 3] = [-HALF - 0.5, -1.0, -HALF - 0.5];
-const BOUNDS_MAX: [f32; 3] = [HALF + 0.5, HEIGHT + 1.5, HALF + 0.5];
+/// The room's box, for voxel GI and the grid: the walls, the floor and the ceiling with the
+/// skylight's well, with a margin.
+fn room_bounds(layout: &Layout) -> ([f32; 3], [f32; 3]) {
+    let (lo, hi) = (layout.min, layout.max);
+    ([lo.x - 0.5, lo.y - 1.0, lo.z - 0.5], [hi.x + 0.5, hi.y + 1.5, hi.z + 0.5])
+}
 
-/// The grid of the room's triangles: 30 cm cells over the room (140 x 36 x 140, within the grid's
-/// million cells), fixed; the dragon's cut in it within `lod_cm` of its surface (a cell's error
-/// would trace a 2.6 m dragon as a lump through the glass).
-fn grid_options(lod_cm: f32) -> SceneRtGridOptions {
+/// The grid of the room's triangles: 30 cm cells over the room's box (within the grid's million
+/// cells), fixed; the dragon's cut in it within `lod_cm` of its surface (a cell's error would
+/// trace a 2.6 m dragon as a lump through the glass).
+fn grid_options(lod_cm: f32, (lo, hi): ([f32; 3], [f32; 3])) -> SceneRtGridOptions {
     let cell = 0.3;
+    let origin = glam::Vec3::from(lo) - 0.2;
+    // (in whole macro cells of 4)
+    let dims: [u32; 3] = std::array::from_fn(|k| ((hi[k] - lo[k] + 0.4) / cell / 4.0).ceil() as u32 * 4);
     SceneRtGridOptions {
-        grid: RtGridOptions { dims: [140, 36, 140], cell, fixed_origin: Some(glam::Vec3::new(-21.0, -1.2, -21.0)), ..Default::default() },
+        grid: RtGridOptions { dims, cell, fixed_origin: Some(origin), ..Default::default() },
         cluster_error_cells: (lod_cm.max(0.0) * 0.01 / cell).max(1e-4),
         rebuild_every_frame: false,
     }
@@ -185,22 +191,31 @@ impl<E: PostProcessingEffect + 'static> PostProcessingEffect for Switch<E> {
     }
 }
 
-/// The effect chain: the pond's surface first (on the lit scene), the ray-traced direct light, the
+/// `render=forward`'s flat fill in place of the GI (cd/m² per unit albedo).
+const FORWARD_FILL: [f32; 3] = [220.0, 225.0, 240.0];
+
+/// The effect chain: the aquarium's surface first (on the lit scene), the ray-traced direct light, the
 /// three GI effects (one enabled), the reflections and the glass, the fog, TAA, motion blur, the
 /// depth of field, bloom and the tone map. `apply` sets them all to the settings.
-fn build_effects(renderer: &Renderer, surface: Option<FluidSurfaceEffect>, sky: &wgpu::Buffer) -> Vec<Box<dyn PostProcessingEffect>> {
+fn build_effects(renderer: &Renderer, surface: Option<FluidSurfaceEffect>, sky: &wgpu::Buffer, layout: &Layout, forward: bool) -> Vec<Box<dyn PostProcessingEffect>> {
+    let [rect_z, rect_x] = layout.lights.skylight_rect;
     // (the sky lighting lights only the rays that leave through the windows and the skylight: the
     // room's materials add no sky ambient of their own for the GI to take out, so `ambient` 0)
     let mut effects: Vec<Box<dyn PostProcessingEffect>> = Vec::new();
     if let Some(surface) = surface {
         effects.push(Box::new(surface));
     }
+    if forward {
+        // the post-processing only
+        post_effects(renderer, &mut effects);
+        return effects;
+    }
     let scene_gi = renderer.voxel_gi().expect("the room enables voxel GI");
     let grid = renderer.rt_grid().expect("the room builds the grid");
     let mut shadows = RtShadowsEffect::new(grid.handle());
     // the skylight is the first spot light: its emitter is the opening (the rectangle's width lies
     // along z for a light pointing down, `set_rect_emitter`'s axes)
-    shadows.set_rect_emitter(0, layout::SKYLIGHT[1] * 2.0, layout::SKYLIGHT[0] * 2.0);
+    shadows.set_rect_emitter(0, rect_z, rect_x);
     effects.push(Box::new(Switch { effect: shadows, on: true }));
     let mut hybrid = RtDiffuseGiEffect::with_volume(scene_gi.volume(), grid.handle(), RtDiffuseGiOptions { max_distance: 60.0, ambient: 0.0, ..Default::default() });
     hybrid.set_spot_lights(Some(renderer.spot_lights_buffer()), renderer.spot_shadow_atlas());
@@ -219,11 +234,11 @@ fn build_effects(renderer: &Renderer, surface: Option<FluidSurfaceEffect>, sky: 
     let mut ssgi = ScreenSpaceGIEffect::new(near);
     ssgi.set_sky_lighting(Some(sky));
     effects.push(Box::new(ssgi));
-    // the dragon's and the water's caustics, over the pond's terrain (its bed, the plinth, the
-    // coping and the floor at its edge), 3 cm texels; the skylight emits from its opening
-    let (lo, hi) = Pond::terrain_bounds();
+    // the dragon's and the water's caustics, over the floor round them (the glb's caustics area),
+    // 3 cm texels; the skylight emits from its opening
+    let (lo, hi) = layout.caustics;
     let mut caustics = RtCausticsEffect::new(renderer.device(), grid.handle(), RtCausticsOptions { min: lo, max: hi, texel: 0.03, ..Default::default() });
-    caustics.set_rect_emitter(0, layout::SKYLIGHT[1] * 2.0, layout::SKYLIGHT[0] * 2.0);
+    caustics.set_rect_emitter(0, rect_z, rect_x);
     let (map, lookup) = caustics.map();
     let caustics_map = (map.clone(), lookup.clone());
     effects.push(Box::new(Switch { effect: caustics, on: true }));
@@ -232,7 +247,7 @@ fn build_effects(renderer: &Renderer, surface: Option<FluidSurfaceEffect>, sky: 
     reflections.screen_hits = true;
     reflections.set_spot_lights(Some(renderer.spot_lights_buffer()));
     // (the glass's reflections traced with the floor's and the mirrors', at their resolution: the
-    // pond's water fills much of the screen)
+    // water can fill much of the screen)
     reflections.set_glass(Some(RtGlass { reflections_in_trace: true, ..Default::default() }));
     reflections.set_caustics(Some((&caustics_map.0, &caustics_map.1)));
     reflections.set_sky_lighting(Some(sky));
@@ -240,7 +255,8 @@ fn build_effects(renderer: &Renderer, surface: Option<FluidSurfaceEffect>, sky: 
     // a faint, even haze filling the room (a box volume; none outside), lit by the sun through the
     // cascades and the spot lights through their shadow maps
     let mut fog = VolumetricFogEffect::new(VolumetricFogOptions { grid: FroxelGridOptions { near: 0.3, far: 90.0, temporal: true, ..Default::default() }, base_density: 0.0, ..Default::default() });
-    let mut haze = LocalFogVolume::new_box(Vec3::new(0.0, HEIGHT * 0.5, 0.0), Vec3::new(HALF, HEIGHT * 0.5, HALF));
+    let (c, h) = ((layout.min + layout.max) * 0.5, (layout.max - layout.min) * 0.5);
+    let mut haze = LocalFogVolume::new_box(Vec3::new(c.x, c.y, c.z), Vec3::new(h.x, h.y, h.z));
     haze.radial_extinction = 0.0;
     haze.height_offset = -1.0;
     haze.height_falloff = 0.35;
@@ -250,12 +266,17 @@ fn build_effects(renderer: &Renderer, surface: Option<FluidSurfaceEffect>, sky: 
     fog.set_spot_lights(Some(renderer.spot_lights_buffer()), renderer.spot_shadow_atlas());
     fog.set_cascaded_shadow_map(renderer.cascaded_shadow_map());
     effects.push(Box::new(Switch { effect: fog, on: true }));
+    post_effects(renderer, &mut effects);
+    effects
+}
+
+/// TAA, motion blur, depth of field, bloom and the tone map.
+fn post_effects(renderer: &Renderer, effects: &mut Vec<Box<dyn PostProcessingEffect>>) {
     effects.push(Box::new(Switch { effect: TemporalAAEffect::new(TemporalAAOptions::default()), on: true }));
     effects.push(Box::new(Switch { effect: MotionBlurEffect::new(MotionBlurOptions::default()), on: false }));
     effects.push(Box::new(Switch { effect: CinematicDepthOfFieldEffect::new(CinematicDepthOfFieldOptions::default()), on: false }));
     effects.push(Box::new(Switch { effect: BloomEffect::new(BloomOptions::default()), on: true }));
     effects.push(Box::new(ToneMapEffect::new(ToneMapOptions::for_surface(renderer.presentation_format()))));
-    effects
 }
 
 /// The sky the windows and the skylight show, as `SkyLighting` (`atmosphere::SKY_LIGHTING_WGSL`)
@@ -274,10 +295,11 @@ fn sky_lighting(zenith: [f32; 3], horizon: [f32; 3]) -> [f32; 60] {
     out
 }
 
-/// The glass dragon on the plinth: the Stanford dragon (`www/assets`, CC-BY-NC-4.0, credited on the
-/// page) about 2.6 m long, clear glass, in the grid by its cluster LOD's cut with its vertex normals,
-/// casting no shadow (light passes through glass), outside voxel GI.
-async fn add_dragon(scene: &mut Scene) -> Option<(usize, (GVec3, GVec3))> {
+/// The glass dragon on the plinth (`MARK_Dragon`: where, its yaw and length): the Stanford dragon
+/// (`www/assets`, CC-BY-NC-4.0, credited on the page), clear glass, in the grid by its cluster
+/// LOD's cut with its vertex normals, casting no shadow (light passes through glass), outside
+/// voxel GI.
+async fn add_dragon(scene: &mut Scene, (at, yaw, length): (GVec3, f32, f32)) -> Option<(usize, (GVec3, GVec3))> {
     let bytes = match fetch_bytes("assets/stanford_dragon_pbr.glb").await {
         Ok(b) => b,
         Err(e) => {
@@ -285,53 +307,24 @@ async fn add_dragon(scene: &mut Scene) -> Option<(usize, (GVec3, GVec3))> {
             return None;
         }
     };
-    let geometry = GLTFLoader::load_glb(&bytes).ok()?.merged_geometry("Dragon").fit(glam::Vec3::new(2.6, f32::INFINITY, 2.6));
+    let geometry = GLTFLoader::load_glb(&bytes).ok()?.merged_geometry("Dragon").fit(glam::Vec3::new(length, f32::INFINITY, length));
     let mesh = ClusterMesh::build(&geometry, &ClusterOptions::default());
     let mut dragon = Renderable::new(geometry, Material::standard_lit("Dragon", &StandardLitOptions::glass(GLASS_TINT, 1.5, 0.0)));
     dragon.clusters = Some(ClusterLod::new(mesh));
     dragon.rt = Some(RtSurface::glass(GLASS_TINT));
     dragon.cast_shadow = false;
-    dragon.object.set_position(0.0, pond::PLINTH_TOP, 0.0);
-    dragon.object.rotation.y = 0.7;
+    dragon.object.set_position(at.x, at.y, at.z);
+    dragon.object.rotation.y = yaw;
     let (lo, hi) = dragon.geometry.bounds();
-    let placed = kansei_core::rt::transform_box(&(glam::Mat4::from_translation(GVec3::new(0.0, pond::PLINTH_TOP, 0.0)) * glam::Mat4::from_rotation_y(0.7)), lo, hi);
+    let placed = kansei_core::rt::transform_box(&(glam::Mat4::from_translation(at) * glam::Mat4::from_rotation_y(yaw)), lo, hi);
     Some((scene.add(SceneNode::Renderable(dragon)), placed))
 }
 
-/// Fixed views (`cam=<name>`): (name, target, distance, azimuth, elevation); the camera stands at
-/// the target plus (sin, cos) of the azimuth times the distance.
-const VIEWS: [(&str, [f32; 3], f32, f32, f32); 13] = [
-    // from the south-east, above the walls' tops, looking in through them and the ceiling
-    ("outside", [0.0, 1.5, 0.0], 52.0, 0.65, 0.42),
-    // the whole room from its south-east, the windows and the sun opposite
-    ("hall", [-2.0, 2.2, -2.0], 26.0, 0.62, 0.16),
-    // the glass dragon on its plinth, the big mirror behind it
-    ("dragon", [0.0, 1.3, 0.0], 6.5, 0.25, 0.12),
-    // the big mirror on the north wall at an angle, the pond and the dragon in it
-    ("mirror", [0.0, 2.2, -19.5], 14.8, 0.42, 0.09),
-    // the windows and the sun coming through them
-    ("windows", [-16.0, 2.5, 0.0], 15.0, 1.25, 0.08),
-    // the crates and platforms in the north-east corner
-    ("parkour", [12.0, 1.0, -12.0], 12.0, -0.7, 0.3),
-    // the living corner and its lamp
-    ("living", [13.0, 0.8, 13.0], 8.5, -0.9, 0.22),
-    // the dining table under its pendant
-    ("dining", [-13.0, 1.0, 13.0], 6.5, 0.7, 0.25),
-    // the library: shelves, the reading chair
-    ("library", [-13.0, 1.2, -16.0], 7.0, 0.6, 0.18),
-    // close-ups of the shadows: the dining chairs' legs on the floor, the character's feet where
-    // it starts, the plinth in the water
-    ("contact", [-13.0, 0.3, 13.0], 3.6, 0.9, 0.35),
-    ("feet", [START[0], 0.3, START[2]], 2.8, 0.5, 0.3),
-    ("plinth", [0.0, 0.5, 0.0], 4.2, 0.6, 0.2),
-    // the caustics: the plinth's top and the pond's bed in front of it from above, the display
-    // spot's light through the dragon falling toward the camera
-    ("caustics", [0.0, 0.3, 1.0], 5.0, 0.15, 0.75),
-];
-
-/// Without a character: the pond from beside the stand-in, a little off its axis.
-fn stand_in_view(controls: &mut CameraControls) {
-    controls.set_view(Vec3::new(START[0], 1.3, START[2] - 5.0), 11.0, 0.4, 0.16);
+/// Without a character: the room from beside the stand-in (at `spawn`, facing `heading`), a little
+/// off its axis.
+fn stand_in_view(controls: &mut CameraControls, (spawn, heading): (GVec3, f32)) {
+    let at = spawn + GVec3::new(heading.sin(), 0.0, heading.cos()) * 5.0;
+    controls.set_view(Vec3::new(at.x, 1.3, at.z), 11.0, heading + std::f32::consts::PI + 0.4, 0.16);
 }
 
 fn tonemapper(name: &str) -> ToneMapper {
@@ -404,9 +397,9 @@ impl RoomState {
             proxy.update(self.renderer.queue(), &mut self.scene, c, visible);
         }
         let view_proj = self.camera.view_projection().to_glam();
-        if let Some(pond) = &mut self.pond {
+        if let Some(aquarium) = &mut self.aquarium {
             if let Some(surface) = self.volume.effect_mut::<FluidSurfaceEffect>() {
-                pond.update(surface, &out.legs, out.landing, dt, view_proj);
+                aquarium.update(surface, &out.legs, out.landing, dt, view_proj);
             }
         }
         let eye = *self.camera.position();
@@ -423,10 +416,10 @@ impl RoomState {
         }
         // the water's glass (its ripples) and its copy in the grid
         let mut water = None;
-        if let Some(pond) = &mut self.pond {
+        if let Some(aquarium) = &mut self.aquarium {
             if let Some(surface) = self.volume.effect_mut::<FluidSurfaceEffect>() {
-                pond.update_surface(&mut self.scene, self.renderer.queue(), surface, self.time);
-                water = pond.caustic_water(surface);
+                aquarium.update_surface(&mut self.scene, self.renderer.queue(), surface, self.time);
+                water = aquarium.caustic_water(surface);
             }
         }
         let RoomState { scene, volume, .. } = self;
@@ -452,16 +445,17 @@ impl RoomState {
             let x = &mut e.effect;
             x.update_lights(lights.iter().copied());
             x.set_time(self.time);
+            let water_box = self.aquarium.as_ref().map(Aquarium::water_box);
             let mut casters: Vec<(GVec3, GVec3)> = self.dragon_box.into_iter().collect();
-            if water.is_some() && x.water_photons {
-                casters.push(Pond::water_box());
+            if let (Some(b), true) = (water_box, water.is_some() && x.water_photons) {
+                casters.push(b);
             }
             x.set_casters(&casters);
             x.set_water(water);
-            // fed every `caustics_every` frames, four times as seldom with the pond out of view
-            // (the mirrors may still show it)
-            let (lo, hi) = Pond::water_box();
-            let (lo, hi) = self.dragon_box.map_or((lo, hi), |(a, b)| (lo.min(a), hi.max(b)));
+            // fed every `caustics_every` frames, four times as seldom with the tank and the dragon
+            // out of view (the mirrors may still show them)
+            let boxes: Vec<(GVec3, GVec3)> = water_box.into_iter().chain(self.dragon_box).collect();
+            let (lo, hi) = boxes.iter().fold((GVec3::splat(f32::MAX), GVec3::splat(f32::MIN)), |(lo, hi), (a, b)| (lo.min(*a), hi.max(*b)));
             let seen = kansei_core::culling::aabb_in_frustum(&kansei_core::culling::frustum_planes(view_proj), lo, hi);
             let every = self.settings.caustics_every.round().clamp(1.0, 16.0) as u32;
             x.interval = if seen { every } else { every * 4 };
@@ -566,32 +560,37 @@ impl RoomState {
     /// The HUD's lines about the room.
     fn status(&self) -> String {
         let s = &self.settings;
-        let pond = self.pond.as_ref().map_or(String::new(), |p| {
-            let speed = p.speed().filter(|_| p.state_name() == "running").map_or(String::new(), |(max, above)| format!(" (fastest {max:.2} m/s, {above} over {:.2})", pond::SETTLE_SPEED));
-            format!("\npond   {} particles, {}{speed}", p.particles(), p.state_name())
+        let aquarium = self.aquarium.as_ref().map_or(String::new(), |p| {
+            let speed = p.speed().filter(|_| p.state_name() == "running").map_or(String::new(), |(max, above)| format!(" (fastest {max:.2} m/s, {above} over {:.2})", aquarium::SETTLE_SPEED));
+            format!("\naquarium {} particles, {}{speed}", p.particles(), p.state_name())
         });
         format!(
-            "room   GI {} · shadows {} · floor {} · fog {} · dust {} · camera {}{}\n",
+            "room   {} · GI {} · shadows {} · fog {} · dust {} · camera {}{}\n",
+            if s.render == "forward" { "forward (no ray tracing, no GI: render=hybrid for the full room)" } else { "hybrid" },
             s.gi,
             if s.shadows == "rt" { "ray traced" } else { "shadow maps" },
-            s.floor,
-            if s.fog > 0.0 { "on" } else { "off" },
+            if s.fog > 0.0 && s.render != "forward" { "on" } else { "off" },
             self.dust.as_ref().filter(|_| s.dust).map_or("off".to_string(), |d| format!("{} motes", (d.count() as f32 * s.dust_amount.clamp(0.0, 1.0)) as u32)),
-            self.view.unwrap_or("following"),
-            pond,
+            self.view_name().unwrap_or("following"),
+            aquarium,
         )
+    }
+
+    /// The fixed view's name, if one.
+    fn view_name(&self) -> Option<&str> {
+        self.view.map(|k| self.layout.views[k].name.as_str())
     }
 
     /// A fixed view by name, or back to following the character.
     fn set_view(&mut self, name: &str) {
-        self.view = VIEWS.iter().find(|v| v.0 == name).map(|v| v.0);
-        if let Some(&(_, target, distance, azimuth, elevation)) = VIEWS.iter().find(|v| Some(v.0) == self.view) {
-            self.controls.set_view(Vec3::new(target[0], target[1], target[2]), distance, azimuth, elevation);
+        self.view = self.layout.views.iter().position(|v| v.name == name);
+        if let Some(v) = self.view.map(|k| &self.layout.views[k]) {
+            self.controls.set_view(Vec3::new(v.target.x, v.target.y, v.target.z), v.distance, v.azimuth, v.elevation);
         } else if let Some(c) = &self.player.character {
             let at = c.controller.matcher.character();
             self.controls.set_view(Vec3::new(at.translation.x, 0.9, at.translation.z), 4.5, std::f32::consts::PI + kansei_core::animation::motion_matching::yaw_of(at.rotation), 0.25);
         } else {
-            stand_in_view(&mut self.controls);
+            stand_in_view(&mut self.controls, self.layout.spawn);
         }
     }
 
@@ -617,25 +616,12 @@ impl RoomState {
                 }
             }
         }
-        if changed(|s| s.floor.clone()) || changed(|s| format!("{}", s.floor_rough)) {
-            let rebuild = old.is_some() && changed(|s| s.floor.clone());
+        // the floor's roughness: its material's, scaled
+        if changed(|s| format!("{}", s.floor_rough)) {
             for surface in self.layout.surfaces.iter_mut().filter(|f| f.floor) {
-                let params = layout::floor_params(&s.floor, s.floor_rough, deferred);
-                surface.params = params;
-                let Some(r) = self.scene.get_renderable_mut(surface.index) else { continue };
-                if rebuild {
-                    r.material = pbr::material("Floor", self.assets.surface(&s.floor, "Floor"), &params, false);
-                    r.material_dirty = true;
-                    r.gi = Some(kansei_core::gi::GiSurface::new(layout::mean(&s.floor, [1.0; 3])));
-                    r.rt = Some(RtSurface::new(layout::mean(&s.floor, [1.0; 3])));
-                    layout::texture_rt(r, &s.floor, &params, self.assets.surfaces.contains_key(s.floor.as_str()));
-                } else if let Some(buffer) = r.material.bindable_buffer(0) {
-                    queue.write_buffer(&buffer, 0, bytemuck::bytes_of(&params));
-                }
-            }
-            if rebuild {
-                if let Some(gi) = self.renderer.voxel_gi_mut() {
-                    gi.invalidate();
+                surface.params.surface[1] = surface.roughness * s.floor_rough.max(0.0);
+                if let Some(buffer) = self.scene.get_renderable(surface.index).and_then(|r| r.material.bindable_buffer(0)) {
+                    queue.write_buffer(&buffer, 0, bytemuck::bytes_of(&surface.params));
                 }
             }
         }
@@ -665,7 +651,8 @@ impl RoomState {
                 // ray traced, the lamps need no shadow map (only the fog and the GI's hits read
                 // them, and the skylight's is the one that shows there): four fewer redraws of
                 // the room a frame
-                l.cast_shadow = !deferred;
+                // (forward, for speed, only the sun and the skylight cast shadows)
+                l.cast_shadow = !deferred && s.render != "forward";
             }
         }
         if let Some(Light::Spot(l)) = self.scene.get_light_mut(self.layout.lights.display) {
@@ -773,7 +760,7 @@ impl RoomState {
             e.effect.focus_sharpen = s.caustics_sharpen.clamp(0.1, 1.0);
             e.effect.set_glass(s.glass_ior, GLASS_TINT);
         }
-        for (k, &mirror) in self.layout.mirrors.iter().enumerate() {
+        for (k, &(mirror, _)) in self.layout.mirrors.iter().enumerate() {
             let roughness = if k == 0 { s.mirror_rough } else { s.mirror2_rough };
             if let Some(r) = self.scene.get_renderable_mut(mirror) {
                 r.material.set_standard_lit(&self.renderer, &StandardLitOptions::mirror([0.92; 3], roughness));
@@ -788,15 +775,15 @@ impl RoomState {
             let j = s.json();
             j.split(",\"").filter(|f| f.starts_with("fluid") && !f.starts_with("fluid_fill")).collect::<Vec<_>>().join(",")
         };
-        if let (Some(pond), true) = (&mut self.pond, changed(fluid)) {
+        if let (Some(aquarium), true) = (&mut self.aquarium, changed(fluid)) {
             if let Some(surface) = self.volume.effect_mut::<FluidSurfaceEffect>() {
-                pond.rebuild_surface(&self.renderer, &mut self.scene, surface, &s);
-                pond.apply(&mut self.scene, surface, &s);
+                aquarium.rebuild_surface(&self.renderer, &mut self.scene, surface, &s);
+                aquarium.apply(&mut self.scene, surface, &s);
             }
         }
-        if let (Some(pond), true) = (&mut self.pond, old.as_ref().is_some_and(|o| o.fluid_fill != s.fluid_fill)) {
+        if let (Some(aquarium), true) = (&mut self.aquarium, old.as_ref().is_some_and(|o| o.fluid_fill != s.fluid_fill)) {
             if let Some(surface) = self.volume.effect_mut::<FluidSurfaceEffect>() {
-                pond.reset(surface, s.fluid_fill);
+                aquarium.reset(surface, s.fluid_fill);
             }
         }
 
@@ -893,13 +880,14 @@ impl RoomState {
         let cpu: Vec<String> = self.stats.as_ref().map_or(Vec::new(), |s| s.cpu.iter().map(|(l, ms)| format!("[\"{l}\",{ms:.3}]")).collect());
         let grid = self.renderer.rt_grid().map(|g| g.stats());
         format!(
-            "{{\"settings\":{},\"camera\":\"{}\",\"character\":{},\"pond\":{},\"fluid\":{},\"proxy_triangles\":{:?},\"grid_triangles\":{},\"grid_rebuilds\":{},\"dragon\":{},\"caustics\":[{},{}],\"size\":[{},{}],\"frame_ms\":{:.2},\"gpu_ms\":{:.3},\"gpu_span_ms\":{:.3},\"passes\":[{}],\"cpu\":[{}]}}",
+            "{{\"settings\":{},\"camera\":\"{}\",\"character\":{},\"room_triangles\":{{{}}},\"aquarium\":{},\"fluid\":{},\"proxy_triangles\":{:?},\"grid_triangles\":{},\"grid_rebuilds\":{},\"dragon\":{},\"caustics\":[{},{}],\"size\":[{},{}],\"frame_ms\":{:.2},\"gpu_ms\":{:.3},\"gpu_span_ms\":{:.3},\"passes\":[{}],\"cpu\":[{}]}}",
             self.settings.json(),
-            self.view.unwrap_or("follow"),
+            self.view_name().unwrap_or("follow"),
             self.player.character.is_some(),
-            self.pond.as_ref().map_or(0, Pond::particles),
-            match (&self.pond, self.volume.effect::<FluidSurfaceEffect>()) {
-                (Some(pond), Some(surface)) => pond.surface_json(surface),
+            self.layout.triangles.iter().map(|(k, n)| format!("\"{k}\":{n}")).collect::<Vec<_>>().join(","),
+            self.aquarium.as_ref().map_or(0, Aquarium::particles),
+            match (&self.aquarium, self.volume.effect::<FluidSurfaceEffect>()) {
+                (Some(aquarium), Some(surface)) => aquarium.surface_json(surface),
                 _ => "null".into(),
             },
             self.proxy.as_ref().map_or(Vec::new(), |p| p.triangles(&self.scene)),
@@ -953,20 +941,36 @@ where
     // voxels and the fallback)
     renderer.enable_spot_shadows(2048, 6);
     renderer.enable_cascaded_shadows(CascadedShadowOptions { max_distance: 70.0, ..Default::default() });
-    renderer.enable_voxel_gi(SceneVoxelGiOptions { quality: VoxelGiQuality::Medium, bounds_min: BOUNDS_MIN, bounds_max: BOUNDS_MAX, radiance_scale: 1.0, budget_bytes: 0 });
     let mut settings = Settings::from_url();
-    renderer.enable_rt_grid(grid_options(settings.grid_lod_cm));
     let deferred = settings.shadows == "rt";
+    // forward (`render=forward`): no voxel GI or ray tracing grid at all, a flat fill for the GI
+    let forward = settings.render == "forward";
+    layout::set_fill(if forward { FORWARD_FILL } else { [0.0; 3] });
 
+    // the room (`www/assets/room/room.glb`, from Blender), then voxel GI and the grid over its box
     set_text("hud", "Loading the room …");
-    let assets = Assets::load(&renderer).await;
     let mut scene = Scene::new();
-    let with_pond = kansei_wasm::flag("pond", true);
-    let mut layout = layout::build(&mut scene, &assets, with_pond.then(Pond::terrain_bounds), &settings.floor, settings.floor_rough, deferred);
-    let (pond, surface) = match with_pond {
-        true => {
-            let (p, s) = Pond::new(&renderer, &mut scene, &mut layout.collision, &assets);
-            // the fluid's box: the pond's own, unless the URL names it
+    let layout = layout::load(&renderer, &mut scene, deferred).await.map_err(|e| {
+        set_text("hud", &format!("The room didn't load: {e}"));
+        JsValue::from_str(&e)
+    })?;
+    let bounds = room_bounds(&layout);
+    if !forward {
+        renderer.enable_voxel_gi(SceneVoxelGiOptions { quality: VoxelGiQuality::Medium, bounds_min: bounds.0, bounds_max: bounds.1, radiance_scale: 1.0, budget_bytes: 0 });
+        renderer.enable_rt_grid(grid_options(settings.grid_lod_cm, bounds));
+    }
+    // the sun where the room's Blender sun points, unless the URL says
+    let d = layout.lights.sun_direction;
+    if param("sun_elev").is_none() {
+        settings.sun_elev = (-d.y).clamp(-1.0, 1.0).asin().to_degrees();
+    }
+    if param("sun_azim").is_none() {
+        settings.sun_azim = d.z.atan2(d.x).to_degrees();
+    }
+    let (aquarium, surface) = match (kansei_wasm::flag("aquarium", true), layout.tank) {
+        (true, Some(tank)) => {
+            let (p, s) = Aquarium::new(&renderer, &mut scene, tank);
+            // the fluid's box: the tank's own, unless the URL names it
             let (min, max) = p.bounds();
             for (name, value) in ["fluid_min_x", "fluid_min_y", "fluid_min_z", "fluid_max_x", "fluid_max_y", "fluid_max_z"].iter().zip(min.iter().chain(&max)) {
                 if kansei_wasm::param(name).is_none() {
@@ -975,10 +979,10 @@ where
             }
             (Some(p), Some(s))
         }
-        false => (None, None),
+        _ => (None, None),
     };
     let (dragon, dragon_box) = match kansei_wasm::flag("dragon", true) {
-        true => add_dragon(&mut scene).await.map_or((None, None), |(d, b)| (Some(d), Some(b))),
+        true => add_dragon(&mut scene, layout.dragon).await.map_or((None, None), |(d, b)| (Some(d), Some(b))),
         false => (None, None),
     };
     // the sky behind the windows and the skylight (its colours set by `apply`)
@@ -994,62 +998,67 @@ where
         }
     }
 
-    // the character (or, without a pack, a capsule standing in for it), facing the pond
+    // the character (or, without a pack, a capsule standing in for it), at the spawn marker
     let page_note = "\n\nThe room renders without one: a capsule stands in for the character.";
     let mut character = load_character(&renderer, &mut scene, &layout.collision, &RoomLit { deferred }, &load, page_note).await;
     let mut bodies = Vec::new();
     if let Some(c) = &mut character {
+        // the parkour the room's tagged pieces give: hangs and shimmies on its ledges, wall runs,
+        // bars, jumps aimed along its platforms
+        c.controller.features = ParkourFeatures::from_pieces(&layout::parkour_pieces(&layout.traversals), &layout.collision);
+        log::info!("room: parkour {} edges, {} bars, {} wall faces, {} platforms", c.controller.features.edges.len(), c.controller.features.bars.len(), c.controller.features.faces.len(), c.controller.features.platforms.len());
         if param("at").is_none() {
-            c.controller.matcher.teleport(GVec3::from(START), START_HEADING);
+            c.controller.matcher.teleport(layout.spawn.0, layout.spawn.1);
         }
         bodies.extend(c.bodies.iter().map(|b| b.index));
     } else {
-        bodies.push(look::stand_in(&mut scene, GVec3::from(START), deferred));
+        bodies.push(look::stand_in(&mut scene, layout.spawn.0, deferred));
     }
-    let proxy = character.as_ref().filter(|_| kansei_wasm::flag("rt_body", true)).map(|c| Proxy::new(&renderer, &mut scene, c, deferred));
+    let hero_layer = layout.albedo_layers.len() as u8;
+    let proxy = character.as_ref().filter(|_| !forward && kansei_wasm::flag("rt_body", true)).map(|c| Proxy::new(&renderer, &mut scene, c, deferred, hero_layer));
 
-    let mut volume = PostProcessingVolume::new(&renderer, build_effects(&renderer, surface, &sky_lighting));
+    let mut volume = PostProcessingVolume::new(&renderer, build_effects(&renderer, surface, &sky_lighting, &layout, forward));
     // the albedo the reflections' hits read: the surfaces' colour maps and the hero's
     let hero = character.as_ref().and_then(|c| c.bodies.iter().find_map(|b| b.base_color.as_ref())).map(|(img, _)| {
         let mut t = kansei_core::buffers::Texture::from_image("Room/HeroAlbedo", img, true);
         t.initialize_with_data(renderer.device(), renderer.queue());
         t
     });
-    let extra: Vec<&wgpu::TextureView> = hero.iter().filter_map(|t| t.view()).collect();
-    let (albedo_texture, albedo) = assets::albedo_array(&renderer, &assets, &extra);
+    let sources: Vec<&wgpu::TextureView> = layout.albedo_layers.iter().map(|(v, _)| v).chain(hero.iter().filter_map(|t| t.view())).collect();
+    let (albedo_texture, albedo) = assets::albedo_array(&renderer, &sources);
     if let Some(e) = volume.effect_mut::<Switch<RtReflectionsEffect>>() {
         e.effect.set_albedo_texture(Some(&albedo));
     }
-    // the surfaces' albedo in the grid and voxel GI: their textures' measured means (times their
-    // tints), in place of the guesses `layout::mean` made before the textures were drawn
+    // the surfaces' albedo in the grid and voxel GI: their colour maps' measured means times their
+    // tints, in place of the guesses the layout made before the textures were drawn
     let means = assets::albedo_means(&renderer, &albedo_texture).await;
     let indices: Vec<usize> = scene.ordered_indices().collect();
     for idx in indices {
         let Some(r) = scene.get_renderable_mut(idx) else { continue };
-        let Some(layer) = r.rt.and_then(|rt| rt.albedo_layer).map(usize::from).filter(|&l| l < assets::SURFACES.len()) else { continue };
-        let guess = layout::mean(assets::SURFACES[layer], [1.0; 3]);
-        let scale: [f32; 3] = std::array::from_fn(|c| means[layer][c] / guess[c].max(1e-3));
+        let Some(layer) = r.rt.and_then(|rt| rt.albedo_layer).map(usize::from).filter(|&l| l < layout.albedo_layers.len()) else { continue };
+        let tint = layout.albedo_layers[layer].1;
+        let albedo: [f32; 3] = std::array::from_fn(|c| (means[layer][c] * tint[c]).min(1.0));
         if let Some(rt) = r.rt.as_mut() {
-            rt.albedo = std::array::from_fn(|c| (rt.albedo[c] * scale[c]).min(1.0));
+            rt.albedo = albedo;
         }
         if let Some(gi) = r.gi.as_mut() {
-            gi.albedo = std::array::from_fn(|c| (gi.albedo[c] * scale[c]).min(1.0));
+            gi.albedo = albedo;
         }
     }
-    log::info!("room: albedo means {:?}", assets::SURFACES.iter().zip(&means).map(|(n, m)| format!("{n} {:.2} {:.2} {:.2}", m[0], m[1], m[2])).collect::<Vec<_>>());
     let dust_count: u32 = param_or("dust_count", 65536);
-    let dust = (dust_count > 0).then(|| Dust::new(&renderer, &mut scene, dust_count, GVec3::ZERO));
+    let (lo, hi) = (layout.min, layout.max);
+    let dust = (dust_count > 0 && (!forward || settings.dust)).then(|| Dust::new(&renderer, &mut scene, dust_count, GVec3::ZERO, (hi.x - lo.x).min(hi.z - lo.z) * 0.5, hi.y - lo.y));
 
     let mut camera = Camera::new(45.0, 0.1, 700.0, canvas.aspect());
     camera.update_projection_matrix();
     let start = character.as_ref().map(|c| c.controller.matcher.character()).unwrap_or_default();
-    let at = if character.is_some() { start.translation } else { GVec3::from(START) };
+    let at = if character.is_some() { start.translation } else { layout.spawn.0 };
     let mut controls = CameraControls::from_canvas(canvas.element(), Vec3::new(at.x, 0.9, at.z), 4.5).with_mouse_pan(canvas.element());
     controls.set_elevation(0.25);
-    let heading = if character.is_some() { kansei_core::animation::motion_matching::yaw_of(start.rotation) } else { START_HEADING };
+    let heading = if character.is_some() { kansei_core::animation::motion_matching::yaw_of(start.rotation) } else { layout.spawn.1 };
     controls.set_azimuth(std::f32::consts::PI + heading + param_or("view", 0.0f32).to_radians());
     if character.is_none() {
-        stand_in_view(&mut controls);
+        stand_in_view(&mut controls, layout.spawn);
     }
 
     let mut player = Player::new(character);
@@ -1063,9 +1072,8 @@ where
         controls,
         volume,
         player,
-        assets,
         layout,
-        pond,
+        aquarium,
         dust,
         proxy,
         dragon,
@@ -1109,7 +1117,7 @@ pub fn room_settings() -> String {
 /// The fixed views' names, as JSON (`follow` first).
 #[wasm_bindgen]
 pub fn room_views() -> String {
-    let names: Vec<String> = VIEWS.iter().map(|v| format!("\"{}\"", v.0)).collect();
+    let names: Vec<String> = with_room(|s| s.layout.views.iter().map(|v| format!("\"{}\"", v.name)).collect()).unwrap_or_default();
     format!("[\"follow\",{}]", names.join(","))
 }
 
@@ -1126,15 +1134,31 @@ pub fn room_set(key: &str, value: &str) -> bool {
     .unwrap_or(false)
 }
 
-/// Fill the pond again, still (`fluid_fill` of it).
+/// Fill the aquarium again, still (`fluid_fill` of it).
 #[wasm_bindgen]
-pub fn room_pond_reset() {
+pub fn room_aquarium_reset() {
     with_room(|s| {
         let fill = s.settings.fluid_fill;
-        if let (Some(pond), Some(surface)) = (&mut s.pond, s.volume.effect_mut::<FluidSurfaceEffect>()) {
-            pond.reset(surface, fill);
+        if let (Some(aquarium), Some(surface)) = (&mut s.aquarium, s.volume.effect_mut::<FluidSurfaceEffect>()) {
+            aquarium.reset(surface, fill);
         }
     });
+}
+
+/// The pieces of the room tagged for parkour (`kansei_traversal` and its properties), as JSON:
+/// `[{"name", "kind", "min", "max", "extras"}, ...]`, for the controller's moves to come.
+#[wasm_bindgen]
+pub fn room_parkour() -> String {
+    with_room(|s| {
+        let rows: Vec<String> = s
+            .layout
+            .traversals
+            .iter()
+            .map(|t| format!("{{\"name\":\"{}\",\"kind\":\"{}\",\"min\":{:?},\"max\":{:?},\"extras\":{}}}", t.name, t.want, t.min.to_array(), t.max.to_array(), t.extras))
+            .collect();
+        format!("[{}]", rows.join(","))
+    })
+    .unwrap_or_default()
 }
 
 /// Whether the furniture meant for parkour is traversable as meant (`layout::check_traversals`),
@@ -1142,7 +1166,7 @@ pub fn room_pond_reset() {
 #[wasm_bindgen]
 pub fn room_check() -> String {
     with_room(|s| {
-        let rows: Vec<String> = layout::check_traversals(&s.layout.collision)
+        let rows: Vec<String> = layout::check_traversals(&s.layout.collision, &s.layout.traversals)
             .into_iter()
             .map(|(name, r)| format!("[\"{name}\",{}]", r.err().map_or("null".to_string(), |e| format!("\"{e}\""))))
             .collect();

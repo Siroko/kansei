@@ -39,7 +39,7 @@
     <script type="module">
         // the room page of the motion-matching module (`start_room`); the character's exports are
         // the same as www/index.html's
-        import init, { start_room, room_info, room_set, room_settings, room_views, room_check, room_pond_reset, drive_restart, motion_timings } from '../pkg/kansei_wasm_motion_matching.js';
+        import init, { start_room, room_info, room_set, room_settings, room_views, room_check, room_parkour, room_aquarium_reset, drive_restart, motion_timings } from '../pkg/kansei_wasm_motion_matching.js';
         await init();
         await start_room('kansei');
         // for scripted captures: room.info() (with stats, each pass's GPU time), room.set('gi', 'voxel')
@@ -48,6 +48,7 @@
             settings: () => JSON.parse(room_settings() || '{}'),
             set: (key, value) => room_set(key, String(value)),
             check: () => JSON.parse(room_check()),
+            parkour: () => JSON.parse(room_parkour()),
         };
         window.driveRestart = drive_restart;
         window.motionTimings = () => JSON.parse(motion_timings() || '{}');
@@ -62,15 +63,15 @@
         // the glass and the water: 'game' (the default) trades exactness for speed where it barely
         // shows; 'high' is the physical path (settings::Settings::apply_quality)
         const QUALITIES = {
-            'game': { glass_checker: true, glass_refl_shared: true, caustics_water_photons: false, caustics_area: false, caustics_photons: 128, caustics_every: 2, caustics_glass_gain: 3, caustics_sharpen: 0.5 },
+            'game': { glass_checker: true, glass_refl_shared: true, caustics_water_photons: true, caustics_area: false, caustics_photons: 128, caustics_every: 2, caustics_glass_gain: 3, caustics_sharpen: 0.5 },
             'high': { glass_checker: false, glass_refl_shared: false, caustics_water_photons: true, caustics_area: true, caustics_photons: 256, caustics_every: 1, caustics_glass_gain: 1, caustics_sharpen: 1 },
         };
         const LOOKS = {
-            'golden hour': { sun: true, sun_lux: 9000, sun_elev: 24, sun_azim: 20, sun_temp: 3600, sky: true, sky_cd: 32000, sky_temp: 7500, sky_radiance: 2500, lamps: true, lamp_cd: 700, lamp_temp: 2700, fog: 0.002, ev: 9.0, floor: 'marble' },
+            'golden hour': { sun: true, sun_lux: 9000, sun_elev: 24, sun_azim: 20, sun_temp: 3600, sky: true, sky_cd: 32000, sky_temp: 7500, sky_radiance: 2500, lamps: true, lamp_cd: 700, lamp_temp: 2700, fog: 0.002, ev: 9.0 },
             'midday': { sun: true, sun_lux: 40000, sun_elev: 58, sun_azim: 10, sun_temp: 5600, sky: true, sky_cd: 60000, sky_temp: 6800, sky_radiance: 7000, lamps: false, fog: 0.002, ev: 8.0 },
             'overcast': { sun: false, sky: true, sky_cd: 52000, sky_temp: 7200, sky_radiance: 4500, lamps: true, lamp_cd: 600, lamp_temp: 2900, fog: 0.005, ev: 6.0 },
-            'night lamps': { sun: false, sky: true, sky_cd: 1500, sky_temp: 9000, sky_radiance: 25, lamps: true, lamp_cd: 1400, lamp_temp: 2500, fog: 0.006, ev: 1.6, floor: 'wood' },
-            'gallery': { sun: false, sky: true, sky_cd: 70000, sky_temp: 6000, sky_radiance: 5000, lamps: false, fog: 0.0015, ev: 6.5, floor: 'marble' },
+            'night lamps': { sun: false, sky: true, sky_cd: 1500, sky_temp: 9000, sky_radiance: 25, lamps: true, lamp_cd: 1400, lamp_temp: 2500, fog: 0.006, ev: 1.6 },
+            'gallery': { sun: false, sky: true, sky_cd: 70000, sky_temp: 6000, sky_radiance: 5000, lamps: false, fog: 0.0015, ev: 6.5 },
         };
         const POSTS = {
             'neutral': { tonemap: 'agx', exposure_comp: 0, white_temp: 6500, tint: 0, contrast: 1.0, saturation: 1.0, lift: 1.0, gain: 1.0, highlights: 1.0, bloom: true, bloom_intensity: 0.04, bloom_threshold: 1.0, vignette: 0.15, grain: 0.0, chromatic: 0.0 },
@@ -118,10 +119,16 @@
         const top = pane.addFolder({ title: 'Presets' });
         top.addBinding(presets, 'look', { options: { ...options(Object.keys(LOOKS)), custom: 'custom' } }).on('change', (ev) => applyPreset(LOOKS, ev.value));
         top.addBinding(presets, 'quality', { label: 'glass & water', options: { ...options(Object.keys(QUALITIES)), custom: 'custom' } }).on('change', (ev) => applyPreset(QUALITIES, ev.value));
+        // how the room is drawn: set at start, so a change reloads the page with it in the URL
+        // (forward: no ray tracing, no GI; for iterating on the character's moves)
+        top.addBinding(p, 'render', { label: 'render', options: { 'hybrid (ray traced, GI)': 'hybrid', 'forward (post only, fast)': 'forward' } }).on('change', (ev) => {
+            const url = new URL(window.location.href);
+            url.searchParams.set('render', ev.value);
+            window.location.href = url.toString();
+        });
         top.addBinding(p, 'cam', { label: 'camera', options: options(JSON.parse(room_views())) }).on('change', (ev) => set('cam', ev.value));
 
         const scene = pane.addFolder({ title: 'Scene', expanded: false });
-        bind(scene, 'floor', { options: { 'white marble slabs': 'marble', 'oak herringbone': 'wood' } });
         bind(scene, 'floor_rough', { label: 'floor roughness', min: 0.2, max: 2.0, step: 0.05 });
         bind(scene, 'mirror_rough', { label: 'mirror roughness', min: 0, max: 0.5, step: 0.01 });
         bind(scene, 'mirror2_rough', { label: 'brushed mirror', min: 0, max: 0.5, step: 0.01 });
@@ -186,15 +193,15 @@
         bind(air, 'dust_mix', { label: 'fibres & flecks', min: 0, max: 1, step: 0.01 });
         bind(air, 'dust_speed', { label: 'drift (m/s)', min: 0, max: 0.5, step: 0.005 });
 
-        // the pond: all live but the fill (Reset pond); its surface is marching cubes over a
+        // the aquarium's water: all live but the fill (Refill aquarium); its surface is marching cubes over a
         // splatted field (the engine has no ray-marched surface or foam)
-        const water = pane.addFolder({ title: 'Fluid (the pond)', expanded: false });
+        const water = pane.addFolder({ title: 'Fluid (the aquarium)', expanded: false });
         bind(water, 'fluid', { label: 'simulate' });
         bind(water, 'fluid_show', { label: 'show water' });
         bind(water, 'fluid_rest', { label: 'sleep when still' });
         bind(water, 'fluid_solver', { label: 'solver', options: { SPH: 'sph', 'position based (PBF)': 'pbf' } });
         bind(water, 'fluid_fill', { label: 'fill (resets)', min: 0.2, max: 1, step: 0.05 });
-        water.addButton({ title: 'Reset pond' }).on('click', () => room_pond_reset());
+        water.addButton({ title: 'Refill aquarium' }).on('click', () => room_aquarium_reset());
         bind(water, 'fluid_speed', { label: 'time scale', min: 0.1, max: 3, step: 0.05 });
         bind(water, 'fluid_substeps', { label: 'substeps', min: 1, max: 12, step: 1 });
         bind(water, 'fluid_gravity', { label: 'gravity (m/s²)', min: 0, max: 30, step: 0.1 });
@@ -234,7 +241,6 @@
         const look = water.addFolder({ title: 'Surface', expanded: false });
         bind(look, 'fluid_render', { label: 'drawn as', options: { 'ray-traced glass': 'rt', 'screen space': 'screen' } });
         bind(look, 'fluid_ripples', { label: 'ripples', min: 0, max: 3, step: 0.05 });
-        bind(look, 'fluid_bed', { label: 'bed', options: { 'pale marble': 'marble', gravel: 'gravel', 'black marble (reflecting pool)': 'blackmarble' } });
         bind(look, 'fluid_mesh', { label: 'mesh', options: { 'smooth (marching cubes)': 'smooth', voxels: 'voxels' } });
         bind(look, 'fluid_ior', { label: 'IOR', min: 1, max: 2, step: 0.01 });
         bind(look, 'fluid_tint', { label: 'tint', min: 0, max: 2, step: 0.01 });

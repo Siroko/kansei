@@ -1,87 +1,101 @@
-//! The room: 40 x 40 m and 9 m high. A marble or oak herringbone floor, plaster walls (a
-//! terracotta one to the south, grey limewash behind the big mirror to the north), three
-//! tall steel-framed windows to the west that the low sun comes through, a skylight in the
-//! concrete ceiling over the pond with oak beams crossing it, four concrete columns, and the
-//! furniture (CC0 models, `assets`): a living corner, a dining table under a pendant, a library,
-//! and blocks of dark marble and oak to vault, mantle and climb. Everything solid is in the collision
-//! world, voxel GI and the ray tracing grid.
+//! The room: a loft gallery authored in Blender and exported as `www/assets/room/room.glb`
+//! (`tools/room_glb.py`; the .blend lives outside the repository, see the README's "The room").
+//! Everything solid is in the collision world, voxel GI and the ray tracing grid.
 //!
-//! One-sided: the shell (walls, floor, ceiling) is drawn with back faces discarded on screen, so
-//! from outside (the orbit camera past a wall or above the ceiling) the camera looks through it
-//! into the room, while the shadow maps draw both sides (the sun outside casts the room's shadow
-//! into it). The grid's rays hit a triangle from either side, so the GI's and the mirrors' rays
-//! meet the walls as they should.
+//! The glb is read by the names and custom properties (glTF extras) the README's contract lists:
+//! meshes are merged by material (and by how they are drawn) into one renderable each, so the
+//! room is a draw per material; `<name>_COL` boxes are the collision world, `<name>_SHADOW` meshes
+//! what their parent casts into the shadow maps, `_CUT` meshes Blender's boolean cutters (skipped);
+//! `kansei` names a role (`shell`, `mirror`, `glass`, `aquarium`, `caustics`, `dragon`, `spawn`,
+//! `preview`); lights carry `kansei_light` (`sun`, `skylight`, `lamp`,
+//! `display`); cameras named `CAM_<view>` are the page's fixed views.
+//!
+//! One-sided: the shell (`kansei: shell`: walls, floor, ceiling) is drawn with back faces discarded
+//! on screen, so from outside (the orbit camera past a wall or above the ceiling) the camera looks
+//! through it into the room, while the shadow maps draw both sides (the sun outside casts the
+//! room's shadow into it). The grid's rays hit a triangle from either side, so the GI's and the
+//! mirrors' rays meet the walls as they should.
 
-use glam::{Quat, Vec3 as GVec3};
+use std::collections::HashMap;
 
+use glam::{Mat3, Mat4, Vec3 as GVec3};
+
+use kansei_core::animation::motion_matching::traversal::features::ParkourPiece;
 use kansei_core::collision::{CollisionWorld, Obb};
-use kansei_core::geometries::{BoxGeometry, CylinderGeometry, Geometry, PlaneGeometry};
+use kansei_core::geometries::{Geometry, Vertex};
 use kansei_core::gi::GiSurface;
 use kansei_core::lights::{DirectionalLight, Light, SpotLight};
+use kansei_core::loaders::{GLTFLoader, GLTFResult};
 use kansei_core::materials::{Material, StandardLitOptions};
 use kansei_core::math::Vec3;
 use kansei_core::objects::{Renderable, Scene, SceneNode};
+use kansei_core::renderers::Renderer;
 use kansei_core::rt::RtSurface;
+use serde_json::Value;
 
-use super::assets::Assets;
-use super::look;
+use super::assets::{Shared, SharedMaps};
 use super::pbr::{self, PbrParams};
-
-/// Half the room's width and depth, and its height (m).
-pub const HALF: f32 = 20.0;
-pub const HEIGHT: f32 = 9.0;
-
-/// Where the character starts: south of the pond, facing it (north, -z).
-pub const START: [f32; 3] = [0.0, 0.0, 12.0];
-pub const START_HEADING: f32 = std::f32::consts::PI;
-
-/// The skylight's opening (x and z half sizes, m), over the pond.
-pub const SKYLIGHT: [f32; 2] = [3.0, 6.0];
-/// The west windows: their centres along z, half width, sill and head heights.
-const WINDOWS: [f32; 3] = [-10.0, 0.0, 10.0];
-const WINDOW_HALF: f32 = 2.2;
-const SILL: f32 = 0.9;
-const HEAD: f32 = 7.2;
-
-/// The lights as built (scene indices): the sun, the skylight's area light, the lamps (the
-/// skylight is the first spot light: `RtShadowsEffect::set_rect_emitter(0, ..)`), and the lamps'
-/// shades.
-pub struct Lights {
-    pub sun: usize,
-    pub skylight: usize,
-    pub lamps: Vec<usize>,
-    pub shades: Vec<usize>,
-    /// The display spot over the glass dragon (the last spot light).
-    pub display: usize,
-}
+use super::aquarium::Tank;
 
 /// Default light levels: the sun's illuminance (lux), the skylight's and a lamp's intensity (cd),
-/// a shade's radiance (cd/m²).
+/// a shade's radiance (cd/m²), the display spot's intensity (cd).
 pub const SUN_LUX: f32 = 9000.0;
 pub const SKYLIGHT_CD: f32 = 32000.0;
 pub const LAMP_CD: f32 = 700.0;
 pub const SHADE_RADIANCE: f32 = 900.0;
-pub const SUN_DIR: [f32; 3] = [0.86, -0.4, 0.32];
-pub const SUN_COLOR: [f32; 3] = [1.0, 0.74, 0.5];
-pub const LAMP_COLOR: [f32; 3] = [1.0, 0.68, 0.4];
-/// The display spot on the dragon: hung under a beam well past it (seen from the room's entrance),
-/// aimed at its middle, low enough that the light it focuses and its shadow fall forward, over the
-/// plinth's top onto the pond's bed in front; its intensity (cd), its narrow cone (inner and outer
-/// half-angles, degrees) over the dragon and the plinth, a small emitter (sharp shadows and
-/// caustics), a neutral warm white. A theatre's follow spot (about 7000 lux on the plinth, the
-/// sun's on the floor): dimmer, its pool and the dragon's caustics drown in the skylight's.
-pub const DISPLAY_AT: [f32; 3] = [0.0, HEIGHT - 0.62, -12.0];
-pub const DISPLAY_AIM: [f32; 3] = [0.0, 1.0, 0.0];
 pub const DISPLAY_CD: f32 = 1_500_000.0;
-const DISPLAY_CONE: [f32; 2] = [7.0, 11.0];
-pub const DISPLAY_COLOR: [f32; 3] = [1.0, 0.86, 0.72];
+const SUN_COLOR: [f32; 3] = [1.0, 0.74, 0.5];
+const LAMP_COLOR: [f32; 3] = [1.0, 0.68, 0.4];
+const DISPLAY_COLOR: [f32; 3] = [1.0, 0.86, 0.72];
+/// cd/m² for a unit of Blender's emission strength (its shades' 6 are `SHADE_RADIANCE`).
+const EMISSION_SCALE: f32 = 150.0;
+const MIRROR: [f32; 3] = [0.92, 0.92, 0.92];
+const MIRROR_GI: [f32; 3] = [0.03, 0.03, 0.03];
 
-/// A PBR surface in the room, for the page to change (deferred lighting, roughness, floors).
+/// The lights as built (scene indices): the sun, the skylight's area light (the first spot light:
+/// `RtShadowsEffect::set_rect_emitter(0, ..)`) and its rectangle, the lamps, the glowing shades,
+/// the display spot over the dragon (the last spot light).
+pub struct Lights {
+    pub sun: usize,
+    pub sun_direction: GVec3,
+    pub skylight: usize,
+    /// The skylight's emitter: its extent along z and along x (m), as `set_rect_emitter` takes it
+    /// for a light pointing down.
+    pub skylight_rect: [f32; 2],
+    pub lamps: Vec<usize>,
+    pub shades: Vec<usize>,
+    pub display: usize,
+}
+
+/// A PBR surface in the room, for the page to change (deferred lighting, the floor's roughness).
 pub struct Surface {
     pub index: usize,
     pub params: PbrParams,
-    /// One of the floor's quads (rebuilt when the floor changes).
+    /// The floor's (its roughness follows `floor_rough`), and its roughness factor as authored.
     pub floor: bool,
+    pub roughness: f32,
+}
+
+/// A fixed view (`cam=<name>`): the orbit camera's target, distance, azimuth and elevation.
+pub struct View {
+    pub name: String,
+    pub target: GVec3,
+    pub distance: f32,
+    pub azimuth: f32,
+    pub elevation: f32,
+}
+
+/// A piece meant for parkour (`kansei_traversal`): the traversal expected walking at it from the
+/// south, from feet `from` metres in front of it at height `from_y`, and all its properties (the
+/// course's `wallrun`, `bar`, `ledge` and `platform` carry what the controller to come needs).
+pub struct Traversal {
+    pub name: String,
+    pub min: GVec3,
+    pub max: GVec3,
+    pub from: f32,
+    pub from_y: f32,
+    pub want: String,
+    pub extras: String,
 }
 
 pub struct Layout {
@@ -89,546 +103,580 @@ pub struct Layout {
     pub collision: CollisionWorld,
     pub surfaces: Vec<Surface>,
     pub lights: Lights,
-    /// The mirrors' renderables.
-    pub mirrors: Vec<usize>,
+    /// The mirrors' renderables and their authored roughness, by name.
+    pub mirrors: Vec<(usize, f32)>,
+    pub views: Vec<View>,
+    /// Where the character starts and its heading.
+    pub spawn: (GVec3, f32),
+    /// The dragon's place on the plinth, its yaw and its length.
+    pub dragon: (GVec3, f32, f32),
+    /// The room's inside (the shell's bounds).
+    pub min: GVec3,
+    pub max: GVec3,
+    /// The aquarium's water (`kansei: aquarium`), and the rectangle (x, z) the caustics' map
+    /// covers (`kansei: caustics`, else round the tank, where the sun throws them, and the dragon).
+    pub tank: Option<Tank>,
+    pub caustics: ([f32; 2], [f32; 2]),
+    /// The colour maps the reflections' hits read (`assets::albedo_array`, a layer each) and the
+    /// tint each is drawn with.
+    pub albedo_layers: Vec<(wgpu::TextureView, [f32; 3])>,
+    pub traversals: Vec<Traversal>,
+    /// Triangles drawn, by role, for the log and the README.
+    pub triangles: Vec<(String, usize)>,
 }
 
-/// Linear tints over the textures.
-const PLASTER: [f32; 3] = [0.92, 0.9, 0.86];
-const TERRACOTTA: [f32; 3] = [0.82, 0.45, 0.32];
-const STEEL: [f32; 3] = [0.09, 0.09, 0.1];
-const MIRROR: [f32; 3] = [0.92, 0.92, 0.92];
-const MIRROR_GI: [f32; 3] = [0.03, 0.03, 0.03];
+thread_local! {
+    /// The flat fill surfaces get with no GI (`render=forward`), cd/m² per unit albedo.
+    static FILL: std::cell::Cell<[f32; 3]> = const { std::cell::Cell::new([0.0; 3]) };
+}
 
-/// How a surface is drawn: a texture `size` metres across in the world, its roughness scaled and
-/// biased, reflective (traced) or not, deferred (`RtShadowsEffect`) or not.
+/// Give the surfaces made from now on a flat fill in place of the GI (`render=forward`).
+pub fn set_fill(fill: [f32; 3]) {
+    FILL.with(|f| f.set(fill));
+}
+
+/// The fill `set_fill` gave.
+pub fn fill() -> [f32; 3] {
+    FILL.with(|f| f.get())
+}
+
+/// How a surface is drawn: a texture `size` metres across in the world (box mapped), its
+/// roughness scaled and biased, reflective (traced) or not, deferred (`RtShadowsEffect`) or not.
 pub fn surface(tint: [f32; 3], size: f32, roughness: [f32; 2], reflective: bool, deferred: bool) -> PbrParams {
     PbrParams {
         tint: [tint[0], tint[1], tint[2], 1.0],
         surface: [size, roughness[0], roughness[1], reflective as u32 as f32],
-        ambient: [0.0, 0.0, 0.0, deferred as u32 as f32],
+        ambient: { let f = fill(); [f[0], f[1], f[2], deferred as u32 as f32] },
         emissive: [0.0, 0.0, 0.0, 1.0],
         ..Default::default()
     }
 }
 
-/// The floor's surface for `floor` ("marble": slabs of 1.2 m, each its own piece of the stone, or
-/// "wood": the herringbone, lacquered: its scan's roughness a third), its roughness scaled by
-/// `roughness`.
-pub fn floor_params(floor: &str, roughness: f32, deferred: bool) -> PbrParams {
-    let (size, rough) = if floor == "wood" { (2.0, [roughness * 0.35, 0.04 * roughness]) } else { (2.4, [roughness, 0.0]) };
-    let mut p = surface([1.0, 1.0, 1.0], size, rough, true, deferred);
-    p.flags[0] = 1.0;
-    if floor != "wood" {
-        p.pattern = [1.0, 1.8, 1.0, 0.0];
-    }
-    p
-}
-
-/// A rough mean albedo for voxel GI and the grid: the tint times the surface's typical colour.
-pub fn mean(name: &str, tint: [f32; 3]) -> [f32; 3] {
-    let base = match name {
-        "marble" => [0.78, 0.78, 0.78],
-        "wood" => [0.18, 0.1, 0.06],
-        "plaster" => [0.78, 0.77, 0.74],
-        "concrete" => [0.42, 0.42, 0.41],
-        "ceiling" => [0.6, 0.6, 0.58],
-        "oak" => [0.5, 0.36, 0.22],
-        "rug" => [0.08, 0.1, 0.18],
-        "blackmarble" => [0.05, 0.05, 0.05],
-        "gravel" => [0.35, 0.34, 0.32],
-        _ => [0.5, 0.5, 0.5],
-    };
-    [base[0] * tint[0], base[1] * tint[1], base[2] * tint[2]]
-}
-
-struct Builder<'a> {
-    scene: &'a mut Scene,
-    collision: CollisionWorld,
-    assets: &'a Assets,
-    deferred: bool,
-    surfaces: Vec<Surface>,
-    /// The boxes and panels of one label and surface, each placed in the world, drawn as one
-    /// mesh (`flush`): the window frames' 24 bars are a draw a pass, not 24.
-    batches: Vec<Batch>,
-}
-
-struct Batch {
-    label: String,
+/// A material of the glb as the room draws it.
+struct RoomMaterial {
     name: String,
+    maps: SharedMaps,
     params: PbrParams,
-    albedo: [f32; 3],
-    parts: Vec<(Geometry, glam::Mat4)>,
+    /// Its colour map's layer in the albedo array.
+    layer: Option<u8>,
+    tint: [f32; 3],
+    double_sided: bool,
+    cutout: bool,
+    shade: bool,
+    emission: [f32; 3],
+    roughness: f32,
 }
 
-impl Builder<'_> {
-    /// `geometry` drawn with `name`'s maps as `params` says, at `center` turned by `yaw`, in voxel
-    /// GI as `albedo`, and in the grid when `grid`.
-    #[allow(clippy::too_many_arguments)]
-    fn add(&mut self, label: &str, geometry: Geometry, name: &str, mut params: PbrParams, albedo: [f32; 3], center: [f32; 3], yaw: f32, grid: bool) -> usize {
-        params.ambient[3] = self.deferred as u32 as f32;
-        let material = pbr::material(label, self.assets.surface(name, label), &params, false);
-        let mut r = Renderable::new(geometry, material).with_gi(GiSurface::new(albedo));
-        r.rt = grid.then(|| RtSurface::new(albedo));
-        r.object.set_position(center[0], center[1], center[2]);
-        r.object.rotation.y = yaw;
-        let index = self.scene.add(SceneNode::Renderable(r));
-        self.surfaces.push(Surface { index, params, floor: false });
-        self.texture_rt(index, name, &params);
-        index
-    }
+/// A group of meshes drawn as one renderable.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct Key {
+    material: usize,
+    shell: bool,
+    self_lit: bool,
+}
 
-    /// In the grid, `name`'s albedo layer at the box-mapped uvs of renderable `index` as placed
-    /// now (the reflections' hits then show the texture; see `texture_rt`).
-    fn texture_rt(&mut self, index: usize, name: &str, params: &PbrParams) {
-        let has = self.assets.surfaces.contains_key(name);
-        if let Some(r) = self.scene.get_renderable_mut(index) {
-            texture_rt(r, name, params, has);
+#[derive(Default)]
+struct Group {
+    vertices: Vec<Vertex>,
+    indices: Vec<u32>,
+    /// What the members cast into the shadow maps (their `_SHADOW` meshes, else themselves), and
+    /// whether any member has a `_SHADOW` mesh (else the group casts its own geometry).
+    shadow: (Vec<Vertex>, Vec<u32>),
+    proxies: bool,
+}
+
+fn extras(raw: &Option<Box<serde_json::value::RawValue>>) -> Value {
+    raw.as_ref().and_then(|r| serde_json::from_str(r.get()).ok()).unwrap_or(Value::Null)
+}
+
+fn text<'a>(v: &'a Value, key: &str) -> &'a str {
+    v.get(key).and_then(Value::as_str).unwrap_or("")
+}
+
+fn number(v: &Value, key: &str) -> Option<f32> {
+    v.get(key).and_then(Value::as_f64).map(|x| x as f32)
+}
+
+/// A primitive's triangles in the world (placed by `world`, wound counter-clockwise).
+fn primitive(primitive: &gltf::Primitive, buffers: &[gltf::buffer::Data], world: Mat4, out: &mut (Vec<Vertex>, Vec<u32>)) {
+    let reader = primitive.reader(|b| buffers.get(b.index()).map(|d| &d.0[..]));
+    let Some(positions) = reader.read_positions() else { return };
+    let positions: Vec<[f32; 3]> = positions.collect();
+    let normals: Vec<[f32; 3]> = reader.read_normals().map(|n| n.collect()).unwrap_or_else(|| vec![[0.0, 1.0, 0.0]; positions.len()]);
+    let uvs: Vec<[f32; 2]> = reader.read_tex_coords(0).map(|t| t.into_f32().collect()).unwrap_or_else(|| vec![[0.0; 2]; positions.len()]);
+    let indices: Vec<u32> = reader.read_indices().map(|i| i.into_u32().collect()).unwrap_or_else(|| (0..positions.len() as u32).collect());
+    let normal_matrix = Mat3::from_mat4(world).inverse().transpose();
+    let flip = Mat3::from_mat4(world).determinant() < 0.0;
+    let base = out.0.len() as u32;
+    for k in 0..positions.len() {
+        let p = world.transform_point3(GVec3::from(positions[k]));
+        let n = (normal_matrix * GVec3::from(normals[k])).normalize_or_zero();
+        out.0.push(Vertex { position: [p.x, p.y, p.z, 1.0], normal: n.to_array(), uv: uvs[k] });
+    }
+    for t in indices.chunks_exact(3) {
+        if flip {
+            out.1.extend_from_slice(&[base + t[0], base + t[2], base + t[1]]);
+        } else {
+            out.1.extend_from_slice(&[base + t[0], base + t[1], base + t[2]]);
         }
     }
+}
 
-    /// `geometry` placed by `world` into the batch of `label`, `name` and `params` (`flush`).
-    fn batch(&mut self, label: &str, geometry: Geometry, name: &str, params: PbrParams, albedo: [f32; 3], world: glam::Mat4) {
-        let same = |b: &&mut Batch| b.label == label && b.name == name && bytemuck::bytes_of(&b.params) == bytemuck::bytes_of(&params);
-        match self.batches.iter_mut().find(|b| same(b)) {
-            Some(b) => b.parts.push((geometry, world)),
-            None => self.batches.push(Batch { label: label.into(), name: name.into(), params, albedo, parts: vec![(geometry, world)] }),
+/// A mesh's bounds in its own space.
+fn local_bounds(mesh: &gltf::Mesh, buffers: &[gltf::buffer::Data]) -> (GVec3, GVec3) {
+    let (mut lo, mut hi) = (GVec3::splat(f32::MAX), GVec3::splat(f32::MIN));
+    for p in mesh.primitives() {
+        let reader = p.reader(|b| buffers.get(b.index()).map(|d| &d.0[..]));
+        for q in reader.read_positions().into_iter().flatten() {
+            lo = lo.min(GVec3::from(q));
+            hi = hi.max(GVec3::from(q));
         }
     }
+    (lo, hi)
+}
 
-    /// Each batch as one renderable, its parts' vertices in the world (the surfaces are box-mapped
-    /// by world position, so they look as they did one by one).
-    fn flush(&mut self) {
-        for b in std::mem::take(&mut self.batches) {
-            let parts: Vec<(&Geometry, glam::Mat4)> = b.parts.iter().map(|(g, m)| (g, *m)).collect();
-            let geometry = Geometry::merged(&b.label, &parts);
-            self.add(&b.label, geometry, &b.name, b.params, b.albedo, [0.0; 3], 0.0, true);
+/// `local`'s box placed by `world`, as world bounds.
+fn world_bounds(world: Mat4, (lo, hi): (GVec3, GVec3)) -> (GVec3, GVec3) {
+    kansei_core::rt::transform_box(&world, lo, hi)
+}
+
+/// The materials, their maps uploaded once each.
+fn materials(renderer: &Renderer, doc: &gltf::Document, result: &GLTFResult, deferred: bool, layers: &mut Vec<(wgpu::TextureView, [f32; 3])>) -> Vec<RoomMaterial> {
+    let support = renderer.compression_support();
+    let mut uploaded: HashMap<usize, (wgpu::Texture, wgpu::TextureView)> = HashMap::new();
+    let mut texture = |t: Option<&kansei_core::loaders::GLTFTextureRef>, flat: [u8; 4], label: &str| -> Shared {
+        let Some(t) = t else { return Shared::upload(renderer, kansei_core::buffers::Texture::from_rgba(label, 1, 1, &flat)) };
+        if let Some((tex, view)) = uploaded.get(&t.image) {
+            return Shared::from_parts(tex.clone(), view.clone());
         }
-    }
-
-    /// A box of `size` centred at `center`, turned by `yaw` (batched), in the collision world when
-    /// `collide`.
-    #[allow(clippy::too_many_arguments)]
-    fn solid(&mut self, label: &str, size: [f32; 3], center: [f32; 3], yaw: f32, name: &str, params: PbrParams, albedo: [f32; 3], collide: bool) {
-        if collide {
-            self.collision.add_box(Obb::new(GVec3::from(center), GVec3::from(size) * 0.5, Quat::from_rotation_y(yaw)));
-        }
-        let world = glam::Mat4::from_translation(GVec3::from(center)) * glam::Mat4::from_rotation_y(yaw);
-        self.batch(label, BoxGeometry::new(size[0], size[1], size[2]), name, params, albedo, world);
-    }
-
-    /// A box standing on `base` (x, height of its bottom, z), as the course's: `size` wide, high
-    /// and deep, turned by `yaw`, in the collision world.
-    fn block(&mut self, label: &str, base: [f32; 3], size: [f32; 3], yaw: f32, name: &str, tint: [f32; 3]) {
-        let albedo = mean(name, tint);
-        let params = surface(tint, 1.6, [1.0, 0.0], false, self.deferred);
-        self.solid(label, size, [base[0], base[1] + size[1] * 0.5, base[2]], yaw, name, params, albedo, true)
-    }
-
-    /// A one-sided plane `size` (width, height) at `center`, its front toward the room (turned by
-    /// `rotation`, radians about x and y), batched.
-    #[allow(clippy::too_many_arguments)]
-    fn shell(&mut self, label: &str, size: [f32; 2], center: [f32; 3], rotation: [f32; 2], name: &str, mut params: PbrParams, albedo: [f32; 3]) {
-        params.flags[0] = 1.0;
-        let world = glam::Mat4::from_translation(GVec3::from(center)) * glam::Mat4::from_rotation_y(rotation[1]) * glam::Mat4::from_rotation_x(rotation[0]);
-        self.batch(label, PlaneGeometry::new(size[0], size[1]), name, params, albedo, world);
-    }
-
-    /// A shell plane of its own (a renderable the page changes: the floor's quads).
-    #[allow(clippy::too_many_arguments)]
-    fn shell_alone(&mut self, label: &str, size: [f32; 2], center: [f32; 3], rotation: [f32; 2], name: &str, mut params: PbrParams, albedo: [f32; 3]) -> usize {
-        params.flags[0] = 1.0;
-        let index = self.add(label, PlaneGeometry::new(size[0], size[1]), name, params, albedo, center, 0.0, true);
-        if let Some(r) = self.scene.get_renderable_mut(index) {
-            r.object.rotation.x = rotation[0];
-            r.object.rotation.y = rotation[1];
-        }
-        // (its uvs again, turned)
-        self.texture_rt(index, name, &params);
-        index
-    }
-
-    /// Model `name` standing on the floor (or `y` up) at `at`, turned by `yaw` and scaled by
-    /// `scale`: a renderable for each part, a box round it in the collision world (`collide`), in
-    /// the grid (`grid`; cut-out leaves never) and voxel GI as `albedo`. Returns the box (world
-    /// centre, half size).
-    #[allow(clippy::too_many_arguments)]
-    fn model(&mut self, name: &str, at: [f32; 2], y: f32, yaw: f32, scale: f32, collide: bool, grid: bool, albedo: [f32; 3]) -> Option<(GVec3, GVec3)> {
-        let model = self.assets.models.get(name)?;
-        let lift = y - model.min.y * scale;
-        // the solid parts cast their shadow as one simplified mesh, on the first of them
-        let mut shadow = model.shadow.as_ref();
-        for part in &model.parts {
-            let m = &model.materials[part.material];
-            let mut params = PbrParams {
-                tint: [m.color[0], m.color[1], m.color[2], 0.0],
-                surface: [1.0, 1.0, 0.0, 0.0],
-                pattern: [0.0, 1.0, 1.0, if m.cutout { 0.5 } else { 0.0 }],
-                ambient: [0.0, 0.0, 0.0, self.deferred as u32 as f32],
-                emissive: [0.0; 4],
-                ..Default::default()
-            };
-            params.flags[1] = 1.0;
-            let material = pbr::material(name, m.maps.maps(name), &params, m.double_sided);
-            let mut r = Renderable::new(Geometry::new(name, part.geometry.vertices.clone(), part.geometry.indices.clone()), material).with_gi(GiSurface::new(albedo));
-            r.object.set_position(at[0], lift, at[1]);
-            r.object.rotation.y = yaw;
-            r.object.scale = Vec3::new(scale, scale, scale);
-            if !m.cutout && model.shadow.is_some() {
-                r.shadow_geometry = shadow.take().map(|g| Geometry::new(&g.label, g.vertices.clone(), g.indices.clone()));
-                r.cast_shadow = r.shadow_geometry.is_some();
+        match result.load_texture(t, support) {
+            Ok(x) => {
+                let s = Shared::upload(renderer, x.into_texture());
+                uploaded.insert(t.image, s.parts());
+                s
             }
-            let index = self.scene.add(SceneNode::Renderable(r));
-            self.surfaces.push(Surface { index, params, floor: false });
+            Err(e) => {
+                log::warn!("room: {label}: {e}");
+                Shared::upload(renderer, kansei_core::buffers::Texture::from_rgba(label, 1, 1, &flat))
+            }
         }
-        // the grid traces its simplified stand-in, not the parts
-        if let Some(geometry) = model.grid.as_ref().filter(|_| grid) {
-            let mut r = look::grid_only(Geometry::new(name, geometry.vertices.clone(), geometry.indices.clone()), RtSurface::new(albedo));
-            r.object.set_position(at[0], lift, at[1]);
-            r.object.rotation.y = yaw;
-            r.object.scale = Vec3::new(scale, scale, scale);
-            self.scene.add(SceneNode::Renderable(r));
-        }
-        let (lo, hi) = (model.min * scale, model.max * scale);
-        let local = GVec3::new((lo.x + hi.x) * 0.5, 0.0, (lo.z + hi.z) * 0.5);
-        let centre = GVec3::new(at[0], y + (hi.y - lo.y) * 0.5, at[1]) + Quat::from_rotation_y(yaw) * local;
-        let half = (hi - lo) * 0.5;
-        if collide {
-            self.collision.add_box(Obb::new(centre, half, Quat::from_rotation_y(yaw)));
-        }
-        Some((centre, half))
-    }
-}
-
-/// A box-mapped surface `r` in the grid (with its `RtSurface`) reads `name`'s albedo layer at the
-/// uvs the box mapping gives it as `r` is placed (`has`: the surface's maps loaded). The grid's
-/// albedo stays the surface's mean: the reflections' hits scale it by the texture over the
-/// layer's mean, and the GI's hits (which read no texture) see the same mean.
-pub fn texture_rt(r: &mut Renderable, name: &str, params: &PbrParams, has: bool) {
-    let (Some(rt), Some(layer)) = (r.rt.as_mut(), super::assets::surface_layer(name).filter(|_| has)) else { return };
-    if params.tint[3] < 0.5 {
-        return;
-    }
-    rt.albedo_layer = Some(layer);
-    let o = &r.object;
-    let world = glam::Mat4::from_translation(o.position.to_glam())
-        * glam::Mat4::from_rotation_z(o.rotation.z)
-        * glam::Mat4::from_rotation_y(o.rotation.y)
-        * glam::Mat4::from_rotation_x(o.rotation.x)
-        * glam::Mat4::from_scale(o.scale.to_glam());
-    pbr::set_box_uvs(&mut r.geometry, world, params.surface[0]);
-}
-
-/// The floor, around the rectangle `hole` (x, z min and max) the pond's terrain fills.
-fn floor(b: &mut Builder, hole: Option<([f32; 2], [f32; 2])>, name: &str, roughness: f32) {
-    let h = HALF;
-    let quads: Vec<([f32; 2], [f32; 2])> = match hole {
-        None => vec![([-h, -h], [h, h])],
-        Some((min, max)) => vec![([-h, -h], [h, min[1]]), ([-h, max[1]], [h, h]), ([-h, min[1]], [min[0], max[1]]), ([max[0], min[1]], [h, max[1]])],
     };
-    for (a, c) in quads {
-        let params = floor_params(name, roughness, b.deferred);
-        let index = b.shell_alone("Floor", [c[0] - a[0], c[1] - a[1]], [(a[0] + c[0]) * 0.5, 0.0, (a[1] + c[1]) * 0.5], [-std::f32::consts::FRAC_PI_2, 0.0], name, params, mean(name, [1.0; 3]));
-        b.surfaces.last_mut().unwrap().floor = true;
-        if let Some(r) = b.scene.get_renderable_mut(index) {
+    doc.materials()
+        .zip(&result.materials)
+        .map(|(m, info)| {
+            let x = extras(m.extras());
+            let color = texture(info.base_color_texture.as_ref(), [255; 4], &info.name);
+            let normal = texture(info.normal_texture.as_ref(), [128, 128, 255, 255], &info.name);
+            let textured_orm = info.metallic_roughness_texture.is_some();
+            let orm = texture(info.metallic_roughness_texture.as_ref().or(info.occlusion_texture.as_ref()), [255, (info.roughness * 255.0) as u8, (info.metallic * 255.0) as u8, 255], &info.name);
+            let tint = [info.base_color[0], info.base_color[1], info.base_color[2]];
+            let cutout = m.alpha_mode() != gltf::material::AlphaMode::Opaque;
+            let emissive = m.emissive_factor();
+            let strength = m.emissive_strength().unwrap_or(1.0);
+            let emission = emissive.map(|c| c * strength * EMISSION_SCALE);
+            let roughness = if textured_orm { info.roughness } else { 1.0 };
+            let reflective = x.get("kansei_reflective").and_then(Value::as_f64).unwrap_or(0.0) > 0.5;
+            let params = PbrParams {
+                tint: [tint[0], tint[1], tint[2], 0.0],
+                surface: [1.0, roughness, 0.0, reflective as u32 as f32],
+                pattern: [0.0, 1.0, m.normal_texture().map_or(1.0, |n| n.scale()), if cutout { m.alpha_cutoff().unwrap_or(0.5) } else { 0.0 }],
+                ambient: { let f = fill(); [f[0], f[1], f[2], deferred as u32 as f32] },
+                emissive: [emission[0], emission[1], emission[2], number(&x, "kansei_macro").unwrap_or(0.0)],
+                flags: [0.0, 1.0, 0.0, 0.0],
+            };
+            let layer = info.base_color_texture.as_ref().map(|_| {
+                layers.push((color.view().clone(), tint));
+                (layers.len() - 1) as u8
+            });
+            RoomMaterial {
+                name: info.name.clone(),
+                maps: SharedMaps { color, normal, orm },
+                params,
+                layer,
+                tint,
+                double_sided: m.double_sided() || cutout,
+                cutout,
+                shade: x.get("kansei_shade").and_then(Value::as_f64).unwrap_or(0.0) > 0.5,
+                emission,
+                roughness,
+            }
+        })
+        .collect()
+}
+
+/// Fetch `assets/room/room.glb` and build the room into `scene`: `deferred` leaves the direct
+/// light to `RtShadowsEffect`.
+pub async fn load(renderer: &Renderer, scene: &mut Scene, deferred: bool) -> Result<Layout, String> {
+    let bytes = crate::fetch_bytes("assets/room/room.glb").await?;
+    let gltf = gltf::Gltf::from_slice(&bytes).map_err(|e| format!("room.glb: {e}"))?;
+    let buffers = gltf::import_buffers(&gltf.document, None, gltf.blob.clone()).map_err(|e| format!("room.glb buffers: {e}"))?;
+    let result = GLTFLoader::load_glb(&bytes)?;
+    let doc = &gltf.document;
+    let mut albedo_layers = Vec::new();
+    let mats = materials(renderer, doc, &result, deferred, &mut albedo_layers);
+
+    // every node, placed in the world
+    let mut placed: Vec<(gltf::Node, Mat4, Option<usize>)> = Vec::new();
+    fn walk<'a>(node: gltf::Node<'a>, parent: Mat4, parent_index: Option<usize>, out: &mut Vec<(gltf::Node<'a>, Mat4, Option<usize>)>) {
+        let world = parent * Mat4::from_cols_array_2d(&node.transform().matrix());
+        let me = node.index();
+        for child in node.children() {
+            walk(child, world, Some(me), out);
+        }
+        out.push((node, world, parent_index));
+    }
+    let root = doc.default_scene().or_else(|| doc.scenes().next()).ok_or("room.glb: no scene")?;
+    for node in root.nodes() {
+        walk(node, Mat4::IDENTITY, None, &mut placed);
+    }
+
+    let mut collision = CollisionWorld::new();
+    let mut groups: HashMap<Key, Group> = HashMap::new();
+    let mut shadows: HashMap<usize, (Vec<Vertex>, Vec<u32>)> = HashMap::new();
+    // the same `_SHADOW` meshes by parent and material, and what the ray tracing grid traces of
+    // each material: a member's `_SHADOW` mesh where it has one (the grid's cost is triangles a
+    // cell: the furniture's full meshes cost the rays half again), else its mesh
+    let mut proxy_parts: HashMap<(usize, usize), (Vec<Vertex>, Vec<u32>)> = HashMap::new();
+    let mut grid: HashMap<(usize, bool), (Vec<Vertex>, Vec<u32>)> = HashMap::new();
+    let mut mirrors: Vec<(String, Geometry, f32)> = Vec::new();
+    let mut glass: Vec<(String, Geometry, [f32; 3])> = Vec::new();
+    let mut views = Vec::new();
+    let mut traversals = Vec::new();
+    let mut spawn = (GVec3::new(0.0, 0.0, 11.0), std::f32::consts::PI);
+    let mut dragon = (GVec3::new(0.0, 0.5, 0.0), 0.7, 2.6);
+    let mut tank = None;
+    let mut colliders = 0;
+    let mut caustics = None;
+    let (mut shell_lo, mut shell_hi) = (GVec3::splat(f32::MAX), GVec3::splat(f32::MIN));
+    let (mut sun, mut skylight, mut lamps, mut display) = (None, None, Vec::new(), None);
+    let mut triangles: HashMap<String, usize> = HashMap::new();
+
+    // the `_SHADOW` meshes first, keyed by their parent
+    for (node, world, parent) in &placed {
+        let name = node.name().unwrap_or("");
+        if let (Some(mesh), Some(parent), true) = (node.mesh(), parent, name.ends_with("_SHADOW")) {
+            let out = shadows.entry(*parent).or_default();
+            for p in mesh.primitives() {
+                primitive(&p, &buffers, *world, out);
+                let material = p.material().index().unwrap_or(0).min(mats.len().saturating_sub(1));
+                primitive(&p, &buffers, *world, proxy_parts.entry((*parent, material)).or_default());
+            }
+        }
+    }
+    for (node, world, parent) in &placed {
+        let name = node.name().unwrap_or("").to_string();
+        let x = extras(node.extras());
+        let role = text(&x, "kansei").to_string();
+        let (_, rotation, translation) = world.to_scale_rotation_translation();
+        if name.ends_with("_CUT") || name.ends_with("_SHADOW") || role == "preview" {
+            continue;
+        }
+        if node.camera().is_some() {
+            let forward = rotation * -GVec3::Z;
+            let distance = number(&x, "distance").unwrap_or(8.0).max(0.5);
+            let target = translation + forward * distance;
+            let d = translation - target;
+            views.push(View { name: name.trim_start_matches("CAM_").to_string(), target, distance, azimuth: d.x.atan2(d.z), elevation: (d.y / distance).clamp(-1.0, 1.0).asin() });
+            continue;
+        }
+        let light_role = text(&x, "kansei_light");
+        if !light_role.is_empty() {
+            let forward = (rotation * -GVec3::Z).normalize();
+            let at = Vec3::new(translation.x, translation.y, translation.z);
+            let dir = Vec3::new(forward.x, forward.y, forward.z);
+            let cone = node.light().and_then(|l| match l.kind() {
+                gltf::khr_lights_punctual::Kind::Spot { inner_cone_angle, outer_cone_angle } => Some((inner_cone_angle, outer_cone_angle)),
+                _ => None,
+            });
+            match light_role {
+                "sun" => sun = Some(forward),
+                "skylight" => skylight = Some((at, dir, [number(&x, "length").unwrap_or(12.0), number(&x, "width").unwrap_or(6.0)])),
+                "lamp" => lamps.push((at, dir, cone.unwrap_or((55f32.to_radians(), 84f32.to_radians())))),
+                "display" => display = Some((at, dir, cone.unwrap_or((7f32.to_radians(), 11f32.to_radians())))),
+                other => log::warn!("room: {name}: unknown kansei_light {other}"),
+            }
+            continue;
+        }
+        match role.as_str() {
+            "spawn" => {
+                let facing = rotation * GVec3::Y;
+                spawn = (translation, facing.x.atan2(facing.z));
+                continue;
+            }
+            "dragon" => {
+                let facing = rotation * GVec3::Z;
+                dragon = (translation, facing.x.atan2(facing.z), number(&x, "length").unwrap_or(2.6));
+                continue;
+            }
+            _ => {}
+        }
+        let Some(mesh) = node.mesh() else { continue };
+        if name.ends_with("_COL") {
+            // a bar's tube (`<bar>_COL`) is not in the collision world: the body swinging up to it
+            // must not be pushed off (its posts are)
+            let tube = parent.and_then(|p| doc.nodes().nth(p)).is_some_and(|p| text(&extras(p.extras()), "kansei_traversal") == "bar" && name == format!("{}_COL", p.name().unwrap_or("")));
+            if tube {
+                continue;
+            }
+            let (lo, hi) = local_bounds(&mesh, &buffers);
+            let (scale, rotation, _) = world.to_scale_rotation_translation();
+            let centre = world.transform_point3((lo + hi) * 0.5);
+            collision.add_box(Obb::new(centre, (hi - lo) * 0.5 * scale, rotation));
+            colliders += 1;
+            continue;
+        }
+        let bounds = world_bounds(*world, local_bounds(&mesh, &buffers));
+        match role.as_str() {
+            "aquarium" => {
+                tank = Some(Tank { min: bounds.0, max: bounds.1, fill: number(&x, "fill").unwrap_or(0.85) });
+                continue;
+            }
+            "caustics" => {
+                caustics = Some(([bounds.0.x, bounds.0.z], [bounds.1.x, bounds.1.z]));
+                continue;
+            }
+            "shell" => {
+                shell_lo = shell_lo.min(bounds.0);
+                shell_hi = shell_hi.max(bounds.1);
+            }
+            _ => {}
+        }
+        if let Some(kind) = x.get("kansei_traversal").and_then(Value::as_str) {
+            traversals.push(Traversal { name: name.clone(), min: bounds.0, max: bounds.1, from: number(&x, "kansei_from").unwrap_or(1.1), from_y: number(&x, "kansei_from_y").unwrap_or(0.0), want: kind.to_string(), extras: x.to_string() });
+        }
+        if role == "mirror" || role == "glass" {
+            let mut part = (Vec::new(), Vec::new());
+            for p in mesh.primitives() {
+                primitive(&p, &buffers, *world, &mut part);
+            }
+            let geometry = Geometry::new(&name, part.0, part.1);
+            if role == "mirror" {
+                mirrors.push((name, geometry, number(&x, "kansei_roughness").unwrap_or(0.0)));
+            } else {
+                let tint = mesh.primitives().next().and_then(|p| p.material().index()).map_or([0.95; 3], |m| mats[m].tint);
+                glass.push((name, geometry, tint));
+            }
+            continue;
+        }
+        let proxy = shadows.get(&node.index());
+        for p in mesh.primitives() {
+            let material = p.material().index().unwrap_or(0).min(mats.len().saturating_sub(1));
+            let key = Key { material, shell: role == "shell", self_lit: x.get("kansei_self_lit").and_then(Value::as_f64).unwrap_or(0.0) > 0.5 };
+            let group = groups.entry(key).or_default();
+            let mut part = (Vec::new(), Vec::new());
+            primitive(&p, &buffers, *world, &mut part);
+            let base = group.vertices.len() as u32;
+            group.vertices.extend_from_slice(&part.0);
+            group.indices.extend(part.1.iter().map(|i| i + base));
+            match proxy {
+                // (a node's proxy is cast once, by its first primitive's group)
+                Some(s) if p.index() == 0 => {
+                    let base = group.shadow.0.len() as u32;
+                    group.shadow.0.extend_from_slice(&s.0);
+                    group.shadow.1.extend(s.1.iter().map(|i| i + base));
+                    group.proxies = true;
+                }
+                Some(_) => {}
+                None => {
+                    let base = group.shadow.0.len() as u32;
+                    group.shadow.0.extend_from_slice(&part.0);
+                    group.shadow.1.extend(part.1.iter().map(|i| i + base));
+                }
+            }
+            let traced = grid.entry((material, key.self_lit)).or_default();
+            let source = if proxy.is_some() { proxy_parts.get(&(node.index(), material)) } else { Some(&part) };
+            if let Some((v, i)) = source {
+                let base = traced.0.len() as u32;
+                traced.0.extend_from_slice(v);
+                traced.1.extend(i.iter().map(|k| k + base));
+            }
+            let what = if role.is_empty() { "furniture".to_string() } else { role.clone() };
+            *triangles.entry(what).or_default() += part.1.len() / 3;
+        }
+    }
+    if shell_lo.x > shell_hi.x {
+        return Err("room.glb: no shell (kansei: shell)".into());
+    }
+
+    // the renderables, a draw per material and way of drawing
+    let mut surfaces = Vec::new();
+    let mut shades = Vec::new();
+    let mut grid_triangles = 0;
+    let mut keys: Vec<Key> = groups.keys().copied().collect();
+    keys.sort_by_key(|k| (k.material, k.shell, k.self_lit));
+    for key in keys {
+        let group = groups.remove(&key).unwrap();
+        let m = &mats[key.material];
+        let label = format!("Room/{}", m.name);
+        let geometry = Geometry::new(&label, group.vertices, group.indices);
+        let albedo = m.tint.map(|c| c * 0.6);
+        if m.shade {
+            let mut r = Renderable::new(geometry, Material::emissive("LampShade", m.emission)).with_gi(GiSurface::new([0.8; 3]).with_emission(m.emission.map(|c| c * 0.02)));
             r.cast_shadow = false;
+            shades.push(scene.add(SceneNode::Renderable(r)));
+            continue;
         }
-        b.collision.add_box(Obb::from_min_max(GVec3::new(a[0], -1.0, a[1]), GVec3::new(c[0], 0.0, c[1])));
+        let mut params = m.params;
+        params.flags[0] = key.shell as u32 as f32;
+        let material = pbr::material(&label, m.maps.maps(&label), &params, m.double_sided);
+        let r = Renderable::new(geometry, material).with_gi(GiSurface::new(albedo));
+        // in the grid (not cut-out leaves): its members as `grid` gathered them
+        if let Some((v, i)) = grid.remove(&(key.material, key.self_lit)).filter(|_| !m.cutout) {
+            let mut rt = RtSurface::new(albedo);
+            if let Some(layer) = m.layer {
+                rt = rt.with_albedo_layer(layer);
+            }
+            if key.self_lit {
+                rt = rt.with_self_lit();
+            }
+            grid_triangles += i.len() / 3;
+            scene.add(SceneNode::Renderable(super::look::grid_only(Geometry::new(&format!("{label}/Grid"), v, i), rt)));
+        }
+        let mut r = r;
+        if group.proxies {
+            r.shadow_geometry = Some(Geometry::new(&format!("{label}/Shadow"), group.shadow.0, group.shadow.1));
+        }
+        // (the floor casts nothing the room can see)
+        let floor = m.name == "Floor";
+        r.cast_shadow = !floor;
+        let index = scene.add(SceneNode::Renderable(r));
+        surfaces.push(Surface { index, params, floor, roughness: m.roughness });
     }
-}
+    let mut mirrors_out = Vec::new();
+    mirrors.sort_by(|a, b| a.0.cmp(&b.0));
+    // (the north mirror first: `mirror_rough`, then `mirror2_rough`)
+    mirrors.sort_by_key(|m| !m.0.contains("North"));
+    for (_, geometry, roughness) in mirrors {
+        let mut r = Renderable::new(geometry, Material::standard_lit("Mirror", &StandardLitOptions::mirror(MIRROR, roughness))).with_gi(GiSurface::new(MIRROR_GI));
+        r.rt = Some(RtSurface::new(MIRROR_GI));
+        mirrors_out.push((scene.add(SceneNode::Renderable(r)), roughness));
+    }
+    for (name, geometry, tint) in glass {
+        let mut r = Renderable::new(geometry, Material::standard_lit(&name, &StandardLitOptions::glass(tint, 1.5, 0.0)));
+        r.rt = Some(RtSurface::glass(tint));
+        r.cast_shadow = false;
+        scene.add(SceneNode::Renderable(r));
+    }
 
-/// A floor lamp at `at`: a steel base and pole, a glowing shade, a warm shadowed downlight under
-/// it. Returns the light and the shade.
-fn floor_lamp(b: &mut Builder, at: [f32; 2], height: f32) -> (usize, usize) {
-    let steel = surface(STEEL, 0.5, [0.6, 0.0], false, b.deferred);
-    b.solid("LampBase", [0.36, 0.03, 0.36], [at[0], 0.015, at[1]], 0.0, "metal", steel, STEEL, false);
-    b.add("LampPole", CylinderGeometry::new(0.018, 0.018, height, 10, 1), "metal", steel, STEEL, [at[0], height * 0.5, at[1]], 0.0, false);
-    b.collision.add_box(Obb::new(GVec3::new(at[0], height * 0.5, at[1]), GVec3::new(0.18, height * 0.5, 0.18), Quat::IDENTITY));
-    let shade = shade(b.scene, [at[0], height + 0.1, at[1]], 0.26, 0.17, 0.34);
-    (lamp_light(b.scene, [at[0], height - 0.1, at[1]]), shade)
-}
+    // the shell in the collision world: the floor, thick walls outside
+    let (lo, hi) = (shell_lo, shell_hi);
+    collision.add_box(Obb::from_min_max(GVec3::new(lo.x, lo.y - 1.0, lo.z), GVec3::new(hi.x, lo.y, hi.z)));
+    for (min, max) in [([lo.x - 1.0, lo.z - 1.0], [hi.x + 1.0, lo.z]), ([lo.x - 1.0, hi.z], [hi.x + 1.0, hi.z + 1.0]), ([lo.x - 1.0, lo.z], [lo.x, hi.z]), ([hi.x, lo.z], [hi.x + 1.0, hi.z])] {
+        collision.add_box(Obb::from_min_max(GVec3::new(min[0], lo.y - 1.0, min[1]), GVec3::new(max[0], hi.y + 1.0, max[1])));
+    }
 
-/// A glowing shade: a frustum of radii `bottom` and `top`, `height` tall, centred at `at`.
-fn shade(scene: &mut Scene, at: [f32; 3], bottom: f32, top: f32, height: f32) -> usize {
-    let radiance = LAMP_COLOR.map(|c| c * SHADE_RADIANCE);
-    let mut r = Renderable::new(CylinderGeometry::new(bottom, top, height, 32, 1), Material::emissive("LampShade", radiance)).with_gi(GiSurface::new([0.8; 3]).with_emission(radiance.map(|c| c * 0.02)));
-    r.object.set_position(at[0], at[1], at[2]);
-    r.cast_shadow = false;
-    scene.add(SceneNode::Renderable(r))
-}
-
-/// A lamp's light: a warm, wide downlight, shadowed (soft).
-fn lamp_light(scene: &mut Scene, at: [f32; 3]) -> usize {
-    let mut light = SpotLight::new(Vec3::new(at[0], at[1], at[2]), Vec3::new(0.0, -1.0, 0.0), Vec3::new(LAMP_COLOR[0], LAMP_COLOR[1], LAMP_COLOR[2]), LAMP_CD, 10.0, 55f32.to_radians(), 84f32.to_radians());
+    // the lights: the sun, the skylight (the first spot light), the lamps, the display spot (the last)
+    let sun_direction = sun.unwrap_or(GVec3::new(0.86, -0.4, 0.32)).normalize();
+    let d = sun_direction;
+    let mut light = DirectionalLight::new(Vec3::new(d.x, d.y, d.z), Vec3::new(SUN_COLOR[0], SUN_COLOR[1], SUN_COLOR[2]), SUN_LUX);
     light.cast_shadow = true;
-    light.source_radius = 0.12;
-    light.volumetric_scale = 1.0;
-    scene.add(SceneNode::Light(Light::Spot(light)))
-}
-
-/// A mirror on a wall: a sheet `size` at `center` turned by `yaw` (0: facing +z), in a steel
-/// frame; `roughness` 0 is a mirror, more a brushed metal.
-fn mirror(b: &mut Builder, center: [f32; 3], size: [f32; 2], yaw: f32, roughness: f32) -> usize {
-    let (s, c) = yaw.sin_cos();
-    let back = [center[0] - s * 0.03, center[1], center[2] - c * 0.03];
-    b.solid("MirrorFrame", [size[0] + 0.16, size[1] + 0.16, 0.05], back, yaw, "metal", surface(STEEL, 0.5, [0.5, 0.0], false, b.deferred), STEEL, false);
-    let mut r = Renderable::new(BoxGeometry::new(size[0], size[1], 0.02), Material::standard_lit("Mirror", &StandardLitOptions::mirror(MIRROR, roughness))).with_gi(GiSurface::new(MIRROR_GI));
-    r.rt = Some(RtSurface::new(MIRROR_GI));
-    r.object.set_position(center[0], center[1], center[2]);
-    r.object.rotation.y = yaw;
-    b.scene.add(SceneNode::Renderable(r))
-}
-
-/// The west wall (x = -HALF, facing +x) with its three windows: the wall round them, their reveals
-/// and their steel frames (a 3 x 3 grid of panes).
-fn west_wall(b: &mut Builder) {
-    use std::f32::consts::FRAC_PI_2;
-    let (h, top) = (HALF, HEIGHT);
-    let wall = surface(PLASTER, 2.0, [1.0, 0.0], false, b.deferred);
-    let albedo = mean("plaster", PLASTER);
-    let x = -h;
-    let face = [0.0, FRAC_PI_2];
-    // below the sills and above the heads, the whole length
-    b.shell("WallWest", [2.0 * h, SILL], [x, SILL * 0.5, 0.0], face, "plaster", wall, albedo);
-    b.shell("WallWest", [2.0 * h, top - HEAD], [x, (HEAD + top) * 0.5, 0.0], face, "plaster", wall, albedo);
-    // the piers between the windows
-    let mut edges = vec![-h];
-    for z in WINDOWS {
-        edges.push(z - WINDOW_HALF);
-        edges.push(z + WINDOW_HALF);
-    }
-    edges.push(h);
-    for pair in edges.chunks(2) {
-        let (a, c) = (pair[0], pair[1]);
-        b.shell("WallWest", [c - a, HEAD - SILL], [x, (SILL + HEAD) * 0.5, (a + c) * 0.5], face, "plaster", wall, albedo);
-    }
-    let steel = surface(STEEL, 0.5, [0.45, 0.0], false, b.deferred);
-    let depth = 0.35;
-    for z in WINDOWS {
-        // the reveals: sill, head and jambs, a wall's depth into it
-        let (w, hh) = (2.0 * WINDOW_HALF, HEAD - SILL);
-        b.solid("Reveal", [depth, 0.04, w], [x - depth * 0.5, SILL - 0.02, z], 0.0, "plaster", wall, albedo, false);
-        b.solid("Reveal", [depth, 0.04, w], [x - depth * 0.5, HEAD + 0.02, z], 0.0, "plaster", wall, albedo, false);
-        b.solid("Reveal", [depth, hh, 0.04], [x - depth * 0.5, (SILL + HEAD) * 0.5, z - WINDOW_HALF - 0.02], 0.0, "plaster", wall, albedo, false);
-        b.solid("Reveal", [depth, hh, 0.04], [x - depth * 0.5, (SILL + HEAD) * 0.5, z + WINDOW_HALF + 0.02], 0.0, "plaster", wall, albedo, false);
-        // the frame: mullions and transoms
-        let fx = x - 0.12;
-        for k in 0..=3 {
-            let zz = z - WINDOW_HALF + 2.0 * WINDOW_HALF * k as f32 / 3.0;
-            b.solid("WindowFrame", [0.06, hh, 0.07], [fx, (SILL + HEAD) * 0.5, zz], 0.0, "metal", steel, STEEL, false);
-        }
-        for k in 0..=3 {
-            let y = SILL + hh * k as f32 / 3.0;
-            b.solid("WindowFrame", [0.06, 0.07, w], [fx, y, z], 0.0, "metal", steel, STEEL, false);
-        }
-    }
-}
-
-/// The ceiling (y = HEIGHT, facing down) round the skylight, the skylight's well and its steel
-/// grid, the oak beams across the room.
-fn ceiling(b: &mut Builder) {
-    use std::f32::consts::{FRAC_PI_2, PI};
-    let (h, top) = (HALF, HEIGHT);
-    let [sx, sz] = SKYLIGHT;
-    let ceil = surface([0.95, 0.95, 0.93], 3.0, [1.0, 0.05], false, b.deferred);
-    let down = [FRAC_PI_2, 0.0];
-    for (min, max) in [([-h, -h], [h, -sz]), ([-h, sz], [h, h]), ([-h, -sz], [-sx, sz]), ([sx, -sz], [h, sz])] {
-        b.shell("Ceiling", [max[0] - min[0], max[1] - min[1]], [(min[0] + max[0]) * 0.5, top, (min[1] + max[1]) * 0.5], down, "ceiling", ceil, mean("ceiling", [1.0; 3]));
-    }
-    // the well: four faces looking into the opening, 0.8 m up
-    let well = 0.8;
-    let wall = surface(PLASTER, 2.0, [1.0, 0.0], false, b.deferred);
-    let albedo = mean("plaster", PLASTER);
-    let y = top + well * 0.5;
-    b.shell("SkylightWell", [2.0 * sx, well], [0.0, y, -sz], [0.0, 0.0], "plaster", wall, albedo);
-    b.shell("SkylightWell", [2.0 * sx, well], [0.0, y, sz], [0.0, PI], "plaster", wall, albedo);
-    b.shell("SkylightWell", [2.0 * sz, well], [-sx, y, 0.0], [0.0, FRAC_PI_2], "plaster", wall, albedo);
-    b.shell("SkylightWell", [2.0 * sz, well], [sx, y, 0.0], [0.0, -FRAC_PI_2], "plaster", wall, albedo);
-    // its steel grid, at the top of the well
-    let steel = surface(STEEL, 0.5, [0.45, 0.0], false, b.deferred);
-    let gy = top + well - 0.05;
-    for k in 0..=4 {
-        let x = -sx + 2.0 * sx * k as f32 / 4.0;
-        b.solid("SkylightGrid", [0.08, 0.1, 2.0 * sz], [x, gy, 0.0], 0.0, "metal", steel, STEEL, false);
-    }
-    for k in 0..=8 {
-        let z = -sz + 2.0 * sz * k as f32 / 8.0;
-        b.solid("SkylightGrid", [2.0 * sx, 0.1, 0.08], [0.0, gy, z], 0.0, "metal", steel, STEEL, false);
-    }
-    // oak beams across the room, under the ceiling (three cross the skylight)
-    let tint = [0.85, 0.75, 0.65];
-    let oak = surface(tint, 2.0, [1.0, 0.0], false, b.deferred);
-    for k in 0..9 {
-        let z = -16.0 + 4.0 * k as f32;
-        b.solid("Beam", [2.0 * h, 0.5, 0.32], [0.0, top - 0.25, z], 0.0, "oak", oak, mean("oak", tint), false);
-    }
-}
-
-/// Build the room into `scene` from `assets`; `pond_hole` leaves the floor open where the pond's
-/// terrain goes; the floor is `floor_name` with its roughness scaled by `floor_roughness`;
-/// `deferred` leaves the direct light to `RtShadowsEffect`.
-pub fn build(scene: &mut Scene, assets: &Assets, pond_hole: Option<([f32; 2], [f32; 2])>, floor_name: &str, floor_roughness: f32, deferred: bool) -> Layout {
-    use std::f32::consts::{FRAC_PI_2, PI};
-    let mut b = Builder { scene, collision: CollisionWorld::new(), assets, deferred, surfaces: Vec::new(), batches: Vec::new() };
-    let (h, top) = (HALF, HEIGHT);
-
-    // the shell: floor, walls, ceiling, and thick colliders outside the walls
-    floor(&mut b, pond_hole, floor_name, floor_roughness);
-    let wall = surface(PLASTER, 2.0, [1.0, 0.0], false, deferred);
-    // (the concrete scan's stains repeat across a wall: concrete only at column size)
-    let concrete = surface([1.0, 1.0, 1.0], 1.2, [1.0, 0.0], false, deferred);
-    let limewash = [0.7, 0.68, 0.64];
-    b.shell("WallNorth", [2.0 * h, top], [0.0, top * 0.5, -h], [0.0, 0.0], "plaster", surface(limewash, 2.0, [1.0, 0.0], false, deferred), mean("plaster", limewash));
-    b.shell("WallSouth", [2.0 * h, top], [0.0, top * 0.5, h], [0.0, PI], "plaster", surface(TERRACOTTA, 2.0, [1.0, 0.0], false, deferred), mean("plaster", TERRACOTTA));
-    b.shell("WallEast", [2.0 * h, top], [h, top * 0.5, 0.0], [0.0, -FRAC_PI_2], "plaster", wall, mean("plaster", PLASTER));
-    west_wall(&mut b);
-    ceiling(&mut b);
-    for (min, max) in [([-h - 1.0, -h - 1.0], [h + 1.0, -h]), ([-h - 1.0, h], [h + 1.0, h + 1.0]), ([-h - 1.0, -h], [-h, h]), ([h, -h], [h + 1.0, h])] {
-        b.collision.add_box(Obb::from_min_max(GVec3::new(min[0], -1.0, min[1]), GVec3::new(max[0], top + 1.0, max[1])));
-    }
-    // oak baseboards along the walls
-    let tint = [0.85, 0.75, 0.65];
-    let oak = surface(tint, 1.5, [1.0, 0.0], false, deferred);
-    for (size, c) in [([2.0 * h, 0.12, 0.02], [0.0, 0.06, -h + 0.01]), ([2.0 * h, 0.12, 0.02], [0.0, 0.06, h - 0.01]), ([0.02, 0.12, 2.0 * h], [h - 0.01, 0.06, 0.0]), ([0.02, 0.12, 2.0 * h], [-h + 0.01, 0.06, 0.0])] {
-        b.solid("Baseboard", size, c, 0.0, "oak", oak, mean("oak", tint), false);
-    }
-    // four concrete columns round the pond
-    for (x, z) in [(-9.5, -9.5), (9.5, -9.5), (-9.5, 9.5), (9.5, 9.5)] {
-        b.solid("Column", [0.7, top, 0.7], [x, top * 0.5, z], 0.0, "concrete", concrete, mean("concrete", [1.0; 3]), true);
-    }
-
-    // the light: the low sun through the west windows (cascade-shadowed), the skylight's area light
-    // (a spot above its well, the RT shadows sampling the opening), lamps
-    let d = GVec3::from(SUN_DIR).normalize();
-    let mut sun = DirectionalLight::new(Vec3::new(d.x, d.y, d.z), Vec3::new(SUN_COLOR[0], SUN_COLOR[1], SUN_COLOR[2]), SUN_LUX);
-    sun.cast_shadow = true;
-    let sun = b.scene.add(SceneNode::Light(Light::Directional(sun)));
-    let mut sky = SpotLight::new(Vec3::new(0.0, top + 0.7, 0.0), Vec3::new(0.0, -1.0, 0.0), Vec3::new(0.78, 0.86, 1.0), SKYLIGHT_CD, 48.0, 62f32.to_radians(), 86f32.to_radians());
+    let sun = scene.add(SceneNode::Light(Light::Directional(light)));
+    let (at, dir, skylight_rect) = skylight.unwrap_or((Vec3::new(0.0, hi.y + 0.7, 0.0), Vec3::new(0.0, -1.0, 0.0), [12.0, 6.0]));
+    let mut sky = SpotLight::new(at, dir, Vec3::new(0.78, 0.86, 1.0), SKYLIGHT_CD, 48.0, 62f32.to_radians(), 86f32.to_radians());
     sky.cast_shadow = true;
     sky.source_radius = 1.5;
     sky.volumetric_scale = 1.0;
-    let skylight = b.scene.add(SceneNode::Light(Light::Spot(sky)));
-
-    // two mirrors: a large one on the north wall, a brushed one on the east wall
-    let mirrors = vec![mirror(&mut b, [0.0, 2.6, -h + 0.04], [9.0, 4.2], 0.0, 0.0), mirror(&mut b, [h - 0.04, 2.2, -1.0], [5.0, 3.4], -FRAC_PI_2, 0.1)];
-
-    // the living corner (south-east): a sofa, two lounge chairs, a coffee table on a rug
-    let rug = surface([1.0, 1.0, 1.0], 1.0, [1.0, 0.0], false, deferred);
-    let r = b.add("Rug", BoxGeometry::new(6.4, 0.012, 5.0), "rug", rug, mean("rug", [1.0; 3]), [13.0, 0.006, 13.2], 0.0, true);
-    if let Some(r) = b.scene.get_renderable_mut(r) {
-        r.cast_shadow = false;
-    }
-    b.model("sofa_02", [13.0, 16.4], 0.0, PI, 1.0, true, true, [0.06, 0.06, 0.06]);
-    b.model("throw_pillows_01", [13.0, 16.2], 0.42, PI, 1.0, false, false, [0.5, 0.3, 0.2]);
-    b.model("mid_century_lounge_chair", [10.7, 10.4], 0.0, 0.4, 1.0, true, true, [0.25, 0.14, 0.08]);
-    b.model("mid_century_lounge_chair", [15.3, 10.4], 0.0, -0.4, 1.0, true, true, [0.25, 0.14, 0.08]);
-    b.model("modern_coffee_table_01", [13.0, 13.3], 0.0, 0.0, 1.0, true, true, [0.4, 0.38, 0.35]);
-    b.model("Ottoman_01", [16.4, 13.6], 0.0, 0.3, 1.0, true, true, [0.08, 0.06, 0.05]);
-    b.model("potted_plant_02", [17.8, 17.8], 0.0, 0.0, 1.4, true, false, [0.1, 0.2, 0.06]);
-    b.model("hanging_picture_frame_02", [13.0, h - 0.03], 1.4, PI, 2.6, false, true, [0.5, 0.45, 0.4]);
-    b.model("modern_wooden_cabinet", [h - 0.3, 5.5], 0.0, -FRAC_PI_2, 1.2, true, true, [0.2, 0.12, 0.07]);
-    let (mut lamps, mut shades) = (Vec::new(), Vec::new());
-    let (l, s) = floor_lamp(&mut b, [17.3, 15.0], 1.6);
-    lamps.push(l);
-    shades.push(s);
-
-    // the dining table (south-west) under a pendant, four chairs round it
-    if let Some((_, half)) = b.model("round_wooden_table_01", [-13.0, 13.0], 0.0, 0.0, 1.0, true, true, [0.18, 0.09, 0.05]) {
-        b.model("ceramic_vase_01", [-13.0, 13.0], half.y * 2.0, 0.0, 1.0, false, false, [0.8, 0.8, 0.78]);
-    }
-    for k in 0..4 {
-        let a = k as f32 * FRAC_PI_2 + 0.3;
-        b.model("dining_chair_02", [-13.0 + a.sin() * 1.05, 13.0 + a.cos() * 1.05], 0.0, a + PI, 1.0, false, true, [0.15, 0.1, 0.07]);
-    }
-    if let Some((_, half)) = b.model("modern_ceiling_lamp_01", [-13.0, 13.0], 2.3, 0.0, 1.0, false, false, [0.8, 0.8, 0.8]) {
-        let rod = top - (2.3 + half.y * 2.0);
-        let steel = surface(STEEL, 0.5, [0.5, 0.0], false, deferred);
-        if rod > 0.05 {
-            b.add("PendantRod", CylinderGeometry::new(0.006, 0.006, rod, 6, 1), "metal", steel, STEEL, [-13.0, top - rod * 0.5, 13.0], 0.0, false);
-        }
-    }
-    lamps.push(lamp_light(b.scene, [-13.0, 2.25, 13.0]));
-
-    // the library (north-west): steel shelves of books, a reading chair and its lamp
-    for x in [-16.2, -12.0] {
-        if let Some((c, half)) = b.model("steel_frame_shelves_03", [x, -h + 0.25], 0.0, 0.0, 1.25, true, true, [0.2, 0.15, 0.1]) {
-            for level in [0.36, 0.62] {
-                b.model("book_encyclopedia_set_01", [x, c.z], half.y * 2.0 * level, 0.0, 1.0, false, false, [0.3, 0.2, 0.15]);
-            }
-        }
-    }
-    b.model("wooden_display_shelves_01", [-7.6, -h + 0.25], 0.0, 0.0, 1.0, true, true, [0.5, 0.4, 0.3]);
-    b.model("modern_arm_chair_01", [-13.6, -16.8], 0.0, 0.5, 1.0, true, true, [0.1, 0.07, 0.05]);
-    b.model("potted_plant_04", [-17.6, -17.6], 0.0, 0.0, 1.6, true, false, [0.2, 0.3, 0.1]);
-    let (l, s) = floor_lamp(&mut b, [-15.4, -16.6], 1.7);
-    lamps.push(l);
-    shades.push(s);
-
-    // the parkour corner (north-east): crates to hurdle and vault, blocks to mantle, a stack, a
-    // platform to climb, two ledges with a gap to jump; a sideboard and an island (north-west); a
-    // bench on the pond's south shore
-    let white = [1.0, 1.0, 1.0];
-    let stone = [2.6, 2.6, 2.6];
-    b.block("Crate", [9.5, 0.0, -7.0], [2.0, 1.0, 0.8], 0.0, "oak", white);
-    b.block("Rail", [13.5, 0.0, -5.0], [3.0, 0.55, 0.25], 0.3, "oak", white);
-    b.block("Block", [14.5, 0.0, -9.5], [2.5, 1.3, 2.5], -0.4, "blackmarble", stone);
-    b.block("Stack", [10.5, 0.0, -14.0], [3.0, 1.2, 3.0], 0.2, "blackmarble", stone);
-    b.block("Stack", [10.61, 1.2, -14.54], [1.8, 1.1, 1.8], 0.2, "oak", white);
-    b.block("Platform", [16.0, 0.0, -16.0], [4.0, 2.2, 3.5], 0.0, "blackmarble", stone);
-    b.block("Step", [16.0, 0.0, -12.6], [4.0, 0.3, 2.0], 0.0, "blackmarble", [2.2, 2.2, 2.2]);
-    b.block("Ledge", [6.5, 0.0, -16.0], [3.0, 1.2, 4.0], 0.0, "blackmarble", stone);
-    b.block("Ledge", [6.5, 0.0, -10.5], [3.0, 1.2, 3.5], 0.0, "blackmarble", stone);
-    b.block("Sideboard", [-12.0, 0.0, -14.0], [2.6, 1.25, 0.9], 0.0, "oak", white);
-    b.block("Island", [-11.0, 0.0, -7.5], [2.4, 1.0, 0.9], 0.35, "marble", [0.95, 0.95, 0.95]);
-    b.block("Bench", [0.0, 0.0, 8.8], [3.2, 0.45, 0.5], 0.0, "oak", white);
-    // a lamp by the east mirror
-    let (l, s) = floor_lamp(&mut b, [18.4, 2.6], 1.7);
-    lamps.push(l);
-    shades.push(s);
-
-    // the display spot on the dragon, and its can under the beam
-    let aim = (GVec3::from(DISPLAY_AIM) - GVec3::from(DISPLAY_AT)).normalize();
-    let mut spot = SpotLight::new(Vec3::new(DISPLAY_AT[0], DISPLAY_AT[1], DISPLAY_AT[2]), Vec3::new(aim.x, aim.y, aim.z), Vec3::new(DISPLAY_COLOR[0], DISPLAY_COLOR[1], DISPLAY_COLOR[2]), DISPLAY_CD, 40.0, DISPLAY_CONE[0].to_radians(), DISPLAY_CONE[1].to_radians());
+    let skylight = scene.add(SceneNode::Light(Light::Spot(sky)));
+    let lamps = lamps
+        .into_iter()
+        .map(|(at, dir, (inner, outer))| {
+            let mut light = SpotLight::new(at, dir, Vec3::new(LAMP_COLOR[0], LAMP_COLOR[1], LAMP_COLOR[2]), LAMP_CD, 10.0, inner, outer);
+            light.cast_shadow = true;
+            light.source_radius = 0.12;
+            light.volumetric_scale = 1.0;
+            scene.add(SceneNode::Light(Light::Spot(light)))
+        })
+        .collect();
+    let (at, dir, (inner, outer)) = display.unwrap_or((Vec3::new(0.0, hi.y - 0.6, -10.5), Vec3::new(0.0, -0.54, 0.84), (7f32.to_radians(), 11f32.to_radians())));
+    let mut spot = SpotLight::new(at, dir, Vec3::new(DISPLAY_COLOR[0], DISPLAY_COLOR[1], DISPLAY_COLOR[2]), DISPLAY_CD, 40.0, inner, outer);
     spot.cast_shadow = true;
     spot.source_radius = 0.03;
     spot.volumetric_scale = 1.0;
-    let display = b.scene.add(SceneNode::Light(Light::Spot(spot)));
-    let can = surface(STEEL, 0.5, [0.5, 0.0], false, b.deferred);
-    b.solid("DisplaySpot", [0.16, 0.24, 0.16], [DISPLAY_AT[0], DISPLAY_AT[1] + 0.13, DISPLAY_AT[2]], 0.0, "metal", can, STEEL, false);
-    b.flush();
-    Layout { collision: b.collision, surfaces: b.surfaces, lights: Lights { sun, skylight, lamps, shades, display }, mirrors }
+    let display = scene.add(SceneNode::Light(Light::Spot(spot)));
+
+    // the caustics' map: as authored, else round the tank and where the sun through it lands on
+    // the floor, and round the dragon
+    let caustics = caustics.unwrap_or_else(|| {
+        let mut points = vec![dragon.0 - GVec3::splat(2.0), dragon.0 + GVec3::splat(2.0)];
+        if let Some(t) = tank {
+            for corner in [t.min, t.max, GVec3::new(t.min.x, t.max.y, t.max.z), GVec3::new(t.max.x, t.max.y, t.min.z)] {
+                points.push(corner - GVec3::splat(0.8));
+                points.push(corner + GVec3::splat(0.8));
+                let along = corner.y / (-sun_direction.y).max(0.1);
+                points.push(corner + sun_direction * along);
+            }
+        }
+        let (a, b) = points.iter().fold((GVec3::splat(f32::MAX), GVec3::splat(f32::MIN)), |(a, b), p| (a.min(*p), b.max(*p)));
+        ([a.x.max(lo.x), a.z.max(lo.z)], [b.x.min(hi.x), b.z.min(hi.z)])
+    });
+    triangles.insert("grid".into(), grid_triangles);
+    let mut triangles: Vec<(String, usize)> = triangles.into_iter().collect();
+    triangles.sort();
+    log::info!("room: {} draws from {} materials, triangles {:?}, {} views, {} colliders", surfaces.len() + shades.len() + mirrors_out.len(), mats.len(), triangles, views.len(), colliders);
+    Ok(Layout {
+        collision,
+        surfaces,
+        lights: Lights { sun, sun_direction, skylight, skylight_rect, lamps, shades, display },
+        mirrors: mirrors_out,
+        views,
+        spawn,
+        dragon,
+        min: lo,
+        max: hi,
+        tank,
+        caustics,
+        albedo_layers,
+        traversals,
+        triangles,
+    })
 }
 
-/// The furniture meant for parkour as the character's traversal sees it: from feet in front of each
-/// piece, walking at it, the probe (`traversal::detect_obstacle`) finds it and picks the kind of
-/// traversal (`traversal_kind`, the default rules). Each piece's name and whether it got the kind
-/// meant, or what it got: `room_check()` on the page.
-pub fn check_traversals(world: &CollisionWorld) -> Vec<(&'static str, Result<(), String>)> {
-    use kansei_core::animation::motion_matching::traversal::{detect_obstacle, traversal_kind, ActionKind, DetectionSettings, TraversalRules};
-    let cases: [(&str, [f32; 3], [f32; 3], ActionKind); 10] = [
-        ("crate", [9.5, 0.0, -5.6], [0.0, 0.0, -1.0], ActionKind::Vault),
-        ("rail", [13.5, 0.0, -3.8], [0.0, 0.0, -1.0], ActionKind::Hurdle),
-        ("block", [14.5, 0.0, -6.9], [0.0, 0.0, -1.0], ActionKind::Mantle),
-        ("stack", [10.5, 0.0, -11.6], [0.0, 0.0, -1.0], ActionKind::Mantle),
-        ("stack's top", [10.6, 1.2, -13.0], [0.0, 0.0, -1.0], ActionKind::Mantle),
-        ("platform, from the step", [16.0, 0.3, -13.0], [0.0, 0.0, -1.0], ActionKind::Climb),
-        ("ledge", [6.5, 0.0, -7.6], [0.0, 0.0, -1.0], ActionKind::Mantle),
-        ("sideboard", [-12.0, 0.0, -12.4], [0.0, 0.0, -1.0], ActionKind::Vault),
-        ("island", [-11.4, 0.0, -6.0], [0.0, 0.0, -1.0], ActionKind::Vault),
-        ("bench", [0.0, 0.0, 10.2], [0.0, 0.0, -1.0], ActionKind::Hurdle),
-    ];
+/// What today's traversal does at a piece of the course tagged for a move it hasn't yet: a platform
+/// is mantled onto, a ledge tower climbed; walls to run along and bars to swing from it doesn't
+/// take (`None`: not checked).
+fn today(kind: &str) -> Option<&str> {
+    match kind {
+        "platform" => Some("mantle"),
+        "ledge" => Some("climb"),
+        "wallrun" | "bar" => None,
+        other => Some(other),
+    }
+}
+
+/// The pieces meant for parkour as the character's traversal sees them: from feet in front of each
+/// (south of it, `Traversal::from` away, at `from_y`), walking north at it, the probe
+/// (`traversal::detect_obstacle`) finds it and picks the kind of traversal (`traversal_kind`, the
+/// default rules). Each piece's name and whether it got the kind meant (for the course's new
+/// kinds, what today's traversal makes of them: `today`), or what it got: `room_check()` on the
+/// page.
+/// The tagged pieces as the controller's parkour reads them (`ParkourPiece::from_extras`): each
+/// piece's box and its `kansei_*` extras.
+pub fn parkour_pieces(pieces: &[Traversal]) -> Vec<ParkourPiece> {
+    pieces
+        .iter()
+        .filter_map(|t| {
+            let x: Value = serde_json::from_str(&t.extras).unwrap_or(Value::Null);
+            let entries: Vec<(String, String)> = x.as_object().map_or(Vec::new(), |o| o.iter().map(|(k, v)| (k.clone(), v.as_str().map_or(v.to_string(), str::to_string))).collect());
+            ParkourPiece::from_extras(&t.name, Obb::from_min_max(t.min, t.max), entries.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+        })
+        .collect()
+}
+
+pub fn check_traversals(world: &CollisionWorld, pieces: &[Traversal]) -> Vec<(String, Result<(), String>)> {
+    use kansei_core::animation::motion_matching::traversal::{detect_obstacle, traversal_kind, DetectionSettings, TraversalRules};
     let (settings, rules) = (DetectionSettings::default(), TraversalRules::default());
-    cases
-        .into_iter()
-        .map(|(name, feet, direction, want)| {
-            let feet = GVec3::from(feet);
-            let got = match detect_obstacle(world, feet, GVec3::from(direction), 2.0, &settings) {
+    pieces
+        .iter()
+        .filter_map(|t| Some((t, today(&t.want)?)))
+        .map(|(t, want)| {
+            let feet = GVec3::new((t.min.x + t.max.x) * 0.5, t.from_y, t.max.z + t.from);
+            let got = match detect_obstacle(world, feet, GVec3::NEG_Z, 2.0, &settings) {
                 None => Err("nothing found".to_string()),
                 Some(o) => traversal_kind(world, &o, feet, &rules, u32::MAX).map_err(|e| format!("{} (height {:.2}, depth {:?}, half width {:.2})", e.describe(), o.height, o.depth, o.half_width)),
             };
-            (name, match got {
-                Ok(kind) if kind == want => Ok(()),
-                Ok(kind) => Err(format!("{} where {} was meant", kind.name(), want.name())),
+            (t.name.clone(), match got {
+                Ok(kind) if kind.name().eq_ignore_ascii_case(want) => Ok(()),
+                Ok(kind) => Err(format!("{} where {} was meant", kind.name(), want)),
                 Err(e) => Err(e),
             })
         })

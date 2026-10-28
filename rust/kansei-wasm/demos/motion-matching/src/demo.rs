@@ -105,7 +105,7 @@ impl ClipPlayer {
         let clip = self.clips[self.next % self.clips.len()];
         self.next += 1;
         self.until = now + (db.clips[clip].frames as f64 - 1.0) / db.sample_rate as f64 + 0.8;
-        Some(Action { clip, start: 0.0, exit: None, path: RootPath::Warp(RootWarp::identity(db.root_at(clip, 0.0), self.home)), collides: false, tag: 0 })
+        Some(Action { clip, start: 0.0, exit: None, path: RootPath::Warp(RootWarp::identity(db.root_at(clip, 0.0), self.home)), collides: false, tag: 0, rate: 1.0, lock_feet: false })
     }
 }
 

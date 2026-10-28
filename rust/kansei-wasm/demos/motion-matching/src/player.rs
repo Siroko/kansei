@@ -147,7 +147,7 @@ impl Player {
             let [x, y] = pad.right_stick();
             controls.rotate(-x * 2.5 * dt, y * 1.5 * dt);
             run |= pad.held(Gamepad::B) || pad.value(Gamepad::RIGHT_TRIGGER) > 0.3;
-            for (button, key) in [(Gamepad::A, " "), (Gamepad::LEFT_BUMPER, "q"), (Gamepad::X, "e"), (Gamepad::Y, "r")] {
+            for (button, key) in [(Gamepad::A, " "), (Gamepad::LEFT_BUMPER, "q"), (Gamepad::X, "e"), (Gamepad::Y, "r"), (Gamepad::RIGHT_BUMPER, "x")] {
                 if pad.pressed(button) {
                     toggles.push(key.into());
                 }
@@ -155,9 +155,11 @@ impl Player {
             out.e_held |= pad.held(Gamepad::X);
         }
         let mut traverse = false;
+        let mut drop = false;
         for key in toggles {
             match key.as_str() {
                 " " => traverse = true,
+                "x" => drop = true,
                 "q" => self.strafe = !self.strafe,
                 "b" => self.overlay = !self.overlay,
                 "c" => {
@@ -228,8 +230,12 @@ impl Player {
                 self.update_ms.push(((kansei_wasm::now() - t0) * 1000.0) as f32);
             }
             if traverse {
-                // an obstacle ahead: traverse it (pressed a little early, once in reach); else jump
+                // an obstacle ahead: traverse it (pressed a little early, once in reach); else jump.
+                // Hanging, on a wall, on a bar: climb up, jump off, let go
                 let _ = c.controller.request_traverse_or_jump(&c.db, collision, 1.0);
+            }
+            if drop {
+                c.controller.request_drop(&c.db);
             }
             // the obstacle last looked at: its ledge, and a post down to the floor
             c.ledge.matrices.fill(Mat4::ZERO);
@@ -243,11 +249,13 @@ impl Player {
             self.searches += search.searched as u32;
             self.switches += search.switched as u32;
 
-            let character = c.controller.matcher.character();
+            let character = c.controller.matcher.shown();
             let body = &mut c.bodies[c.showing];
             if let Some(r) = scene.get_renderable_mut(body.index) {
                 r.object.set_position(character.translation.x, character.translation.y, character.translation.z);
-                r.object.rotation.y = yaw_of(character.rotation);
+                // (leaning on a wall, swinging from a bar: the whole rotation, not just the heading)
+                let (z, y, x) = character.rotation.to_euler(glam::EulerRot::ZYX);
+                r.object.rotation = Vec3::new(x, y, z);
                 body.palette.update(&body.mesh, c.controller.matcher.model());
                 if let Some(buffer) = r.material.bindable_buffer(PALETTE_BINDING) {
                     body.palette.upload(renderer.queue(), &buffer);
@@ -328,7 +336,7 @@ impl Player {
         let feet = c.controller.matcher.feet_locked();
         let speed = c.controller.matcher.simulation().velocity.length();
         Some(format!(
-            "{:.0} fps   {} {}{}\nclip   {}\nframe  {:.0} / {}{}\nsearch {:.0}/s, switch {:.1}/s, cost {:.3}\nupdate {}\nfeet   {} {}  (lock {})\n{}\n\n{}\n\nWASD / left stick move · Shift / B run · Space / A jump, traverse · Q / LB strafe\ndrag / right stick orbit · B overlay · K skeleton · M mesh · L foot lock{}",
+            "{:.0} fps   {} {}{}\nclip   {}\nframe  {:.0} / {}{}\nsearch {:.0}/s, switch {:.1}/s, cost {:.3}\nupdate {}\nfeet   {} {}  (lock {})\n{}\n\n{}\n\nWASD / left stick move · Shift / B run · Space / A jump, traverse, wall run · X / RB drop · Q / LB strafe\ndrag / right stick orbit · B overlay · K skeleton · M mesh · L foot lock{}",
             self.fps,
             if self.run { "run" } else { "walk" },
             format_args!("{speed:.1} m/s"),
@@ -348,10 +356,13 @@ impl Player {
                 "state  {}{}",
                 match c.controller.state() {
                     CharacterState::Grounded => "on the ground".to_string(),
-                    CharacterState::Traversing(k) => ["hurdling", "vaulting", "mantling", "climbing", "falling", "landing", "jumping"][k as usize].to_string(),
+                    CharacterState::Traversing(k) => ["hurdling", "vaulting", "mantling", "climbing", "falling", "landing", "jumping"].get(k as usize).map_or(k.name().to_string(), |s| s.to_string()),
                     CharacterState::Jumping => "jumping".to_string(),
                     CharacterState::Falling(t) => format!("in the air {t:.1} s"),
                     CharacterState::Landing => "landing".to_string(),
+                    CharacterState::Hanging => "hanging (A/D shimmy, Space climb up, X drop)".to_string(),
+                    CharacterState::WallRunning => "running along the wall (Space jump off, X drop)".to_string(),
+                    CharacterState::Swinging => "swinging (W/S pump, Space let go, X drop)".to_string(),
                 },
                 match c.controller.last_result {
                     Some(Ok(k)) => format!("   last Space: {}", k.name()),
