@@ -5,8 +5,8 @@ shaders: `RT_GRID_WGSL`'s `kansei_rt_trace` walks a uniform grid of the scene's 
 the camera. On native, where the GPU has ray tracing hardware, the same triangles can go into an
 acceleration structure instead, traced with hardware ray queries (wgpu's
 `EXPERIMENTAL_RAY_QUERY`). Both backends sit behind the same `kansei_rt_trace` and return the
-same `KanseiRtHit` for the same triangle ids, so the reflections, glass and hybrid GI effects
-(and any pass of your own) run unchanged on either. The web keeps the grid: WebGPU has no ray
+same `KanseiRtHit` for the same triangle ids, so the reflections, glass, hybrid GI and
+ray-traced shadow effects (and any pass of your own) run unchanged on either. The web keeps the grid: WebGPU has no ray
 tracing.
 
 ## Which backend
@@ -133,6 +133,10 @@ that added the backend):
 - DX12 (`RtBackend::Hardware`, on DXC) passed the parity tests on the 5090 as
   Vulkan did: Kansei's traces don't take the shape of the miscompiled one. It stays opt-in until
   the driver bug is understood.
+- `RtShadowsEffect`'s any-hit shadow rays (`--example rt_shadows`: gi-box's room, direct light
+  only, half resolution, 2026-10-28) trace in 0.49 → 0.30 ms on the M4 Pro and 0.28 → 0.014 ms on
+  the 5090 (Vulkan; DX12 0.21 → 0.021 ms); the effect's filter and composite cost the same on
+  either.
 
 ## The path tracer
 
