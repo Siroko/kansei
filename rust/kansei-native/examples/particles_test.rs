@@ -144,7 +144,11 @@ const QUAD: array<vec2<f32>, 6> = array(
                 data[32] = 0.15;
                 queue.write_buffer(self.params_buf.as_ref().unwrap(), 0, bytemuck::cast_slice(&data));
 
-                let output = kansei_core::renderers::surface_texture(self.surface.as_ref().unwrap()).unwrap();
+                // no surface texture this frame (occluded, outdated): skip it
+                let Some(output) = kansei_core::renderers::surface_texture(self.surface.as_ref().unwrap()) else {
+                    self.window.as_ref().unwrap().request_redraw();
+                    return;
+                };
                 let tex_view = output.texture.create_view(&Default::default());
                 let mut enc = device.create_command_encoder(&Default::default());
                 {

@@ -65,7 +65,11 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => el.exit(),
             WindowEvent::RedrawRequested => {
-                let output = kansei_core::renderers::surface_texture(self.surface.as_ref().unwrap()).unwrap();
+                // no surface texture this frame (occluded, outdated): skip it
+                let Some(output) = kansei_core::renderers::surface_texture(self.surface.as_ref().unwrap()) else {
+                    self.window.as_ref().unwrap().request_redraw();
+                    return;
+                };
                 let view = output.texture.create_view(&Default::default());
                 let mut enc = self.device.as_ref().unwrap().create_command_encoder(&Default::default());
                 {

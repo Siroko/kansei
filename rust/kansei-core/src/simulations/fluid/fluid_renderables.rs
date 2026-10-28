@@ -308,7 +308,7 @@ impl RaymarchingRenderable {
     /// into `density_field` (`splat_radius` each), raymarch it from `camera` over a `background`
     /// colour, blit and present. The bounds follow the simulation's.
     pub fn render_frame(&mut self, renderer: &Renderer, density_field: &mut FluidDensityField, sim: &super::FluidSimulation, splat_radius: f32, camera: &crate::cameras::Camera, background: wgpu::Color) {
-        let Some(output) = renderer.surface().and_then(crate::renderers::surface_texture) else { return };
+        let Some(output) = renderer.acquire_surface_texture() else { return };
         let canvas_view = output.texture.create_view(&Default::default());
         let mut encoder = renderer.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("FluidRaymarch/Frame") });
         density_field.update_with_encoder(&mut encoder, sim.world_bounds_min, sim.world_bounds_max, sim.particle_count(), splat_radius);

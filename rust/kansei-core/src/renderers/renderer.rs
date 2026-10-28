@@ -408,7 +408,10 @@ impl Renderer {
             desired_maximum_frame_latency: 2,
             color_space: wgpu::SurfaceColorSpace::Auto,
         };
-        surface.configure(&device, &surface_config);
+        // a zero size (a window not laid out yet) is configured by the first resize to a real one
+        if has_area(surface_config.width, surface_config.height) {
+            surface.configure(&device, &surface_config);
+        }
 
         self.presentation_format = format;
         self.initialize_resources(device, queue);
@@ -897,6 +900,31 @@ impl Renderer {
         self.surface.as_ref()
     }
 
+    /// The surface's next texture to draw a frame into, or `None` to skip the frame: without a
+    /// surface, at a zero size (a minimised window), while the window is occluded or the
+    /// surface timed out, and when it is outdated or lost, which configures it again for the
+    /// next frame. The render paths skip their frame the same way; a frame drawn by hand
+    /// presents this texture.
+    pub fn acquire_surface_texture(&self) -> Option<wgpu::SurfaceTexture> {
+        let (surface, config) = (self.surface.as_ref()?, self.surface_config.as_ref()?);
+        if !has_area(config.width, config.height) {
+            return None;
+        }
+        match surface_frame(surface.get_current_texture()) {
+            Ok(texture) => Some(texture),
+            Err(SurfaceSkip::Wait) => None,
+            Err(SurfaceSkip::Reconfigure) => {
+                log::info!("surface outdated or lost: configured again at {}x{}", config.width, config.height);
+                surface.configure(self.device.as_ref()?, config);
+                None
+            }
+            Err(SurfaceSkip::Invalid) => {
+                log::warn!("surface texture: validation error; frame skipped");
+                None
+            }
+        }
+    }
+
     pub fn width(&self) -> u32 { self.config.width }
     pub fn height(&self) -> u32 { self.config.height }
 
@@ -919,10 +947,14 @@ impl Renderer {
         scaled_size(self.config.width, self.config.height, self.render_scale)
     }
 
+    /// The surface and the canvas path's targets to `width` x `height`, the window's size in
+    /// physical pixels (or less: Metal stretches a smaller drawable over its layer). At a zero
+    /// size (a minimised window) the surface keeps its last configuration and frames are
+    /// skipped until a resize to a real size.
     pub fn resize(&mut self, width: u32, height: u32) {
         self.config.width = width;
         self.config.height = height;
-        if self.device.is_none() { return; }
+        if self.device.is_none() || !has_area(width, height) { return; }
         // Configure surface
         if let (Some(ref surface), Some(ref mut config)) = (&self.surface, &mut self.surface_config) {
             config.width = width;
@@ -969,8 +1001,8 @@ impl Renderer {
         let tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Renderer/Depth"),
             size: wgpu::Extent3d {
-                width: self.config.width,
-                height: self.config.height,
+                width: self.config.width.max(1),
+                height: self.config.height.max(1),
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -987,8 +1019,8 @@ impl Renderer {
             let msaa = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("Renderer/MSAA"),
                 size: wgpu::Extent3d {
-                    width: self.config.width,
-                    height: self.config.height,
+                    width: self.config.width.max(1),
+                    height: self.config.height.max(1),
                     depth_or_array_layers: 1,
                 },
                 mip_level_count: 1,
@@ -2883,6 +2915,9 @@ impl Renderer {
 
     /// Render the scene to the canvas surface (simple path).
     pub fn render(&mut self, scene: &mut Scene, camera: &mut Camera) {
+        if !has_area(self.config.width, self.config.height) {
+            return;
+        }
         // Phase 0: Update transforms, prepare scene
         camera.update_view_matrix();
         scene.prepare(camera.position());
@@ -3104,8 +3139,11 @@ impl Renderer {
         }
 
         // Phase 2+3: Create render pass and execute bundle
-        let surface = self.surface.as_ref().unwrap();
-        let output = surface_texture(surface).expect("Failed to get surface texture");
+        // no surface texture (occluded, timed out, outdated): skip the frame, the camera's too
+        let Some(output) = self.acquire_surface_texture() else {
+            crate::profiling::end_frame(self.device.as_ref().unwrap(), self.queue.as_ref().unwrap());
+            return;
+        };
         let canvas_view = output.texture.create_view(&Default::default());
 
         let device = self.device.as_ref().unwrap();
@@ -3174,9 +3212,14 @@ impl Renderer {
     /// find it empty.
     pub(crate) fn present_through(&mut self, input: &wgpu::TextureView, camera: &Camera, volume: &mut crate::postprocessing::PostProcessingVolume) {
         let (width, height) = (self.config.width, self.config.height);
+        if !has_area(width, height) {
+            return;
+        }
         volume.ensure_gbuffer(width, height);
-        let surface = self.surface.as_ref().unwrap();
-        let output = surface_texture(surface).expect("Surface texture");
+        let Some(output) = self.acquire_surface_texture() else {
+            crate::profiling::end_frame(self.device.as_ref().unwrap(), self.queue.as_ref().unwrap());
+            return;
+        };
         let canvas_view = output.texture.create_view(&Default::default());
         volume.render_from(Some(input), camera, &canvas_view, width, height);
         self.queue.as_ref().unwrap().present(output);
@@ -3192,6 +3235,9 @@ impl Renderer {
         let _frame = crate::profiling::cpu_scope("frame");
         let width = self.config.width;
         let height = self.config.height;
+        if !has_area(width, height) {
+            return;
+        }
         let (render_width, render_height) = self.render_size();
         volume.ensure_gbuffer(render_width, render_height);
 
@@ -3213,8 +3259,13 @@ impl Renderer {
 
         // Get surface texture for blit
         let t = crate::profiling::cpu_scope("frame/surface");
-        let surface = self.surface.as_ref().unwrap();
-        let output = surface_texture(surface).expect("Surface texture");
+        // no surface texture (occluded, timed out, outdated): the GBuffer is drawn but nothing
+        // is shown, and the camera's frame doesn't end, so the next one's motion vectors (and
+        // TAA's history) still reach back to the last frame shown
+        let Some(output) = self.acquire_surface_texture() else {
+            crate::profiling::end_frame(self.device.as_ref().unwrap(), self.queue.as_ref().unwrap());
+            return;
+        };
         let canvas_view = output.texture.create_view(&Default::default());
         drop(t);
 
@@ -4122,11 +4173,33 @@ fn draw_geometry<'a>(enc: &mut impl wgpu::util::RenderEncoder<'a>, r: &'a crate:
     bind_and_draw(enc, r, r.instance_culling.as_ref().and_then(|c| c.view(view)));
 }
 
-/// The surface's next texture, suboptimal or not; `None` when it is outdated, lost, occluded or timed out.
+/// The surface's next texture, suboptimal or not; `None` when it is outdated, lost, occluded or
+/// timed out: skip the frame then (and configure the surface again when it is outdated or lost),
+/// never panic, since on macOS this runs inside winit's `drawRect:`, which cannot unwind.
+/// [`Renderer::acquire_surface_texture`] reconfigures the renderer's own surface itself.
 pub fn surface_texture(surface: &wgpu::Surface) -> Option<wgpu::SurfaceTexture> {
-    match surface.get_current_texture() {
-        wgpu::CurrentSurfaceTexture::Success(texture) | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => Some(texture),
-        _ => None,
+    surface_frame(surface.get_current_texture()).ok()
+}
+
+/// Why a frame finds no surface texture to draw into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SurfaceSkip {
+    /// Occluded or timed out: try again next frame. On Metal a new window reads as occluded
+    /// until macOS first shows it, and wgpu then hands out no drawable.
+    Wait,
+    /// Outdated or lost: configure the surface again, then try next frame.
+    Reconfigure,
+    /// A validation error, already reported to the device's error handler.
+    Invalid,
+}
+
+/// The texture in the surface's answer, or why the frame has none.
+fn surface_frame(current: wgpu::CurrentSurfaceTexture) -> Result<wgpu::SurfaceTexture, SurfaceSkip> {
+    match current {
+        wgpu::CurrentSurfaceTexture::Success(texture) | wgpu::CurrentSurfaceTexture::Suboptimal(texture) => Ok(texture),
+        wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => Err(SurfaceSkip::Wait),
+        wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => Err(SurfaceSkip::Reconfigure),
+        wgpu::CurrentSurfaceTexture::Validation => Err(SurfaceSkip::Invalid),
     }
 }
 
@@ -4176,6 +4249,11 @@ fn projection_near(projection: glam::Mat4) -> f32 {
     if near.is_finite() && near > 0.0 { near } else { 0.01 }
 }
 
+/// Whether a surface of `width` x `height` can be configured and drawn: a minimised window's is 0.
+fn has_area(width: u32, height: u32) -> bool {
+    width > 0 && height > 0
+}
+
 /// `width` x `height` times `scale`, rounded, at least 1 x 1.
 fn scaled_size(width: u32, height: u32, scale: f32) -> (u32, u32) {
     let scaled = |n: u32| ((n as f32 * scale).round() as u32).max(1);
@@ -4209,6 +4287,22 @@ mod tests {
         assert!((super::halton(1, 3) - 1.0 / 3.0).abs() < 1e-6);
         assert!((super::halton(2, 3) - 2.0 / 3.0).abs() < 1e-6);
         assert!((super::halton(4, 3) - 4.0 / 9.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_frame_without_a_surface_texture_is_skipped() {
+        use super::{has_area, surface_frame, SurfaceSkip};
+        use wgpu::CurrentSurfaceTexture as Current;
+        // Metal reads a new window as occluded until macOS first shows it (its first drawRect:)
+        assert_eq!(surface_frame(Current::Occluded).err(), Some(SurfaceSkip::Wait));
+        assert_eq!(surface_frame(Current::Timeout).err(), Some(SurfaceSkip::Wait));
+        assert_eq!(surface_frame(Current::Outdated).err(), Some(SurfaceSkip::Reconfigure));
+        assert_eq!(surface_frame(Current::Lost).err(), Some(SurfaceSkip::Reconfigure));
+        assert_eq!(surface_frame(Current::Validation).err(), Some(SurfaceSkip::Invalid));
+        // a minimised window's surface is neither configured nor drawn
+        assert!(has_area(1600, 900));
+        assert!(!has_area(0, 900));
+        assert!(!has_area(1600, 0));
     }
 
     #[test]

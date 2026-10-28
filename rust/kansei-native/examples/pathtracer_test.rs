@@ -420,9 +420,11 @@ impl ApplicationHandler for App {
 
                 self.camera.update_view_matrix();
 
-                // Get surface texture
-                let surface = renderer.surface().unwrap();
-                let output = kansei_core::renderers::surface_texture(surface).expect("Failed to get surface texture");
+                // Get surface texture (none this frame when occluded or outdated: skip it)
+                let Some(output) = renderer.acquire_surface_texture() else {
+                    if let Some(ref w) = self.window { w.request_redraw(); }
+                    return;
+                };
                 let canvas_view = output.texture.create_view(&Default::default());
 
                 let mut encoder =
