@@ -45,8 +45,13 @@
 //!   metres up, default 0.6) or `view=probes` (the probes, lit by their own irradiance);
 //! - the distance field (it turns voxel GI's scene volume on whatever the mode): `sdf_ao=0..1`
 //!   (its AO on the GI), `sdf_shadows=off|fallback|always` (the voxels' shadows through it, where
-//!   no map covers them or always), `shadows=map|sdf` (the direct light's shadows through it, by
+//!   no map covers them or always), `shadows=sdf` (the direct light's shadows through it, by
 //!   the material helper `gi::SDF_WGSL`);
+//! - the direct light's shadows: `shadows=maps` (the shadow atlas, PCSS: the default) or
+//!   `shadows=rt` (`RtShadowsEffect`: rays through the grid of triangles toward a point of the
+//!   lamp's disk, denoised; the materials leave the lamp to it through `RT_SHADOWS_GBUFFER_WGSL`),
+//!   with `rts_res=half|full`, `rts_contact=<m>` (the screen-space contact rays, 0.25; 0 none) and
+//!   `rts_view=lit|visibility|direct|mask`;
 //! - the balls: `mirror=0`, `glass=0` (without either, and without `reflect`, `gi=rt` or `rt=1`, no
 //!   grid of triangles is built), `mirror_rough=0..1`, `glass_ior=` (1.5), `glass_rough=0..1`
 //!   (frosted), `glass_tint=r,g,b` (the light left after a metre inside), `glass_samples=` (paths
@@ -87,7 +92,8 @@ use kansei_core::renderers::{Renderer, RendererConfig};
 use kansei_core::clusters::{ClusterLod, ClusterMesh, ClusterOptions};
 use kansei_core::rt::{
     RtDiffuseGiEffect, RtDiffuseGiOptions, RtGiDenoise, RtGiHitLighting, RtGiKernel, RtGiMode, RtGiResolution, RtGiShadows, RtGiView, RtGlass, RtGridOptions,
-    RtReflectionsEffect, RtReflectionsOptions, RtReflectionsView, RtSurface, RtTraceResolution, SceneRtGridOptions,
+    RtReflectionsEffect, RtReflectionsOptions, RtReflectionsView, RtShadowsEffect, RtShadowsView, RtSurface, RtTraceResolution, SceneRtGridOptions,
+    RT_SHADOWS_GBUFFER_WGSL,
 };
 use kansei_wasm::{fetch_bytes, flag, is_phone, now, param, param_or, Canvas, Frame};
 
@@ -130,7 +136,7 @@ fn shade(in: VOut, base: vec3<f32>) -> KanseiGBufferOut {
     let view3 = mat3x3<f32>(view_matrix[0].xyz, view_matrix[1].xyz, view_matrix[2].xyz);
     let camera_pos = -(transpose(view3) * view_matrix[3].xyz);
     let v = normalize(camera_pos - in.world);
-    return kansei_gbuffer_out_specular(lit_radiance(in.world, n, v, base, in.clip.xy), vec3<f32>(0.0), n, base, surface.specular.x, surface.specular.y);
+    return lit_out(lit_radiance(in.world, n, v, base, in.clip.xy), n, base, surface.specular.x, surface.specular.y);
 }
 "#;
 
@@ -195,10 +201,11 @@ fn rug_texture() -> Texture {
 }
 
 /// The rug's material; `voxel_entry` false voxelizes it with its constant `GiSurface` instead.
-fn rug_material(voxel_entry: bool, sdf: Option<&SdfBinding>) -> Material {
+fn rug_material(voxel_entry: bool, sdf: Option<&SdfBinding>, rt: bool) -> Material {
     let (code, bindings) = lit_shader(
         &format!("{VOXEL_WRITE_WGSL}\n{SURFACE_WGSL}\n{TEXTURED_WGSL}"),
         sdf,
+        rt,
         vec![
             Binding::uniform(0, ShaderStages::VERTEX | ShaderStages::FRAGMENT),
             Binding::texture_2d(1, ShaderStages::FRAGMENT),
@@ -213,10 +220,33 @@ fn rug_material(voxel_entry: bool, sdf: Option<&SdfBinding>) -> Material {
     material
 }
 
+/// The GBuffer output of a surface that lights itself (`lit_out`): its light, normal and albedo,
+/// and a polished one's F0 and roughness.
+const SELF_LIT_OUT_WGSL: &str = r#"
+fn lit_out(color: vec3<f32>, n: vec3<f32>, base: vec3<f32>, f0: f32, roughness: f32) -> KanseiGBufferOut {
+    return kansei_gbuffer_out_specular(color, vec3<f32>(0.0), n, base, f0, roughness);
+}
+"#;
+
 /// The spot lights' light on a surface (`lit_radiance`), shadowed by the shadow atlas.
 const MAP_SHADOWS_WGSL: &str = r#"
 fn lit_radiance(world: vec3<f32>, n: vec3<f32>, v: vec3<f32>, base: vec3<f32>, pixel: vec2<f32>) -> vec3<f32> {
     return kansei_spot_lights_radiance(world, n, v, base, 1.0, 0.0, pixel);
+}
+"#;
+
+/// No light of its own: the lamp's direct light is `RtShadowsEffect`'s, with ray-traced shadows
+/// (`RT_SHADOWS_GBUFFER_WGSL`'s `kansei_gbuffer_out_rt_lit` marks the surface for it). Matte
+/// surfaces take its GGX at roughness 1, as `kansei_brdf` lights them with the maps; a polished
+/// one's highlight is the traced reflections'.
+const RT_SHADOWS_WGSL: &str = r#"
+fn lit_radiance(world: vec3<f32>, n: vec3<f32>, v: vec3<f32>, base: vec3<f32>, pixel: vec2<f32>) -> vec3<f32> {
+    return vec3<f32>(0.0);
+}
+
+fn lit_out(color: vec3<f32>, n: vec3<f32>, base: vec3<f32>, f0: f32, roughness: f32) -> KanseiGBufferOut {
+    let polished = f0 > 0.0;
+    return kansei_gbuffer_out_rt_lit(color, vec3<f32>(0.0), n, base, select(1.0, roughness, polished), f0, polished);
 }
 "#;
 
@@ -258,15 +288,16 @@ impl SdfBinding {
     }
 }
 
-/// `body` (which calls `lit_radiance`, through `SURFACE_WGSL`'s `shade`) after the GBuffer output and
-/// the light chunk for `sdf` (shadows through the field) or the shadow maps, with its bindings:
-/// `bindings` plus the field's.
-fn lit_shader(body: &str, sdf: Option<&SdfBinding>, mut bindings: Vec<Binding>) -> (String, Vec<Binding>) {
+/// `body` (which calls `lit_radiance` and `lit_out`, through `SURFACE_WGSL`'s `shade`) after the
+/// GBuffer output and the light chunk for `sdf` (shadows through the field), `rt` (the light left
+/// to `RtShadowsEffect`) or the shadow maps, with its bindings: `bindings` plus the field's.
+fn lit_shader(body: &str, sdf: Option<&SdfBinding>, rt: bool, mut bindings: Vec<Binding>) -> (String, Vec<Binding>) {
     match sdf {
-        None => (format!("{GBUFFER_OUT_WGSL}\n{SPOT_LIGHTS_WGSL}\n{MAP_SHADOWS_WGSL}\n{body}"), bindings),
+        _ if rt => (format!("{GBUFFER_OUT_WGSL}\n{RT_SHADOWS_GBUFFER_WGSL}\n{RT_SHADOWS_WGSL}\n{body}"), bindings),
+        None => (format!("{GBUFFER_OUT_WGSL}\n{SPOT_LIGHTS_WGSL}\n{MAP_SHADOWS_WGSL}\n{SELF_LIT_OUT_WGSL}\n{body}"), bindings),
         Some(_) => {
             bindings.extend([Binding::uniform(10, ShaderStages::FRAGMENT), Binding::texture_3d(11, ShaderStages::FRAGMENT), Binding::sampler(12, ShaderStages::FRAGMENT)]);
-            (format!("{GBUFFER_OUT_WGSL}\n{SPOT_LIGHTS_WGSL}\n{SDF_WGSL}\n{SDF_SHADOWS_WGSL}\n{body}"), bindings)
+            (format!("{GBUFFER_OUT_WGSL}\n{SPOT_LIGHTS_WGSL}\n{SDF_WGSL}\n{SDF_SHADOWS_WGSL}\n{SELF_LIT_OUT_WGSL}\n{body}"), bindings)
         }
     }
 }
@@ -280,9 +311,10 @@ fn bind_sdf(material: &mut Material, sdf: Option<&SdfBinding>) {
     }
 }
 
-/// A lit material of `base_color`, polished as `specular` says (F0, roughness; zeros: matte).
-fn lit_material(label: &str, base_color: [f32; 3], sdf: Option<&SdfBinding>, specular: [f32; 2]) -> Material {
-    let (code, bindings) = lit_shader(&format!("{SURFACE_WGSL}\n{PLAIN_WGSL}"), sdf, vec![Binding::uniform(0, ShaderStages::VERTEX | ShaderStages::FRAGMENT)]);
+/// A lit material of `base_color`, polished as `specular` says (F0, roughness; zeros: matte), its
+/// direct light ray traced by `RtShadowsEffect` with `rt`.
+fn lit_material(label: &str, base_color: [f32; 3], sdf: Option<&SdfBinding>, rt: bool, specular: [f32; 2]) -> Material {
+    let (code, bindings) = lit_shader(&format!("{SURFACE_WGSL}\n{PLAIN_WGSL}"), sdf, rt, vec![Binding::uniform(0, ShaderStages::VERTEX | ShaderStages::FRAGMENT)]);
     let mut material = Material::new(label, &code, bindings, MaterialOptions { mrt_output_count: Some(4), ..Default::default() });
     material.set_uniform_bindable(0, label, &[base_color[0], base_color[1], base_color[2], 1.0f32, specular[0], specular[1], 0.0, 0.0]);
     bind_sdf(&mut material, sdf);
@@ -523,6 +555,91 @@ fn rt_grid_options() -> SceneRtGridOptions {
     }
 }
 
+/// The direct light's shadows (`shadows=`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Direct {
+    /// The shadow atlas (PCSS, the lamp's disk).
+    Maps,
+    /// Voxel GI's distance field, through the material helper `gi::SDF_WGSL`.
+    Sdf,
+    /// Ray traced through the room's grid (`RtShadowsEffect`): the materials leave the lamp's
+    /// light to it.
+    Rt,
+}
+
+impl Direct {
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "maps" | "map" => Some(Self::Maps),
+            "sdf" => Some(Self::Sdf),
+            "rt" => Some(Self::Rt),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Maps => "maps",
+            Self::Sdf => "sdf",
+            Self::Rt => "rt",
+        }
+    }
+}
+
+fn rt_shadows_view(name: &str) -> Option<RtShadowsView> {
+    match name {
+        "lit" => Some(RtShadowsView::Lit),
+        "visibility" => Some(RtShadowsView::Visibility),
+        "direct" => Some(RtShadowsView::Direct),
+        "mask" => Some(RtShadowsView::Mask),
+        _ => None,
+    }
+}
+
+fn rt_shadows_view_name(view: RtShadowsView) -> &'static str {
+    match view {
+        RtShadowsView::Lit => "lit",
+        RtShadowsView::Visibility => "visibility",
+        RtShadowsView::Direct => "direct",
+        RtShadowsView::Mask => "mask",
+    }
+}
+
+/// `RtShadowsEffect`'s settings (`rts_*`, the panel's "RT shadows").
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RtShadows {
+    view: RtShadowsView,
+    /// a ray a pixel (else one for each 2 x 2)
+    full: bool,
+    /// metres the screen-space contact rays walk (0: none)
+    contact: f32,
+}
+
+impl RtShadows {
+    fn from_url() -> Self {
+        Self {
+            view: param("rts_view").and_then(|v| rt_shadows_view(&v)).unwrap_or_default(),
+            full: param("rts_res").as_deref() == Some("full"),
+            // (the effect's default)
+            contact: param_or("rts_contact", 0.25f32).clamp(0.0, 2.0),
+        }
+    }
+
+    fn set(&mut self, key: &str, v: &str) -> bool {
+        match key {
+            "view" => rt_shadows_view(v).map(|x| self.view = x),
+            "res" => Some(self.full = v == "full"),
+            "contact" => v.parse::<f32>().ok().map(|x| self.contact = x.clamp(0.0, 2.0)),
+            _ => None,
+        }
+        .is_some()
+    }
+
+    fn json(&self) -> String {
+        format!("{{\"view\":\"{}\",\"res\":\"{}\",\"contact\":{}}}", rt_shadows_view_name(self.view), if self.full { "full" } else { "half" }, self.contact)
+    }
+}
+
 /// Everything the panel and the URL set.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Config {
@@ -539,9 +656,9 @@ struct Config {
     sdf_ao: f32,
     /// The voxels' shadows through the distance field.
     sdf_shadows: SdfShadows,
-    /// The direct light's shadows through the distance field (the material helper) instead of
-    /// the shadow atlas.
-    direct_sdf: bool,
+    /// The direct light's shadows: the shadow atlas, the distance field or ray traced.
+    direct: Direct,
+    rt_shadows: RtShadows,
     /// The SDF slice's height, metres.
     slice: f32,
     /// `reflect=1`: the polished floor and the grid of triangles its reflections trace (set at
@@ -576,7 +693,7 @@ impl Config {
 
     /// Whether anything reads the distance field.
     fn needs_sdf(&self) -> bool {
-        self.sdf_ao > 0.0 || self.sdf_shadows != SdfShadows::Off || self.view == View::Sdf || self.direct_sdf || self.needs_probes()
+        self.sdf_ao > 0.0 || self.sdf_shadows != SdfShadows::Off || self.view == View::Sdf || self.direct == Direct::Sdf || self.needs_probes()
     }
 
     /// Whether the scene's voxel GI must run: for the voxel modes, the distance field, or the
@@ -611,11 +728,11 @@ struct Preset {
     dragon: Dragon,
     sdf_ao: f32,
     sdf_shadows: SdfShadows,
-    direct_sdf: bool,
+    direct: Direct,
 }
 
 const fn preset(name: &'static str, label: &'static str, gi: &'static str, voxels: Option<VoxelGiQuality>, view: View, dragon: Dragon) -> Preset {
-    Preset { name, label, gi, voxels, view, dragon, sdf_ao: 0.0, sdf_shadows: SdfShadows::Off, direct_sdf: false }
+    Preset { name, label, gi, voxels, view, dragon, sdf_ao: 0.0, sdf_shadows: SdfShadows::Off, direct: Direct::Maps }
 }
 
 const PRESETS: [Preset; 15] = [
@@ -630,8 +747,8 @@ const PRESETS: [Preset; 15] = [
     preset("phone", "Phone (low)", "voxel+ssgi", Some(VoxelGiQuality::Low), View::Lit, Dragon::Off),
     preset("dragon", "Dragon, 871k tris (voxel + SSGI)", "voxel+ssgi", None, View::Lit, Dragon::Full),
     // the distance field: its AO on the GI and soft shadows for the voxels and the direct light
-    Preset { sdf_ao: 0.8, sdf_shadows: SdfShadows::Always, direct_sdf: true, ..preset("sdf", "SDF: AO + soft shadows", "voxel+ssgi", None, View::Lit, Dragon::Off) },
-    Preset { sdf_ao: 0.8, sdf_shadows: SdfShadows::Always, direct_sdf: true, ..preset("sdf-dragon", "SDF + dragon, 871k tris", "voxel+ssgi", None, View::Lit, Dragon::Full) },
+    Preset { sdf_ao: 0.8, sdf_shadows: SdfShadows::Always, direct: Direct::Sdf, ..preset("sdf", "SDF: AO + soft shadows", "voxel+ssgi", None, View::Lit, Dragon::Off) },
+    Preset { sdf_ao: 0.8, sdf_shadows: SdfShadows::Always, direct: Direct::Sdf, ..preset("sdf-dragon", "SDF + dragon, 871k tris", "voxel+ssgi", None, View::Lit, Dragon::Full) },
     preset("slice", "SDF slice (debug)", "voxel", None, View::Sdf, Dragon::Off),
     // irradiance probes traced in the distance field, under SSGI
     preset("probes", "Probes + SSGI", "probes+ssgi", None, View::Lit, Dragon::Off),
@@ -670,8 +787,9 @@ struct State {
     enabled_voxels: Option<VoxelGiQuality>,
     /// Bumped whenever voxel GI or its field is made anew (materials that read the field rebind).
     gi_generation: u32,
-    /// The generation the lit materials read the field of (None: they use the shadow maps).
-    materials_sdf: Option<u32>,
+    /// The direct shadows the lit materials were made for, and the generation of the field they
+    /// read (with `Direct::Sdf`).
+    materials: (Direct, Option<u32>),
     /// The lit renderables: (scene index, label, albedo); the rug is apart.
     lit: Vec<(usize, &'static str, [f32; 3])>,
     tall: usize,
@@ -729,7 +847,7 @@ fn with_preset(config: Config, name: &str, phone: bool) -> Config {
         dragon: p.dragon,
         sdf_ao: p.sdf_ao,
         sdf_shadows: p.sdf_shadows,
-        direct_sdf: p.direct_sdf,
+        direct: p.direct,
         ..config
     }
 }
@@ -746,7 +864,8 @@ fn config_from_url(phone: bool) -> Config {
         textured: true,
         sdf_ao: 0.0,
         sdf_shadows: SdfShadows::Off,
-        direct_sdf: false,
+        direct: Direct::Maps,
+        rt_shadows: RtShadows::from_url(),
         slice: 0.6,
         reflect: flag("reflect", false),
         reflections: true,
@@ -786,15 +905,15 @@ fn config_from_url(phone: bool) -> Config {
     if let Some(shadows) = param("sdf_shadows").as_deref().and_then(SdfShadows::from_name) {
         c.sdf_shadows = shadows;
     }
-    if let Some(direct) = param("shadows") {
-        c.direct_sdf = direct == "sdf";
+    if let Some(direct) = param("shadows").as_deref().and_then(Direct::from_name) {
+        c.direct = direct;
     }
     if let Some(slice) = param("slice").and_then(|v| v.parse::<f32>().ok()) {
         c.slice = slice;
     }
     c.rug = param("rug").as_deref() != Some("off");
     c.textured = param("albedo").as_deref() != Some("constant");
-    c.grid = c.reflect || c.gi == Gi::Rt || flag("rt", false) || c.mirror || c.glass;
+    c.grid = c.reflect || c.gi == Gi::Rt || c.direct == Direct::Rt || flag("rt", false) || c.mirror || c.glass;
     c
 }
 
@@ -802,6 +921,24 @@ fn config_from_url(phone: bool) -> Config {
 fn build_effects(renderer: &Renderer, config: &Config, phone: bool, stats: bool) -> Vec<Box<dyn PostProcessingEffect>> {
     let indirect = config.view == View::Indirect;
     let mut effects: Vec<Box<dyn PostProcessingEffect>> = Vec::new();
+    // the lamp's direct light with ray-traced shadows (shadows=rt): first, so the GI and the
+    // reflections' screen hits see it
+    if let (Direct::Rt, Some(grid)) = (config.direct, renderer.rt_grid()) {
+        let mut shadows = RtShadowsEffect::new(grid.handle());
+        let r = config.rt_shadows;
+        shadows.view = r.view;
+        shadows.half_resolution = !r.full;
+        shadows.contact_length = r.contact;
+        effects.push(Box::new(shadows));
+        if r.view != RtShadowsView::Lit {
+            // its debug views alone: the direct light exposed as the image is, the visibility and
+            // the mask as they are
+            let mut tone = ToneMapOptions::for_surface(renderer.presentation_format());
+            tone.exposure = if r.view == RtShadowsView::Direct { exposure_from_ev100(5.0) } else { 1.0 };
+            effects.push(Box::new(ToneMapEffect::new(tone)));
+            return effects;
+        }
+    }
     let screen = ScreenSpaceGIOptions { radius_m: 4.0, ..Default::default() };
     match config.gi {
         Gi::Off if config.view != View::Sdf => {}
@@ -933,21 +1070,23 @@ impl State {
             }
         }
         self.volume.effects = build_effects(&self.renderer, &config, self.phone, self.stats.is_some());
-        // the lit materials: shadowed through the field (bound to this one) or by the maps
-        let wanted = config.direct_sdf.then_some(self.gi_generation);
-        if wanted != self.materials_sdf || config.textured != previous.textured {
-            let sdf = config.direct_sdf.then(|| self.renderer.voxel_gi().and_then(SdfBinding::of)).flatten();
+        // the lit materials: shadowed through the field (bound to this one), by the maps, or
+        // leaving the lamp to the ray-traced shadows
+        let wanted = (config.direct, (config.direct == Direct::Sdf).then_some(self.gi_generation));
+        if wanted != self.materials || config.textured != previous.textured {
+            let sdf = (config.direct == Direct::Sdf).then(|| self.renderer.voxel_gi().and_then(SdfBinding::of)).flatten();
+            let rt = config.direct == Direct::Rt;
             for &(index, label, albedo) in &self.lit {
                 if let Some(r) = self.scene.get_renderable_mut(index) {
-                    r.material = lit_material(label, albedo, sdf.as_ref(), if label == "Floor" { self.floor_specular } else { [0.0; 2] });
+                    r.material = lit_material(label, albedo, sdf.as_ref(), rt, if label == "Floor" { self.floor_specular } else { [0.0; 2] });
                     r.material_dirty = true;
                 }
             }
             if let Some(r) = self.scene.get_renderable_mut(self.rug) {
-                r.material = rug_material(config.textured, sdf.as_ref());
+                r.material = rug_material(config.textured, sdf.as_ref(), rt);
                 r.material_dirty = true;
             }
-            self.materials_sdf = wanted;
+            self.materials = wanted;
         }
 
         if let Some(r) = self.scene.get_renderable_mut(self.rug) {
@@ -1015,6 +1154,9 @@ impl State {
             }
         }
         self.controls.update(&mut self.camera, dt);
+        if let Some(shadows) = self.volume.effect_mut::<RtShadowsEffect>() {
+            shadows.update_lights(self.scene.lights());
+        }
         if let Some(gi) = self.volume.effect_mut::<RtDiffuseGiEffect>() {
             gi.update_lights(self.scene.lights());
         }
@@ -1120,7 +1262,7 @@ impl State {
         // (+ 0.0: an empty sum is -0)
         let sum = |prefix: &str| self.stats.as_ref().map_or(0.0, |s| s.passes.iter().filter(|p| p.0.starts_with(prefix)).map(|p| p.1).sum::<f64>()) + 0.0;
         format!(
-            "{{\"grid\":{},\"rtgi\":{},\"rtgi_ms\":{:.3},\"reflect\":{},\"balls\":{},\"rt_ms\":{:.3},\"reflect_ms\":{:.3},\"glass_ms\":{:.3},\"gi\":\"{}\",\"view\":\"{}\",\"voxels\":\"{}\",\"voxel_tier\":{},\"dims\":{},\"mib\":{:.1},\"dragon\":\"{}\",\"animate\":{},\"rug\":{},\"textured\":{},\"sdf_ao\":{},\"sdf_shadows\":\"{}\",\"shadows\":\"{}\",\"slice\":{},\"sdf\":{},\"sdf_ms\":{:.3},\"probes\":{},\"probe_dims\":{},\"probes_ms\":{:.3},\"triangles\":{},\"stats\":{},\"frame_ms\":{:.2},\"gpu_ms\":{:.3},\"gpu_span_ms\":{:.3},\"voxelize_ms\":{:.3},\"inject_ms\":{:.3},\"mips_ms\":{:.3},\"screen_ms\":{:.3},\"ssgi_ms\":{:.3},\"passes\":[{}]}}",
+            "{{\"grid\":{},\"rtgi\":{},\"rtgi_ms\":{:.3},\"reflect\":{},\"balls\":{},\"rt_ms\":{:.3},\"reflect_ms\":{:.3},\"glass_ms\":{:.3},\"gi\":\"{}\",\"view\":\"{}\",\"voxels\":\"{}\",\"voxel_tier\":{},\"dims\":{},\"mib\":{:.1},\"dragon\":\"{}\",\"animate\":{},\"rug\":{},\"textured\":{},\"sdf_ao\":{},\"sdf_shadows\":\"{}\",\"shadows\":\"{}\",\"rt_shadows\":{},\"rt_shadows_ms\":{:.3},\"slice\":{},\"sdf\":{},\"sdf_ms\":{:.3},\"probes\":{},\"probe_dims\":{},\"probes_ms\":{:.3},\"triangles\":{},\"stats\":{},\"frame_ms\":{:.2},\"gpu_ms\":{:.3},\"gpu_span_ms\":{:.3},\"voxelize_ms\":{:.3},\"inject_ms\":{:.3},\"mips_ms\":{:.3},\"screen_ms\":{:.3},\"ssgi_ms\":{:.3},\"passes\":[{}]}}",
             self.grid_info(),
             self.rtgi_info(),
             sum("RtGi/"),
@@ -1141,7 +1283,9 @@ impl State {
             self.config.textured,
             self.config.sdf_ao,
             self.config.sdf_shadows.name(),
-            if self.config.direct_sdf { "sdf" } else { "map" },
+            self.config.direct.name(),
+            self.config.rt_shadows.json(),
+            sum("RtShadows/"),
             self.config.slice,
             gi.and_then(|g| g.sdf()).is_some(),
             sum("VoxelGI/Sdf"),
@@ -1176,7 +1320,7 @@ fn add_dragon(scene: &mut Scene, geometry: kansei_core::geometries::Geometry, re
         log::info!("dragon: cluster LOD of {} triangles in {:.0} ms", geometry.index_count() / 3, (now() - t) * 1000.0);
         ClusterLod::new(mesh)
     });
-    let mut dragon = Renderable::new(geometry, lit_material("Dragon", albedo, None, [0.0; 2])).with_gi(GiSurface::new(albedo));
+    let mut dragon = Renderable::new(geometry, lit_material("Dragon", albedo, None, false, [0.0; 2])).with_gi(GiSurface::new(albedo));
     dragon.clusters = clusters;
     // its hits shaded with its vertex normals, not its cut's facets
     dragon.rt = grid.then(|| RtSurface::new(albedo).with_smooth_normals());
@@ -1214,20 +1358,20 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     ];
     for (label, size, position, color) in slabs {
         let specular = if label == "Floor" { floor_specular } else { [0.0; 2] };
-        let mut slab = Renderable::new(BoxGeometry::new(size[0], size[1], size[2]), lit_material(label, color, None, specular)).with_gi(GiSurface::new(color));
+        let mut slab = Renderable::new(BoxGeometry::new(size[0], size[1], size[2]), lit_material(label, color, None, false, specular)).with_gi(GiSurface::new(color));
         slab.object.set_position(position[0], position[1], position[2]);
         slab.rt = rt(color);
         lit.push((scene.add(SceneNode::Renderable(slab)), label, color));
     }
     // a tall block near the red wall and a short one near the green wall
     let tall_rest = (Vec3::new(-0.75, 1.2, -2.6), 0.33);
-    let mut tall = Renderable::new(BoxGeometry::new(1.2, 2.4, 1.2), lit_material("Tall", white, None, [0.0; 2])).with_gi(GiSurface::new(white));
+    let mut tall = Renderable::new(BoxGeometry::new(1.2, 2.4, 1.2), lit_material("Tall", white, None, false, [0.0; 2])).with_gi(GiSurface::new(white));
     tall.rt = rt(white);
     tall.object.position = tall_rest.0;
     tall.object.rotation.y = tall_rest.1;
     let tall = scene.add(SceneNode::Renderable(tall));
     lit.push((tall, "Tall", white));
-    let mut short = Renderable::new(BoxGeometry::new(1.2, 1.2, 1.2), lit_material("Short", white, None, [0.0; 2])).with_gi(GiSurface::new(white));
+    let mut short = Renderable::new(BoxGeometry::new(1.2, 1.2, 1.2), lit_material("Short", white, None, false, [0.0; 2])).with_gi(GiSurface::new(white));
     short.rt = rt(white);
     short.object.set_position(0.8, 0.6, -1.5);
     short.object.rotation.y = -0.3;
@@ -1236,7 +1380,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     // before the short one, whose sides facing the camera only bounces light; its constant
     // surface (its mean colour) is used where the material's voxel entry is not
     let mean: [f32; 3] = std::array::from_fn(|c| (RUG_LEFT[c] + RUG_RIGHT[c]) * 0.5);
-    let mut rug = Renderable::new(BoxGeometry::new(2.4, 0.02, 0.8), rug_material(config.textured, None)).with_gi(GiSurface::new(mean));
+    let mut rug = Renderable::new(BoxGeometry::new(2.4, 0.02, 0.8), rug_material(config.textured, None, false)).with_gi(GiSurface::new(mean));
     rug.object.set_position(0.0, 0.01, -0.55);
     rug.rt = rt(mean);
     let rug = scene.add(SceneNode::Renderable(rug));
@@ -1297,7 +1441,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         phone,
         enabled_voxels: None,
         gi_generation: 0,
-        materials_sdf: None,
+        materials: (Direct::Maps, None),
         lit,
         tall,
         rug,
@@ -1406,7 +1550,7 @@ async fn apply_with_dragon(config: Config) {
                         s.dragons[slot] = Some(index);
                         s.lit.push((index, "Dragon", DRAGON_ALBEDO));
                         // its material follows the others' at the next apply
-                        s.materials_sdf = Some(u32::MAX);
+                        s.materials.1 = Some(u32::MAX);
                     }
                 });
             }
@@ -1454,11 +1598,29 @@ pub fn set_sdf_shadows(name: &str) {
     }
 }
 
-/// The direct light's shadows: `map` (the shadow atlas) or `sdf` (the distance field, through the
-/// material helper `gi::SDF_WGSL`).
+/// The direct light's shadows: `maps` (the shadow atlas), `sdf` (the distance field, through the
+/// material helper `gi::SDF_WGSL`) or `rt` (ray traced through the grid by `RtShadowsEffect`;
+/// with the grid only, built at load: the page reloads with `shadows=rt` otherwise).
 #[wasm_bindgen]
 pub fn set_shadows(name: &str) {
-    with_state(|s| s.apply(Config { direct_sdf: name == "sdf", ..s.config }));
+    let Some(direct) = Direct::from_name(name) else { return };
+    with_state(|s| {
+        if direct != Direct::Rt || s.config.grid {
+            s.apply(Config { direct, ..s.config })
+        }
+    });
+}
+
+/// One of `RtShadowsEffect`'s settings (`view`: `lit|visibility|direct|mask`; `res`: `half|full`;
+/// `contact`: metres) and value.
+#[wasm_bindgen]
+pub fn set_rt_shadows(key: &str, value: &str) {
+    with_state(|s| {
+        let mut config = s.config;
+        if config.rt_shadows.set(key, value) {
+            s.apply(config);
+        }
+    });
 }
 
 /// The SDF slice's height, metres (`view=sdf`).
