@@ -333,11 +333,14 @@ fn screen_rect(view_proj: Mat4, lookup: &LookupGpu, size: [f32; 2]) -> [f32; 4] 
 }
 
 /// The texel level a tile wants: a pixel's width at its caster (`pixel`, m) but no finer than
-/// `finest`, coarse enough that `extent` (m) fits `texels`; kept at `previous` unless the pixel
-/// left it by more than a quarter step, so a camera moving a little doesn't clear it.
-fn texel_level(finest: f32, pixel: f32, extent: f32, texels: u32, previous: Option<u32>) -> u32 {
+/// `finest`, coarse enough that a new tile round a footprint `extent` (m) across holds it within
+/// `texels` (the footprint a quarter wider, `margin` texels and a texel's rounding each side, as
+/// `Planner::plan` places it), so a still caster's tile holds its footprint the next frame; kept
+/// at `previous` unless the pixel left it by more than a quarter step, so a camera moving a little
+/// doesn't clear it.
+fn texel_level(finest: f32, pixel: f32, extent: f32, texels: u32, margin: f32, previous: Option<u32>) -> u32 {
     let level = |x: f32| (x / finest).max(1.0).log2();
-    let fit = level(extent / (texels.max(8) - 4) as f32).ceil() as u32;
+    let fit = level(1.25 * extent / (texels as f32 - 2.0 * (margin + 1.0)).max(4.0)).ceil() as u32;
     let want = level(pixel);
     let chosen = match previous {
         Some(p) if want > p as f32 - 1.25 && want <= p as f32 + 0.25 => p,
@@ -395,10 +398,11 @@ impl Planner {
             let pixel = eye.distance((lo + hi) * 0.5) * pixel_scale;
             let extent = (b[0] - a[0]).max(b[1] - a[1]);
             let old = self.tiles[k];
-            let level = texel_level(finest, pixel, extent, texels, old.map(|t| t.level));
+            // the splat's reach as margin (texels)
+            let margin_texels = options.splat_texels.ceil() + 1.0;
+            let level = texel_level(finest, pixel, extent, texels, margin_texels, old.map(|t| t.level));
             let texel = finest * (1u32 << level) as f32;
-            // the splat's reach as margin
-            let margin = (options.splat_texels.ceil() + 1.0) * texel;
+            let margin = margin_texels * texel;
             let contained = old.is_some_and(|t| {
                 let size = [t.dims[0] as f32 * texel, t.dims[1] as f32 * texel];
                 t.level == level && a[0] - margin >= t.min[0] && a[1] - margin >= t.min[1] && b[0] + margin <= t.min[0] + size[0] && b[1] + margin <= t.min[1] + size[1]
@@ -1302,16 +1306,16 @@ mod tests {
     fn the_texel_follows_the_pixel_and_holds_still() {
         let finest = 0.0005;
         // a pixel of 1.3 mm at the marble: the 2 mm level (2^2 the finest)
-        assert_eq!(texel_level(finest, 0.0013, 0.05, 256, None), 2);
+        assert_eq!(texel_level(finest, 0.0013, 0.05, 256, 4.0, None), 2);
         // a little closer or further keeps it
-        assert_eq!(texel_level(finest, 0.0011, 0.05, 256, Some(2)), 2);
-        assert_eq!(texel_level(finest, 0.0021, 0.05, 256, Some(2)), 2);
+        assert_eq!(texel_level(finest, 0.0011, 0.05, 256, 4.0, Some(2)), 2);
+        assert_eq!(texel_level(finest, 0.0021, 0.05, 256, 4.0, Some(2)), 2);
         // much closer: finer; never finer than the finest
-        assert_eq!(texel_level(finest, 0.0004, 0.05, 256, Some(2)), 0);
-        assert_eq!(texel_level(finest, 0.00001, 0.05, 256, None), 0);
+        assert_eq!(texel_level(finest, 0.0004, 0.05, 256, 4.0, Some(2)), 0);
+        assert_eq!(texel_level(finest, 0.00001, 0.05, 256, 4.0, None), 0);
         // a footprint too wide for the tile coarsens it whatever the pixel
-        let level = texel_level(finest, 0.0001, 1.0, 256, None);
-        assert!(1.0 / (finest * (1 << level) as f32) <= 252.0, "{level}");
+        let level = texel_level(finest, 0.0001, 1.0, 256, 4.0, None);
+        assert!(1.25 / (finest * (1 << level) as f32) + 10.0 <= 256.0, "{level}");
     }
 
     #[test]
@@ -1345,6 +1349,35 @@ mod tests {
         let before = step(&[marble(0.003)], &moved, 11).1.unwrap();
         let after = step(&[marble(0.004)], &moved, 12).1.unwrap();
         assert_eq!((before.min, before.dims, before.level), (after.min, after.dims, after.level));
+    }
+
+    #[test]
+    fn a_still_casters_tile_is_kept_where_its_footprint_sets_the_texel() {
+        // a glass piece 12 cm across close to the camera (the finest texel wanted), its footprint
+        // too wide for the tile at that texel: the tile placed the first frame holds it the next,
+        // and accumulates
+        let view_proj = Mat4::perspective_rh(1.0, 1.0, 0.01, 10.0) * Mat4::look_at_rh(Vec3::new(0.0, 0.9, 0.12), Vec3::new(0.0, 0.75, 0.0), Vec3::Y);
+        let eye = Vec3::new(0.0, 0.9, 0.12);
+        let options = RtCausticsOptions::default();
+        let marble = (Vec3::new(-0.06, 0.75, -0.06), Vec3::new(0.06, 0.8, 0.06));
+        let lights = vec![spot(Vec3::new(0.3, 1.0, 0.0))];
+        let mut planner = Planner { tiles: vec![None; RT_CAUSTICS_MAX_CASTERS], ..Default::default() };
+        let mut tiles = Vec::new();
+        for f in 0..4 {
+            planner.frame = f;
+            let fed = planner.plan(&options, &[marble], &lights, 1, view_proj, eye, 0.0002);
+            for &(k, _) in &fed {
+                planner.tiles[k].as_mut().unwrap().history += 1;
+            }
+            tiles.push(planner.tiles[0].unwrap());
+        }
+        let first = tiles[0];
+        // the footprint, not the pixel (finer than the finest texel), chose the texel
+        assert!(first.level > 0, "{first:?}");
+        for t in &tiles[1..] {
+            assert_eq!((t.min, t.dims, t.level), (first.min, first.dims, first.level), "the tile moved");
+        }
+        assert_eq!(tiles[3].history, 4, "a still caster's tile accumulates");
     }
 
     #[test]
