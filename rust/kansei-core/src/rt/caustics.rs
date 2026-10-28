@@ -158,6 +158,7 @@ struct CompositeGpu {
     size: [f32; 2],
     view: u32,
     receivers: u32,
+    rect: [f32; 4],
 }
 
 /// The WGSL structs' sizes, for the tests.
@@ -271,6 +272,27 @@ fn on_screen(view_proj: Mat4, points: &[Vec3]) -> bool {
     let clip: Vec<Vec4> = points.iter().map(|p| view_proj * p.extend(1.0)).collect();
     let outside = |f: &dyn Fn(Vec4) -> bool| clip.iter().all(|&c| f(c));
     !(outside(&|c| c.x < -c.w) || outside(&|c| c.x > c.w) || outside(&|c| c.y < -c.w) || outside(&|c| c.y > c.w) || outside(&|c| c.z > c.w) || outside(&|c| c.w <= 0.0))
+}
+
+/// The pixels (min x, y, max x, y) the live tiles may cover: their rectangles at their height,
+/// within their tolerance, and their casters' boxes, projected; the whole screen when one reaches
+/// behind the eye, none when there are none.
+fn screen_rect(view_proj: Mat4, lookup: &LookupGpu, size: [f32; 2]) -> [f32; 4] {
+    let mut rect = [f32::MAX, f32::MAX, f32::MIN, f32::MIN];
+    for t in lookup.tiles.iter().filter(|t| t.live != 0) {
+        let (lo, hi) = (Vec3::new(t.min[0], (t.ref_y - t.tolerance).min(t.box_min[1]), t.min[1]), Vec3::new(t.min[0] + t.size[0], (t.ref_y + t.tolerance).max(t.box_max[1]), t.min[1] + t.size[1]));
+        for k in 0..8 {
+            let p = Vec3::new(if k & 1 == 0 { lo.x } else { hi.x }, if k & 2 == 0 { lo.y } else { hi.y }, if k & 4 == 0 { lo.z } else { hi.z });
+            let c = view_proj * p.extend(1.0);
+            if c.w <= 1e-4 {
+                return [0.0, 0.0, size[0], size[1]];
+            }
+            let (x, y) = ((c.x / c.w * 0.5 + 0.5) * size[0], (0.5 - c.y / c.w * 0.5) * size[1]);
+            rect = [rect[0].min(x), rect[1].min(y), rect[2].max(x), rect[3].max(y)];
+        }
+    }
+    // a pixel's margin for the sampler
+    [rect[0] - 1.0, rect[1] - 1.0, rect[2] + 1.0, rect[3] + 1.0]
 }
 
 /// The texel level a tile wants: a pixel's width at its caster (`pixel`, m) but no finer than
@@ -918,7 +940,8 @@ impl PostProcessingEffect for RtCausticsEffect {
             RtCausticReceivers::RtLit => 0,
             RtCausticReceivers::All => 1,
         };
-        queue.write_buffer(&gpu.composite_params, 0, bytemuck::bytes_of(&CompositeGpu { inv_proj: proj.inverse().to_cols_array(), inv_view: view.inverse().to_cols_array(), size: [width as f32, height as f32], view: self.view as u32, receivers }));
+        let rect = screen_rect(proj * view, &lookup, [width as f32, height as f32]);
+        queue.write_buffer(&gpu.composite_params, 0, bytemuck::bytes_of(&CompositeGpu { inv_proj: proj.inverse().to_cols_array(), inv_view: view.inverse().to_cols_array(), size: [width as f32, height as f32], view: self.view as u32, receivers, rect }));
         // the grid's group, made anew when its buffers (or its acceleration structure) are
         let (bindings, generation) = self.grid.bindings();
         if gpu.grid_group.as_ref().is_none_or(|(g, _)| *g != generation) {

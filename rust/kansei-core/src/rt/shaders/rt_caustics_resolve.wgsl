@@ -39,6 +39,8 @@ struct CompositeParams {
     view      : u32,
     // 0: only the surfaces RtShadowsEffect lights; 1: every surface
     receivers : u32,
+    // the pixels the tiles may cover (min x, y, max x, y): the others pass through
+    rect      : vec4f,
 }
 
 @group(0) @binding(0) var<uniform> cc : CompositeParams;
@@ -57,6 +59,10 @@ fn composite(@builtin(global_invocation_id) gid : vec3u) {
     if (any(vec2f(gid.xy) >= cc.size)) { return; }
     let px = gid.xy;
     let color = textureLoad(inputTex, px, 0);
+    if ((any(vec2f(px) < cc.rect.xy) || any(vec2f(px) > cc.rect.zw)) && cc.view == 0u) {
+        textureStore(outputTex, px, color);
+        return;
+    }
     let depth = textureLoad(depthTex, px, 0);
     let albedo = textureLoad(albedoTex, px, 0);
     let ea = textureLoad(emissiveTex, px, 0).a;
