@@ -134,11 +134,20 @@ fn composite(@builtin(global_invocation_id) gid : vec3u) {
         let world = (cc.invView * vec4f(view.xyz / view.w, 1.0)).xyz;
         let n = normalize(textureLoad(normalTex, px, 0).xyz * 2.0 - 1.0);
         if (cc.weighted != 0u) {
-            // each light's change where that light reaches (its shadow's own visibility)
-            let vis = visibility(px, -view.z / view.w, n);
-            for (var l = 0u; l < lookup.lights; l++) {
-                let slot = kansei_rt_caustics_shadow_slot(lookup, l);
-                white += kansei_rt_caustics_light(causticsMap, causticsSampler, lookup, world, n, l) * select(1.0, saturate(vis[min(slot, 7u)]), slot < 8u);
+            // each light's change where that light reaches (its shadow's own visibility, read
+            // only where some light changes anything)
+            var changes = array<vec3f, 8>();
+            var any = false;
+            for (var l = 0u; l < min(lookup.lights, 8u); l++) {
+                changes[l] = kansei_rt_caustics_light(causticsMap, causticsSampler, lookup, world, n, l);
+                any = any || dot(abs(changes[l]), vec3f(1.0)) > 0.0;
+            }
+            if (any) {
+                let vis = visibility(px, -view.z / view.w, n);
+                for (var l = 0u; l < min(lookup.lights, 8u); l++) {
+                    let slot = kansei_rt_caustics_shadow_slot(lookup, l);
+                    white += changes[l] * select(1.0, saturate(vis[min(slot, 7u)]), slot < 8u);
+                }
             }
         } else {
             white = kansei_rt_caustics_lookup(causticsMap, causticsSampler, lookup, world, n);
