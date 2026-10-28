@@ -18,8 +18,33 @@
 @group(0) @binding(11) var outB : texture_storage_2d<rgba16float, write>;
 @group(0) @binding(12) var outGuide : texture_storage_2d<rgba32float, write>;
 
+// this frame's rays round a workgroup (its 8 x 8 texels and two each side): each light's, and 1
+// where a lit surface holds them
+var<workgroup> nearA : array<vec4f, 144>;
+var<workgroup> nearB : array<vec4f, 144>;
+var<workgroup> nearLit : array<f32, 144>;
+
 @compute @workgroup_size(8, 8)
-fn temporal(@builtin(global_invocation_id) id: vec3u) {
+fn temporal(@builtin(global_invocation_id) id: vec3u, @builtin(workgroup_id) group: vec3u, @builtin(local_invocation_index) index: u32) {
+    let corner = vec2i(group.xy * 8u) - 2;
+    let last = vec2i(sp.traceSize) - 1;
+    for (var k = index; k < 144u; k += 64u) {
+        let q = corner + vec2i(i32(k % 12u), i32(k / 12u));
+        var lit = 0.0;
+        var qa = vec4f(0.0);
+        var qb = vec4f(0.0);
+        if (all(q >= vec2i(0)) && all(q <= last) && textureLoad(curGuide, q, 0).z > 0.0) {
+            lit = 1.0;
+            qa = textureLoad(curA, q, 0);
+            if (sp.numLights > 4u) {
+                qb = textureLoad(curB, q, 0);
+            }
+        }
+        nearA[k] = qa;
+        nearB[k] = qb;
+        nearLit[k] = lit;
+    }
+    workgroupBarrier();
     let t = id.xy;
     if (any(vec2f(t) >= sp.traceSize)) { return; }
     let g = textureLoad(curGuide, t, 0);
@@ -51,7 +76,6 @@ fn temporal(@builtin(global_invocation_id) id: vec3u) {
         let tp = (prevUv * sp.fullSize - 0.5) / f32(sp.downscale);
         let t0 = vec2i(floor(tp));
         let f = tp - floor(tp);
-        let last = vec2i(sp.traceSize) - 1;
         for (var k = 0; k < 4; k++) {
             let o = vec2i(k & 1, k >> 1u);
             let q = t0 + o;
@@ -76,18 +100,16 @@ fn temporal(@builtin(global_invocation_id) id: vec3u) {
         // spread (sqrt(v (1 - v)), and 2 / n, where the rays all agree but the light may not be
         // quite whole); a history moved by more than 0.1 starts over (more of the frame, and of
         // the wavelet). A still penumbra's history lies within its rays' spread and is kept.
-        var sumA = a;
-        var sumB = b;
-        var n = 1.0;
-        let last = vec2i(sp.traceSize) - 1;
+        var sumA = vec4f(0.0);
+        var sumB = vec4f(0.0);
+        var n = 0.0;
+        let here = vec2i(t) - corner;
         for (var k = 0; k < 25; k++) {
-            let q = vec2i(t) + vec2i(k % 5 - 2, k / 5 - 2);
-            if (k == 12 || any(q < vec2i(0)) || any(q > last) || textureLoad(curGuide, q, 0).z <= 0.0) { continue; }
-            sumA += textureLoad(curA, q, 0);
-            if (sp.numLights > 4u) {
-                sumB += textureLoad(curB, q, 0);
-            }
-            n += 1.0;
+            let q = here + vec2i(k % 5 - 2, k / 5 - 2);
+            let at = q.y * 12 + q.x;
+            sumA += nearA[at];
+            sumB += nearB[at];
+            n += nearLit[at];
         }
         let meanA = sumA / n;
         let meanB = select(b, sumB / n, sp.numLights > 4u);
