@@ -58,7 +58,7 @@
 //!   a frosted pixel a frame, 4), `rt_screen=0` (their rays' hits lit by the lamp and the voxels
 //!   even where the camera sees them), `rt_direct=0` (hits the camera doesn't see lit by the
 //!   voxels alone);
-//! - `cam=front|corner|low|floor|glass`;
+//! - `cam=front|corner|low|floor|glass|chrome`;
 //! - `dragon=1|full`: the Stanford dragon (CC-BY-NC-4.0, see `www/assets/license.txt`): `1` the
 //!   decimated `.glb` (19k triangles), `full` the whole scan (871k triangles, 24 MB);
 //! - `animate=1`: the dragon (or, without it, the tall block) turns and slides, re-voxelized each
@@ -67,6 +67,12 @@
 //!   triangles (`Renderer::enable_rt_grid`, `RtReflectionsEffect`), lit by the voxels;
 //!   `floor_f0`, `floor_rough`, `rt_view=lit|reflection|mirror|cost`, `rt_trace=voxels`,
 //!   `rt_res=quarter`, `rt_lod=0` (the dragon into the grid whole, not by its cluster cut);
+//! - the environment past the box's opening (`environment`): `env=none` (the default: black),
+//!   `gradient` (a studio gradient, `GradientEnvironment`, on a dome) or `hdri` (Poly Haven's CC0
+//!   `studio_small_09`, `HdrEnvironment`: the background, the balls' reflections and refraction, and
+//!   the GI's rays past the box); `env_ev=` (stops over the default), `env_rotation=` (degrees about
+//!   the vertical), `env_blur=0..1` (the HDRI background's softness), `env_spin=` (degrees a second:
+//!   the HDRI prepared again every frame, to time it);
 //! - `albedo=constant`, `rug=off` (the box without its rug), `ui=0` (no panel);
 //! - `stats=1`: triangles, frame interval and the GPU time of each pass (the renderer's profiling).
 
@@ -77,16 +83,17 @@ use std::rc::Rc;
 use kansei_core::buffers::{BufferType, ComputeBuffer, Sampler, Texture};
 use kansei_core::cameras::Camera;
 use kansei_core::controls::CameraControls;
+use kansei_core::environment::{EnvironmentLighting, GradientEnvironment, HdrEnvironment, HdrEnvironmentOptions, HdrEnvironmentSettings};
 use kansei_core::geometries::{BoxGeometry, SphereGeometry};
 use kansei_core::gi::{GiSurface, SceneVoxelGiOptions, SdfProbeOptions, SdfShadows, VoxelGIEffect, VoxelGIOptions, VoxelGiQuality, SDF_WGSL, VOXEL_WRITE_WGSL};
 use kansei_core::lights::{Light, SpotLight, SPOT_LIGHTS_WGSL};
 use kansei_core::loaders::GLTFLoader;
-use kansei_core::materials::{Binding, Material, MaterialOptions, ShaderStages, StandardLitOptions, GBUFFER_OUT_WGSL};
+use kansei_core::materials::{Binding, GradientSkyOptions, Material, MaterialOptions, ShaderStages, StandardLitOptions, GBUFFER_OUT_WGSL};
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::postprocessing::{
     PostProcessingEffect, PostProcessingVolume,
-    effects::{exposure_from_ev100, GiQuality, ScreenSpaceGIEffect, ScreenSpaceGIOptions, ToneMapEffect, ToneMapOptions},
+    effects::{exposure_from_ev100, EnvironmentBackgroundEffect, GiQuality, ScreenSpaceGIEffect, ScreenSpaceGIOptions, ToneMapEffect, ToneMapOptions},
 };
 use kansei_core::renderers::{Renderer, RendererConfig};
 use kansei_core::clusters::{ClusterLod, ClusterMesh, ClusterOptions};
@@ -458,6 +465,45 @@ impl View {
     }
 }
 
+/// The environment past the box's opening (`env=`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Env {
+    /// Black, as the box has always been.
+    None,
+    /// A studio gradient (`GradientEnvironment`), bright above, on a dome round the box.
+    Gradient,
+    /// The studio HDRI (`HdrEnvironment`), fetched the first time.
+    Hdri,
+}
+
+impl Env {
+    fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "none" | "off" | "0" => Env::None,
+            "gradient" => Env::Gradient,
+            "hdri" | "hdr" => Env::Hdri,
+            _ => return None,
+        })
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Env::None => "none",
+            Env::Gradient => "gradient",
+            Env::Hdri => "hdri",
+        }
+    }
+}
+
+/// Poly Haven's "Studio Small 09" by Sergej Majboroda (CC0), 1024 x 512.
+const HDRI_ASSET: &str = "assets/studio_small_09_1k.hdr";
+/// The HDRI's stops at `env_ev=0`: its mean radiance is about 0.86, the lamp-lit walls' about 20.
+const HDRI_EV: f32 = 4.0;
+/// The studio gradient's radiance straight up and straight down at `env_ev=0` (cd/m²), about the
+/// HDRI's own above and below.
+const STUDIO_UP: [f32; 3] = [20.0, 20.0, 21.0];
+const STUDIO_DOWN: [f32; 3] = [6.0, 5.8, 5.6];
+
 /// The reflections' view by name: `lit`, `reflection`, `mirror` or `cost`.
 fn reflection_view(name: &str) -> Option<RtReflectionsView> {
     match name {
@@ -683,6 +729,12 @@ struct Config {
     /// The balls' (and the floor's) rays' hits lit by the lit image where the camera sees them
     /// (`rt_screen=`), else by the lamp and the voxels.
     screen_hits: bool,
+    /// The environment past the opening, its stops over the default, its turn (degrees) and the
+    /// HDRI background's blur.
+    env: Env,
+    env_ev: f32,
+    env_rotation: f32,
+    env_blur: f32,
 }
 
 impl Config {
@@ -714,6 +766,17 @@ impl Config {
 
     fn glass_material(&self) -> StandardLitOptions {
         StandardLitOptions::glass(self.glass_tint, self.glass_ior, self.glass_rough)
+    }
+
+    /// The HDRI's settings.
+    fn hdri_settings(&self) -> HdrEnvironmentSettings {
+        HdrEnvironmentSettings { intensity: (HDRI_EV + self.env_ev).exp2(), rotation: self.env_rotation.to_radians(), tint: [1.0; 3] }
+    }
+
+    /// The studio gradient's radiance up and down.
+    fn studio(&self) -> ([f32; 3], [f32; 3]) {
+        let k = self.env_ev.exp2();
+        (STUDIO_UP.map(|v| v * k), STUDIO_DOWN.map(|v| v * k))
     }
 }
 
@@ -762,7 +825,7 @@ fn probe_options(phone: bool) -> SdfProbeOptions {
 }
 
 /// The camera presets: (name, target, distance, azimuth, elevation).
-const CAMERAS: [(&str, [f32; 3], f32, f32, f32); 5] = [
+const CAMERAS: [(&str, [f32; 3], f32, f32, f32); 6] = [
     // the box's opening, framed as the Cornell box photographs are
     ("front", [0.0, 2.0, -2.0], 8.3, 0.0, 0.0),
     // inside, from the upper front-left corner toward the short block and the green wall
@@ -773,6 +836,8 @@ const CAMERAS: [(&str, [f32; 3], f32, f32, f32); 5] = [
     ("floor", [-0.3, 0.5, -2.0], 6.2, 0.3, 0.42),
     // close on the glass ball, the room and (with dragon=1) the dragon behind it
     ("glass", [-0.1, 0.45, -0.45], 1.8, 0.92, 0.12),
+    // close on the chrome ball from in front of the opening: it mirrors what is behind the camera
+    ("chrome", [0.8, 1.6, -1.5], 2.2, -0.35, 0.1),
 ];
 
 struct State {
@@ -806,6 +871,14 @@ struct State {
     stats: Option<Stats>,
     /// The floor's F0 and roughness (zeros without `reflect=1`).
     floor_specular: [f32; 2],
+    /// The environments: the studio gradient (and its dome) and the HDRI once fetched.
+    gradient: GradientEnvironment,
+    dome: usize,
+    hdri: Option<HdrEnvironment>,
+    /// Fetching and decoding the HDRI, and uploading it, ms.
+    hdri_load_ms: (f64, f64),
+    /// `env_spin`: degrees a second the HDRI turns.
+    env_spin: f32,
 }
 
 /// The `stats=1` overlay's numbers, refreshed every second.
@@ -882,6 +955,10 @@ fn config_from_url(phone: bool) -> Config {
         glass_tint: param("glass_tint").and_then(|v| parse_rgb(&v)).unwrap_or(GLASS_TINT),
         glass_samples: param_or("glass_samples", 4u32).clamp(1, 16),
         screen_hits: flag("rt_screen", true),
+        env: param("env").as_deref().and_then(Env::from_name).unwrap_or(Env::None),
+        env_ev: param_or("env_ev", 0.0f32),
+        env_rotation: param_or("env_rotation", 0.0f32),
+        env_blur: param_or("env_blur", 0.0f32).clamp(0.0, 1.0),
     };
     if let Some(preset) = param("preset").or_else(|| param("gi").is_none().then(|| DEFAULT_PRESET.to_string())) {
         c = with_preset(c, &preset, phone);
@@ -918,7 +995,10 @@ fn config_from_url(phone: bool) -> Config {
 }
 
 /// The post-processing chain for `config`: its GI effect (none when off) and the tone mapping.
-fn build_effects(renderer: &Renderer, config: &Config, phone: bool, stats: bool) -> Vec<Box<dyn PostProcessingEffect>> {
+/// With an `environment`, every effect is lit by it (`set_environment`) and its cubemap, where it
+/// has one, is the background. The room's materials have no sky ambient of their own, so none is
+/// taken out where the GI replaces it.
+fn build_effects(renderer: &Renderer, config: &Config, phone: bool, stats: bool, environment: Option<&EnvironmentLighting>) -> Vec<Box<dyn PostProcessingEffect>> {
     let indirect = config.view == View::Indirect;
     let mut effects: Vec<Box<dyn PostProcessingEffect>> = Vec::new();
     // the lamp's direct light with ray-traced shadows (shadows=rt): first, so the GI and the
@@ -939,7 +1019,7 @@ fn build_effects(renderer: &Renderer, config: &Config, phone: bool, stats: bool)
             return effects;
         }
     }
-    let screen = ScreenSpaceGIOptions { radius_m: 4.0, ..Default::default() };
+    let screen = ScreenSpaceGIOptions { radius_m: 4.0, ambient_occlusion: 0.0, ..Default::default() };
     match config.gi {
         Gi::Off if config.view != View::Sdf => {}
         Gi::Screen(quality) if config.view != View::Sdf => {
@@ -953,7 +1033,7 @@ fn build_effects(renderer: &Renderer, config: &Config, phone: bool, stats: bool)
             let scene_gi = renderer.voxel_gi().expect("gi=rt enables voxel GI");
             let grid = renderer.rt_grid().expect("gi=rt builds the grid");
             let r = config.rtgi;
-            let options = RtDiffuseGiOptions { resolution: r.resolution, hit_lighting: r.hit, shadows: r.shadows, denoise: r.denoise, kernel: r.kernel, max_distance: 20.0, ..Default::default() };
+            let options = RtDiffuseGiOptions { resolution: r.resolution, hit_lighting: r.hit, shadows: r.shadows, denoise: r.denoise, kernel: r.kernel, max_distance: 20.0, ambient: 0.0, ..Default::default() };
             let mut effect = RtDiffuseGiEffect::with_volume(scene_gi.volume(), grid.handle(), options);
             effect.mode = r.mode;
             effect.accumulate = r.accumulate;
@@ -968,7 +1048,7 @@ fn build_effects(renderer: &Renderer, config: &Config, phone: bool, stats: bool)
             let scene_gi = renderer.voxel_gi().expect("voxel GI is enabled for the voxel modes and the field");
             let near_quality = if phone || scene_gi.quality() == VoxelGiQuality::Low { GiQuality::Low } else { GiQuality::High };
             let near_field = config.gi.near_field().then_some(ScreenSpaceGIOptions { quality: near_quality, ..screen });
-            let mut effect = VoxelGIEffect::new(scene_gi.volume(), VoxelGIOptions { quality: scene_gi.quality(), near_field, ..Default::default() });
+            let mut effect = VoxelGIEffect::new(scene_gi.volume(), VoxelGIOptions { quality: scene_gi.quality(), near_field, material_ambient: 0.0, ..Default::default() });
             effect.show_indirect = indirect;
             effect.show_voxels = config.view == View::Voxels;
             effect.set_sdf(scene_gi.sdf());
@@ -1001,6 +1081,16 @@ fn build_effects(renderer: &Renderer, config: &Config, phone: bool, stats: bool)
         }
         reflections.set_glass(config.glass.then_some(RtGlass { samples: config.glass_samples, ..Default::default() }));
         effects.push(Box::new(reflections));
+    }
+    if let Some(environment) = environment {
+        for effect in &mut effects {
+            effect.set_environment(environment);
+        }
+        if environment.environment.is_some() {
+            let mut background = EnvironmentBackgroundEffect::new(environment);
+            background.blur = config.env_blur;
+            effects.insert(0, Box::new(background));
+        }
     }
     let mut tone = ToneMapOptions::for_surface(renderer.presentation_format());
     // the indirect view alone is 2 stops brighter
@@ -1069,7 +1159,13 @@ impl State {
                 gi.disable_probes();
             }
         }
-        self.volume.effects = build_effects(&self.renderer, &config, self.phone, self.stats.is_some());
+        let environment = self.environment();
+        self.renderer.set_environment(environment.as_ref());
+        self.volume.effects = build_effects(&self.renderer, &config, self.phone, self.stats.is_some(), environment.as_ref());
+        if let Some(r) = self.scene.get_renderable_mut(self.dome) {
+            r.visible = config.env == Env::Gradient;
+        }
+        self.set_env_settings(config);
         // the lit materials: shadowed through the field (bound to this one), by the maps, or
         // leaving the lamp to the ray-traced shadows
         let wanted = (config.direct, (config.direct == Direct::Sdf).then_some(self.gi_generation));
@@ -1122,6 +1218,33 @@ impl State {
         }
     }
 
+    /// The environment `config.env` names (None: black; the HDRI's until it is fetched).
+    fn environment(&self) -> Option<EnvironmentLighting> {
+        match self.config.env {
+            Env::None => None,
+            Env::Gradient => Some(self.gradient.lighting()),
+            Env::Hdri => self.hdri.as_ref().map(|h| h.lighting()),
+        }
+    }
+
+    /// The environment's intensity, turn and blur to `config`'s (alone: the chain goes on as it
+    /// is; the HDRI is prepared again before the next frame).
+    fn set_env_settings(&mut self, config: Config) {
+        self.config = config;
+        let (up, down) = config.studio();
+        self.gradient.set(self.renderer.queue(), up, down);
+        if let Some(buffer) = self.scene.get_renderable(self.dome).and_then(|r| r.material.bindable_buffer(0)) {
+            let bytes: Vec<u8> = dome_uniform(up, down).iter().flat_map(|v| v.to_le_bytes()).collect();
+            self.renderer.queue().write_buffer(&buffer, 0, &bytes);
+        }
+        if let Some(hdri) = &mut self.hdri {
+            hdri.set_settings(config.hdri_settings());
+        }
+        if let Some(background) = self.volume.effect_mut::<EnvironmentBackgroundEffect>() {
+            background.blur = config.env_blur;
+        }
+    }
+
     /// The balls' materials to `config`'s (alone: the effects, and the frosted glass's history, go
     /// on as they are).
     fn set_ball_materials(&mut self, config: Config) {
@@ -1154,6 +1277,14 @@ impl State {
             }
         }
         self.controls.update(&mut self.camera, dt);
+        if self.env_spin != 0.0 && self.hdri.is_some() {
+            let config = Config { env_rotation: (self.config.env_rotation + self.env_spin * dt) % 360.0, ..self.config };
+            self.set_env_settings(config);
+        }
+        // the HDRI's cubemaps and SH, prepared again when its settings changed
+        if let Some(hdri) = &mut self.hdri {
+            hdri.prepare(self.renderer.device(), self.renderer.queue());
+        }
         if let Some(shadows) = self.volume.effect_mut::<RtShadowsEffect>() {
             shadows.update_lights(self.scene.lights());
         }
@@ -1256,13 +1387,26 @@ impl State {
         )
     }
 
+    /// The environment's settings, and the HDRI's size and load times (null until fetched).
+    fn env_info(&self) -> String {
+        let c = &self.config;
+        let hdri = self.hdri.as_ref().map_or("null".into(), |h| {
+            let (w, h2) = h.image_size();
+            format!("{{\"image\":[{w},{h2}],\"face\":{},\"mib\":{:.1},\"fetch_decode_ms\":{:.1},\"upload_ms\":{:.1}}}", h.face_size(), h.memory_bytes() as f64 / (1 << 20) as f64, self.hdri_load_ms.0, self.hdri_load_ms.1)
+        });
+        format!("{{\"mode\":\"{}\",\"ev\":{},\"rotation\":{},\"blur\":{},\"spin\":{},\"hdri\":{hdri}}}", c.env.name(), c.env_ev, c.env_rotation, c.env_blur, self.env_spin)
+    }
+
     fn info(&self) -> String {
         let gi = self.renderer.voxel_gi();
         let passes: Vec<String> = self.stats.as_ref().map_or(Vec::new(), |s| s.passes.iter().map(|(l, ms)| format!("[\"{l}\",{ms:.3}]")).collect());
         // (+ 0.0: an empty sum is -0)
         let sum = |prefix: &str| self.stats.as_ref().map_or(0.0, |s| s.passes.iter().filter(|p| p.0.starts_with(prefix)).map(|p| p.1).sum::<f64>()) + 0.0;
         format!(
-            "{{\"grid\":{},\"rtgi\":{},\"rtgi_ms\":{:.3},\"reflect\":{},\"balls\":{},\"rt_ms\":{:.3},\"reflect_ms\":{:.3},\"glass_ms\":{:.3},\"gi\":\"{}\",\"view\":\"{}\",\"voxels\":\"{}\",\"voxel_tier\":{},\"dims\":{},\"mib\":{:.1},\"dragon\":\"{}\",\"animate\":{},\"rug\":{},\"textured\":{},\"sdf_ao\":{},\"sdf_shadows\":\"{}\",\"shadows\":\"{}\",\"rt_shadows\":{},\"rt_shadows_ms\":{:.3},\"slice\":{},\"sdf\":{},\"sdf_ms\":{:.3},\"probes\":{},\"probe_dims\":{},\"probes_ms\":{:.3},\"triangles\":{},\"stats\":{},\"frame_ms\":{:.2},\"gpu_ms\":{:.3},\"gpu_span_ms\":{:.3},\"voxelize_ms\":{:.3},\"inject_ms\":{:.3},\"mips_ms\":{:.3},\"screen_ms\":{:.3},\"ssgi_ms\":{:.3},\"passes\":[{}]}}",
+            "{{\"env\":{},\"env_prepare_ms\":{:.3},\"env_background_ms\":{:.3},\"grid\":{},\"rtgi\":{},\"rtgi_ms\":{:.3},\"reflect\":{},\"balls\":{},\"rt_ms\":{:.3},\"reflect_ms\":{:.3},\"glass_ms\":{:.3},\"gi\":\"{}\",\"view\":\"{}\",\"voxels\":\"{}\",\"voxel_tier\":{},\"dims\":{},\"mib\":{:.1},\"dragon\":\"{}\",\"animate\":{},\"rug\":{},\"textured\":{},\"sdf_ao\":{},\"sdf_shadows\":\"{}\",\"shadows\":\"{}\",\"rt_shadows\":{},\"rt_shadows_ms\":{:.3},\"slice\":{},\"sdf\":{},\"sdf_ms\":{:.3},\"probes\":{},\"probe_dims\":{},\"probes_ms\":{:.3},\"triangles\":{},\"stats\":{},\"frame_ms\":{:.2},\"gpu_ms\":{:.3},\"gpu_span_ms\":{:.3},\"voxelize_ms\":{:.3},\"inject_ms\":{:.3},\"mips_ms\":{:.3},\"screen_ms\":{:.3},\"ssgi_ms\":{:.3},\"passes\":[{}]}}",
+            self.env_info(),
+            sum("Environment/Cube") + sum("Environment/Prefilter") + sum("Environment/SH"),
+            sum("Environment/Background"),
             self.grid_info(),
             self.rtgi_info(),
             sum("RtGi/"),
@@ -1305,6 +1449,27 @@ impl State {
             passes.join(","),
         )
     }
+}
+
+/// The studio gradient's dome (`Material::gradient_sky`'s uniform): `up` at the zenith, `down`
+/// below the horizon, their mean at it.
+fn dome_uniform(up: [f32; 3], down: [f32; 3]) -> [f32; 12] {
+    let o = GradientSkyOptions { zenith: up, horizon: std::array::from_fn(|c| (up[c] + down[c]) * 0.5), ground: down, curve: 0.5 };
+    let ([zr, zg, zb], [hr, hg, hb], [gr, gg, gb]) = (o.zenith, o.horizon, o.ground);
+    [zr, zg, zb, o.curve, hr, hg, hb, 0.0, gr, gg, gb, 0.0]
+}
+
+/// Fetch the studio HDRI and upload it: the environment, and the ms its fetch and decode took and
+/// its upload (None if it can't be fetched or read).
+async fn load_hdri(device: &wgpu::Device, queue: &wgpu::Queue) -> Option<(HdrEnvironment, (f64, f64))> {
+    let t = now();
+    let bytes = fetch_bytes(HDRI_ASSET).await.map_err(|e| log::warn!("{HDRI_ASSET}: {e:?}")).ok()?;
+    let image = kansei_core::environment::HdrImage::decode(&bytes).map_err(|e| log::warn!("{e}")).ok()?;
+    let decoded = now();
+    let hdri = HdrEnvironment::new(device, queue, &image, HdrEnvironmentOptions::default());
+    let ms = ((decoded - t) * 1000.0, (now() - decoded) * 1000.0);
+    log::info!("HDRI: {} x {}, fetched and decoded in {:.0} ms, uploaded in {:.1} ms; cube faces of {}", image.width, image.height, ms.0, ms.1, hdri.face_size());
+    Some((hdri, ms))
 }
 
 /// Add the dragon to the scene (hidden until the config shows it), returning its index.
@@ -1421,6 +1586,20 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     lamp.volumetric_scale = 0.0;
     scene.add(SceneNode::Light(Light::Spot(lamp)));
 
+    // the studio gradient's dome round the box (env=gradient), out of the GI, the grid and the
+    // shadows
+    let (up, down) = config.studio();
+    let gradient = GradientEnvironment::new(renderer.device(), up, down);
+    let dome_options = GradientSkyOptions { zenith: up, horizon: std::array::from_fn(|c| (up[c] + down[c]) * 0.5), ground: down, curve: 0.5 };
+    let mut dome = Renderable::new(SphereGeometry::new(60.0, 48, 24), Material::gradient_sky("Dome", &dome_options));
+    dome.cast_shadow = false;
+    dome.visible = false;
+    let dome = scene.add(SceneNode::Renderable(dome));
+    let (hdri, hdri_load_ms) = match config.env {
+        Env::Hdri => load_hdri(renderer.device(), renderer.queue()).await.map_or((None, (0.0, 0.0)), |(h, ms)| (Some(h), ms)),
+        _ => (None, (0.0, 0.0)),
+    };
+
     let camera = Camera::new(38.0, 0.1, 100.0, canvas.aspect());
     let (_, target, distance, azimuth, elevation) = CAMERAS.iter().find(|c| Some(c.0) == param("cam").as_deref()).copied().unwrap_or(CAMERAS[0]);
     let mut controls = CameraControls::from_canvas(canvas.element(), Vec3::new(target[0], target[1], target[2]), distance).with_mouse_pan(canvas.element());
@@ -1453,6 +1632,11 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
         time: 0.0,
         stats,
         floor_specular,
+        gradient,
+        dome,
+        hdri,
+        hdri_load_ms,
+        env_spin: param_or("env_spin", 0.0f32),
     };
     state.apply(config);
     log::info!("Kansei — GI box (WASM) ready: {}", state.info());
@@ -1576,7 +1760,7 @@ pub fn set_textured(on: bool) {
     with_state(|s| s.apply(Config { textured: on, ..s.config }));
 }
 
-/// Camera preset `front|corner|low|floor|glass` (`CAMERAS`).
+/// Camera preset `front|corner|low|floor|glass|chrome` (`CAMERAS`).
 #[wasm_bindgen]
 pub fn set_camera(name: &str) {
     if let Some(&(_, t, distance, azimuth, elevation)) = CAMERAS.iter().find(|c| c.0 == name) {
@@ -1705,4 +1889,46 @@ pub fn set_reflection_grid(on: bool) {
 #[wasm_bindgen]
 pub fn set_reflection_resolution(name: &str) {
     with_state(|s| s.apply(Config { reflection_quarter: name == "quarter", ..s.config }));
+}
+
+/// `env=none|gradient|hdri`: the environment past the box's opening, fetching the HDRI the first
+/// time.
+#[wasm_bindgen]
+pub async fn set_env(name: String) {
+    let Some(env) = Env::from_name(&name) else { return };
+    if env == Env::Hdri {
+        if let Some((device, queue)) = with_state(|s| s.hdri.is_none().then(|| (s.renderer.device().clone(), s.renderer.queue().clone()))).flatten() {
+            if let Some((hdri, ms)) = load_hdri(&device, &queue).await {
+                with_state(|s| {
+                    s.hdri = Some(hdri);
+                    s.hdri_load_ms = ms;
+                });
+            }
+        }
+    }
+    with_state(|s| s.apply(Config { env, ..s.config }));
+}
+
+/// The environment's stops over its default (the gradient's and the HDRI's alike).
+#[wasm_bindgen]
+pub fn set_env_ev(ev: f32) {
+    with_state(|s| s.set_env_settings(Config { env_ev: ev, ..s.config }));
+}
+
+/// The HDRI's turn about the vertical, degrees.
+#[wasm_bindgen]
+pub fn set_env_rotation(degrees: f32) {
+    with_state(|s| s.set_env_settings(Config { env_rotation: degrees, ..s.config }));
+}
+
+/// The HDRI background's blur, 0 (sharp) to 1.
+#[wasm_bindgen]
+pub fn set_env_blur(blur: f32) {
+    with_state(|s| s.set_env_settings(Config { env_blur: blur.clamp(0.0, 1.0), ..s.config }));
+}
+
+/// Degrees a second the HDRI turns (0: still): prepared again every frame, to time it.
+#[wasm_bindgen]
+pub fn set_env_spin(degrees_per_second: f32) {
+    with_state(|s| s.env_spin = degrees_per_second);
 }

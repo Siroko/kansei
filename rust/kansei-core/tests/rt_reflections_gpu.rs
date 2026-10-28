@@ -223,3 +223,83 @@ fn a_mirror_floor_reflects_the_box_where_its_rays_hit_it() {
     eprintln!("voxel cone alone: {smeared} of {miss} missing pixels red");
     assert!(smeared > 0, "the voxel cone blurs the box past its edges");
 }
+
+/// The sky in the mirror: a gradient handed over as an environment (`set_environment` with a
+/// `GradientEnvironment`) reflects exactly as through `set_sky_lighting`, and an HDR
+/// environment's cubemap reflects its small bright light sharp where its SH alone blurs it away.
+#[test]
+fn the_sky_in_the_mirror_comes_from_the_environment() {
+    use kansei_core::environment::{GradientEnvironment, HdrEnvironment, HdrEnvironmentOptions, HdrImage};
+    let Some(mut renderer) = renderer() else { return eprintln!("no GPU adapter: skipping") };
+    renderer.enable_voxel_gi(SceneVoxelGiOptions { quality: VoxelGiQuality::Low, bounds_min: [-2.0, -0.5, -2.0], bounds_max: [2.0, 1.5, 2.0], ..Default::default() });
+    renderer.enable_rt_grid(SceneRtGridOptions { grid: RtGridOptions { dims: [64, 32, 64], cell: 4.0 / 64.0, fixed_origin: Some(glam::Vec3::new(-2.0, -0.5, -2.0)), ..Default::default() }, ..Default::default() });
+    let mut scene = Scene::new();
+    let mut floor = Renderable::new(BoxGeometry::new(6.0, 0.2, 6.0), material([0.02, 0.02, 0.02], 1.0)).with_rt(RtSurface::new([0.02; 3]));
+    floor.object.set_position(0.0, -0.1, 0.0);
+    scene.add(SceneNode::Renderable(floor));
+    let gbuffer = GBuffer::new(renderer.device(), W, H, 1);
+    let mut camera = camera();
+    let expect = expected(&camera);
+    let target = || {
+        renderer.device().create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        })
+    };
+    let outputs: Vec<wgpu::Texture> = (0..4).map(|_| target()).collect();
+    let views: Vec<wgpu::TextureView> = outputs.iter().map(|t| t.create_view(&Default::default())).collect();
+
+    let (up, down) = ([0.4, 0.6, 1.2], [0.1, 0.08, 0.05]);
+    let gradient = GradientEnvironment::new(renderer.device(), up, down);
+    let old_sky = wgpu::util::DeviceExt::create_buffer_init(renderer.device(), &wgpu::util::BufferInitDescriptor {
+        label: None,
+        contents: bytemuck::cast_slice(&kansei_core::gi::gradient_sky_lighting(up, down)),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    // a dim environment with a bright strip above the horizon down its middle column (along -z,
+    // where the floor reflects the camera's view)
+    let (w, h) = (256u32, 128u32);
+    let pixels = (0..w * h).map(|i| if (i % w).abs_diff(w / 2) < 3 && (10..56).contains(&(i / w)) { [40.0; 3] } else { [0.1; 3] }).collect();
+    let mut hdr = HdrEnvironment::new(renderer.device(), renderer.queue(), &HdrImage::from_pixels(w, h, pixels), HdrEnvironmentOptions::default());
+    hdr.prepare(renderer.device(), renderer.queue());
+
+    let handle = renderer.rt_grid().unwrap().handle();
+    let options = || RtReflectionsOptions { max_distance: 10.0, ..Default::default() };
+    let volume = renderer.voxel_gi().unwrap().volume();
+    let mut effects: Vec<RtReflectionsEffect> = (0..4).map(|_| RtReflectionsEffect::with_volume(volume, handle.clone(), options())).collect();
+    effects[0].set_sky_lighting(Some(&old_sky));
+    effects[1].set_environment(&gradient.lighting());
+    effects[2].set_environment(&hdr.lighting());
+    // the HDR environment's SH alone
+    effects[3].set_sky_lighting(Some(&hdr.lighting().sky_lighting));
+    for e in &mut effects {
+        e.view = RtReflectionsView::Mirror;
+    }
+    for _ in 0..12 {
+        renderer.render_scene_offscreen(&mut scene, &mut camera, &gbuffer);
+        let mut encoder = renderer.device().create_command_encoder(&Default::default());
+        for (e, view) in effects.iter_mut().zip(&views) {
+            e.render(renderer.device(), renderer.queue(), &mut encoder, &gbuffer, &gbuffer.color_view, &gbuffer.depth_view, view, &camera, W, H);
+        }
+        renderer.queue().submit(Some(encoder.finish()));
+    }
+    let images: Vec<Vec<[f32; 4]>> = outputs.iter().map(|t| read_rgba16(&renderer, t)).collect();
+    let floor_pixels: Vec<usize> = expect.iter().enumerate().filter(|(_, e)| **e == Some(false)).map(|(i, _)| i).collect();
+    assert!(floor_pixels.len() > 2000);
+    assert!(floor_pixels.iter().all(|&i| images[0][i] == images[1][i]), "the gradient as an environment reflects as before");
+    // the floor reflects the gradient's upper half: blue over warm
+    let mean = |image: &[[f32; 4]]| floor_pixels.iter().map(|&i| glam::Vec3::from_slice(&image[i][..3])).sum::<glam::Vec3>() / floor_pixels.len() as f32;
+    let sky = mean(&images[0]);
+    assert!(sky.z > sky.x && sky.z > 0.3, "the gradient's sky: {sky}");
+    let brightest = |image: &[[f32; 4]]| floor_pixels.iter().map(|&i| image[i][0]).fold(0.0f32, f32::max);
+    let (sharp, blurred) = (brightest(&images[2]), brightest(&images[3]));
+    eprintln!("the strip in the mirror: {sharp} from the cubemap, {blurred} from the SH");
+    assert!(sharp > 20.0, "the cubemap reflects the strip sharp: {sharp}");
+    assert!(blurred < 0.5 * sharp, "the SH blurs it: {blurred}");
+}

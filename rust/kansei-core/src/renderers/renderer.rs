@@ -204,6 +204,8 @@ pub struct Renderer {
     // Voxel GI of an open scene's meshes, in a clipmap round the camera (`enable_voxel_clipmap`)
     voxel_clipmap: Option<crate::gi::SceneVoxelClipmap>,
     rt_grid: Option<crate::rt::SceneRtGrid>,
+    // The sky the voxel GI sees past its volume and clipmap (`set_environment`)
+    environment: Option<crate::environment::EnvironmentLighting>,
 }
 
 /// wgpu's environment variables with DX12 on DXC unless `WGPU_DX12_COMPILER` says otherwise.
@@ -296,6 +298,7 @@ impl Renderer {
             voxel_gi: None,
             voxel_clipmap: None,
             rt_grid: None,
+            environment: None,
         }
     }
 
@@ -1689,11 +1692,46 @@ impl Renderer {
         log::info!("voxel GI: {:?}, {:?} voxels, {:.1} MiB", gi.quality(), gi.volume().dims(), gi.memory_bytes() as f64 / (1 << 20) as f64);
         self.voxel_gi = Some(gi);
         self.sync_voxel_gi_shadows();
+        self.sync_environment();
     }
 
     /// Turn voxel GI off and free its volume.
     pub fn disable_voxel_gi(&mut self) {
         self.voxel_gi = None;
+    }
+
+    /// The sky the scene's voxel GI (`enable_voxel_gi`'s volume and `enable_voxel_clipmap`'s
+    /// clipmap, now or enabled later) sees past them: an `environment::EnvironmentLighting` from a
+    /// `GradientEnvironment`, `SkyAtmosphere::lighting` or an `HdrEnvironment`, as
+    /// `SceneVoxelGi::use_sky_lighting` takes it; None: their own gradient again
+    /// (`set_sky_gradient`). Give the post-processing chain the same
+    /// (`PostProcessingVolume::set_environment`).
+    pub fn set_environment(&mut self, environment: Option<&crate::environment::EnvironmentLighting>) {
+        self.environment = environment.cloned();
+        self.sync_environment();
+        if environment.is_none() {
+            if let Some(gi) = &mut self.voxel_gi {
+                gi.reset_sky_lighting();
+            }
+            if let Some(gi) = &mut self.voxel_clipmap {
+                gi.reset_sky_lighting();
+            }
+        }
+    }
+
+    /// The environment `set_environment` gave.
+    pub fn environment(&self) -> Option<&crate::environment::EnvironmentLighting> {
+        self.environment.as_ref()
+    }
+
+    fn sync_environment(&mut self) {
+        let Some(environment) = &self.environment else { return };
+        if let Some(gi) = &mut self.voxel_gi {
+            gi.use_sky_lighting(&environment.sky_lighting);
+        }
+        if let Some(gi) = &mut self.voxel_clipmap {
+            gi.use_sky_lighting(&environment.sky_lighting);
+        }
     }
 
     pub fn voxel_gi(&self) -> Option<&crate::gi::SceneVoxelGi> {
@@ -1829,6 +1867,7 @@ impl Renderer {
         );
         self.voxel_clipmap = Some(gi);
         self.sync_voxel_gi_shadows();
+        self.sync_environment();
     }
 
     /// Turn the voxel clipmap off and free it.

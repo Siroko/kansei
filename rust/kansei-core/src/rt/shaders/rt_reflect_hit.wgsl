@@ -5,7 +5,7 @@
 // through the grid) and the voxels' irradiance, else the voxels (srcHitRadiance); past the grid or on a
 // miss, a voxel cone then the sky. Glass (RtSurface::glass) shows where the camera sees it (the
 // glass pass's image) and is stepped through elsewhere. Included after the trace's bindings,
-// RT_GRID_WGSL and the voxel source.
+// RT_GRID_WGSL, the voxel source and `rtSky(d, tanHalf)`, the sky along d for a ray of that lobe.
 
 // the image the hits are looked up in (the lit colour before the reflections)
 @group(0) @binding(10) var screenTex : texture_2d<f32>;
@@ -176,11 +176,12 @@ fn rtHitRadiance(p: vec3f, ng: vec3f, triangle: u32, bary: vec2f, d: vec3f) -> v
     return srcHitRadiance(p, ng) * specular.a + specular.rgb + kansei_rt_emission(triangle);
 }
 
-// Past the grid (or outside it): the voxels from where the ray left it, then the sky.
+// Past the grid (or outside it): the voxels from where the ray left it, then the sky (rtSky, the
+// includer's: rt_reflect_sky.wgsl).
 fn rtFarField(origin: vec3f, d: vec3f, n: vec3f, tanHalf: f32, exit: f32) -> vec3f {
     let size = srcVoxelSize(origin);
     let c = srcCone(origin, d, n, max(rp.coneTan, tanHalf), max(exit, size), rp.maxDistance, rp.coneSteps);
-    return c.rgb + c.a * rp.skyScale * skyRadiance(sky, d);
+    return c.rgb + c.a * rp.skyScale * rtSky(d, tanHalf);
 }
 
 struct RtRay {

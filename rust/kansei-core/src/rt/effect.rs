@@ -101,11 +101,13 @@ fn traced_wgsl(clipmap: bool, backend: RtBackend, covered: &str, main: &str) -> 
         format!("{}{}{VOLUME_SOURCE_WGSL}", crate::gi::VOXEL_CONES_WGSL, include_str!("../gi/shaders/voxel_irradiance.wgsl"))
     };
     super::hoist_wgsl_enables(&format!(
-        "{}\n{}\n{COMMON_WGSL}\n{}\n{}\n{ALPHA_BINDINGS_WGSL}{covered}\n{source}\n{}\n{main}",
+        "{}\n{}\n{}\n{COMMON_WGSL}\n{}\n{}\n{ALPHA_BINDINGS_WGSL}{covered}\n{source}\n{}\n{}\n{main}",
         crate::atmosphere::SKY_LIGHTING_WGSL,
+        crate::atmosphere::SKY_ENVIRONMENT_WGSL,
         include_str!("../shaders/spot_light_types.wgsl"),
         backend.wgsl(),
         backend.bindings_wgsl(1, 0),
+        include_str!("shaders/rt_reflect_sky.wgsl"),
         include_str!("shaders/rt_reflect_hit.wgsl"),
     ))
 }
@@ -122,7 +124,7 @@ pub(crate) fn trace_layout_entries(clipmap: bool, backend: RtBackend) -> [Vec<wg
     let depth = wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Depth, view_dimension: d2, multisampled: false };
     let storage_tex = wgpu::BindingType::StorageTexture { access: wgpu::StorageTextureAccess::WriteOnly, format: wgpu::TextureFormat::Rgba16Float, view_dimension: d2 };
     let filtering = wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering);
-    let mut trace_entries = vec![entry(0, uniform), entry(1, depth), entry(2, texture(false, d2)), entry(3, texture(false, d2)), entry(4, storage_tex), entry(5, uniform), entry(10, texture(false, d2)), entry(11, storage(true)), entry(12, texture(true, d2)), entry(13, storage_tex), entry(14, filtering), entry(15, storage(true))];
+    let mut trace_entries = vec![entry(0, uniform), entry(1, depth), entry(2, texture(false, d2)), entry(3, texture(false, d2)), entry(4, storage_tex), entry(5, uniform), entry(10, texture(false, d2)), entry(11, storage(true)), entry(12, texture(true, d2)), entry(13, storage_tex), entry(14, filtering), entry(15, storage(true)), entry(16, texture(true, wgpu::TextureViewDimension::Cube)), entry(17, filtering)];
     if clipmap {
         trace_entries.extend(crate::gi::clipmap_layout_entries(compute));
     } else {
@@ -295,6 +297,8 @@ struct Gpu {
     glass: wgpu::ComputePipeline,
     resolve: wgpu::ComputePipeline,
     no_sky: wgpu::Buffer,
+    /// no environment cubemap (`set_environment_map`): black, never read
+    no_environment: wgpu::TextureView,
     /// no spot lights (a count of 0)
     no_spots: wgpu::Buffer,
     /// the directional and point lights (`update_lights`; rt_reflect_hit.wgsl's RtReflectLights)
@@ -317,7 +321,8 @@ struct Gpu {
 /// voxels as the surface cache; with `screen_hits`, by the lit image where the camera sees the
 /// same point, and with `set_spot_lights`, the hits it doesn't see by the spot lights (shadow rays
 /// through the grid) plus the voxels' irradiance. Rays leaving the grid's box go on as a narrow
-/// voxel cone, then the sky (`set_sky_lighting`). It needs the voxel GI running whatever GI the
+/// voxel cone, then the sky (`set_sky_lighting`; with `set_environment_map`, a prefiltered cubemap
+/// at the ray's lobe, sharp for a mirror and clear glass). It needs the voxel GI running whatever GI the
 /// image shows (`hit_indirect` off where that is none or screen space).
 ///
 /// It traces one pixel of each 2 x 2 (or 4 x 4) block a frame, each in turn, and accumulates them
@@ -367,6 +372,7 @@ pub struct RtReflectionsEffect {
     grid: RtGridHandle,
     source: Source,
     sky_lighting: Option<wgpu::Buffer>,
+    environment: Option<crate::environment::EnvironmentMap>,
     alpha_texture: Option<wgpu::TextureView>,
     frame: u32,
     prev_view_proj: Option<glam::Mat4>,
@@ -422,6 +428,7 @@ impl RtReflectionsEffect {
             grid,
             source,
             sky_lighting: None,
+            environment: None,
             alpha_texture: None,
             frame: 0,
             prev_view_proj: None,
@@ -437,6 +444,14 @@ impl RtReflectionsEffect {
     /// uniform); black without one.
     pub fn set_sky_lighting(&mut self, sky: Option<&wgpu::Buffer>) {
         self.sky_lighting = sky.cloned();
+    }
+
+    /// The sky past the voxels as a prefiltered cubemap (`environment::EnvironmentMap`: an
+    /// `HdrEnvironment`'s or the atmosphere's), read at each ray's lobe, sharp for mirrors and
+    /// clear glass, in place of the sky lighting's SH; None (the default): the SH. Polished hits'
+    /// own reflections keep the SH.
+    pub fn set_environment_map(&mut self, map: Option<&crate::environment::EnvironmentMap>) {
+        self.environment = map.cloned();
     }
 
     /// The texture `kansei_rt_covered` reads (`kansei_rt_alpha_texture`).
@@ -587,6 +602,23 @@ impl RtReflectionsEffect {
             glass,
             resolve,
             no_sky: device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("RtReflections/NoSky"), contents: &[0u8; 256], usage: wgpu::BufferUsages::UNIFORM }),
+            no_environment: device
+                .create_texture_with_data(
+                    queue,
+                    &wgpu::TextureDescriptor {
+                        label: Some("RtReflections/NoEnvironment"),
+                        size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 6 },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                        view_formats: &[],
+                    },
+                    wgpu::util::TextureDataOrder::LayerMajor,
+                    &[0; 24],
+                )
+                .create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::Cube), ..Default::default() }),
             no_spots: device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("RtReflections/NoSpots"), contents: &[0u8; 256], usage: wgpu::BufferUsages::STORAGE }),
             lights: lights_buffer(device, 0),
             white,
@@ -603,6 +635,12 @@ impl RtReflectionsEffect {
 }
 
 impl PostProcessingEffect for RtReflectionsEffect {
+    /// Its SH for the sky, and its cubemap (where it has one) for the misses.
+    fn set_environment(&mut self, environment: &crate::environment::EnvironmentLighting) {
+        self.set_sky_lighting(Some(&environment.sky_lighting));
+        self.set_environment_map(environment.environment.as_ref());
+    }
+
     fn initialize(&mut self, _device: &wgpu::Device, _gbuffer: &GBuffer, _camera: &Camera) {}
 
     fn is_active(&self) -> bool {
@@ -677,7 +715,7 @@ impl PostProcessingEffect for RtReflectionsEffect {
         }
         let direct = self.spot_lights.is_some() || !self.lights.1.is_empty();
         let mut flags = 0;
-        for (on, flag) in [(self.alpha_test, 1), (self.collect_stats, 2), (self.prev_view_proj.is_some(), 4), (self.trace_grid, 8), (self.screen_hits, 16), (direct, 32), (matches!(&self.source, Source::Volume { anisotropic: Some(_), .. }), 64), (!self.hit_indirect, 128), (self.glass.is_some(), 256)] {
+        for (on, flag) in [(self.alpha_test, 1), (self.collect_stats, 2), (self.prev_view_proj.is_some(), 4), (self.trace_grid, 8), (self.screen_hits, 16), (direct, 32), (matches!(&self.source, Source::Volume { anisotropic: Some(_), .. }), 64), (!self.hit_indirect, 128), (self.glass.is_some(), 256), (self.environment.is_some(), 512)] {
             if on {
                 flags |= flag;
             }
@@ -722,6 +760,8 @@ impl PostProcessingEffect for RtReflectionsEffect {
             wgpu::BindGroupEntry { binding: 5, resource: buf(sky) },
             wgpu::BindGroupEntry { binding: 11, resource: buf(self.spot_lights.as_ref().unwrap_or(&gpu.no_spots)) },
             wgpu::BindGroupEntry { binding: 15, resource: buf(&gpu.lights) },
+            wgpu::BindGroupEntry { binding: 16, resource: tex(self.environment.as_ref().map_or(&gpu.no_environment, |e| &e.view)) },
+            wgpu::BindGroupEntry { binding: 17, resource: wgpu::BindingResource::Sampler(self.environment.as_ref().map_or(&gpu.linear, |e| &e.sampler)) },
         ];
         match &self.source {
             Source::Clipmap { uniform, levels, sampler } => {

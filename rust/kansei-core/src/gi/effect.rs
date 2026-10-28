@@ -530,6 +530,10 @@ impl VoxelGIEffect {
 }
 
 impl PostProcessingEffect for VoxelGIEffect {
+    fn set_environment(&mut self, environment: &crate::environment::EnvironmentLighting) {
+        self.set_sky_lighting(Some(&environment.sky_lighting));
+    }
+
     fn initialize(&mut self, device: &wgpu::Device, _gbuffer: &GBuffer, _camera: &Camera) {
         if self.gpu.is_none() {
             self.init_gpu(device);

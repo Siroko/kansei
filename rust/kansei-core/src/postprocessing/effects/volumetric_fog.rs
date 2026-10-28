@@ -935,6 +935,10 @@ impl VolumetricFogEffect {
 }
 
 impl PostProcessingEffect for VolumetricFogEffect {
+    fn set_environment(&mut self, environment: &crate::environment::EnvironmentLighting) {
+        self.set_sky_lighting(Some(&environment.sky_lighting));
+    }
+
     fn initialize(&mut self, _device: &wgpu::Device, _gbuffer: &GBuffer, _camera: &Camera) {
         // GPU resources need the queue too; they are created on the first render().
     }

@@ -8,6 +8,33 @@ use super::{Binding, Material, MaterialOptions};
 pub const GBUFFER_OUT_WGSL: &str = include_str!("../shaders/gbuffer_out.wgsl");
 
 const STANDARD_LIT_WGSL: &str = include_str!("../shaders/standard_lit.wgsl");
+const ENVIRONMENT_AMBIENT_WGSL: &str = include_str!("../shaders/environment_ambient.wgsl");
+
+/// Where a [`Material::standard_lit`] surface's ambient comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StandardAmbient {
+    /// `sky_up` and `sky_down`'s hemisphere.
+    Hemisphere,
+    /// An environment's SH, and its cubemap for the specular where it has one
+    /// (`standard_lit_environment`).
+    Environment { map: bool },
+}
+
+/// An environment's view or sampler, bound as it was made.
+enum External {
+    View(wgpu::TextureView),
+    Sampler(wgpu::Sampler),
+}
+
+impl crate::buffers::Bindable for External {
+    fn ensure_ready(&mut self, _device: &wgpu::Device, _queue: &wgpu::Queue) {}
+    fn binding_resource(&self) -> Option<super::BindingResource<'_>> {
+        Some(match self {
+            Self::View(view) => super::BindingResource::TextureView(view),
+            Self::Sampler(sampler) => super::BindingResource::Sampler(sampler),
+        })
+    }
+}
 
 /// How an instanced [`Material::standard_lit`] places each instance: a vec4 per instance at
 /// vertex location 3 (`ComputeBuffer::with_vertex_vec4(3)`), the layout `culling::InstanceCulling`
@@ -120,6 +147,10 @@ impl StandardLitOptions {
 
     /// The shader: the chunks it uses, then the material with its placeholders filled.
     fn shader(&self) -> String {
+        self.shader_with(StandardAmbient::Hemisphere)
+    }
+
+    fn shader_with(&self, ambient: StandardAmbient) -> String {
         let velocity = self.outputs_velocity;
         let (instance_input, instance_place) = match self.instancing {
             None => ("", ""),
@@ -144,10 +175,32 @@ impl StandardLitOptions {
                     ""
                 },
             )
-            .replace("KANSEI_VELOCITY_FRAGMENT", if velocity { "out.velocity = kansei_motion_vector(in.currClip, in.prevClip);" } else { "" });
+            .replace("KANSEI_VELOCITY_FRAGMENT", if velocity { "out.velocity = kansei_motion_vector(in.currClip, in.prevClip);" } else { "" })
+            .replace(
+                "KANSEI_AMBIENT",
+                match ambient {
+                    StandardAmbient::Hemisphere => "",
+                    StandardAmbient::Environment { .. } => "radiance += kansei_environment_ambient(N, V, base, roughness, metallic, kansei_surface.params.z);",
+                },
+            );
         let motion = if velocity { crate::cameras::MOTION_VECTORS_WGSL } else { "" };
+        let environment = match ambient {
+            StandardAmbient::Hemisphere => String::new(),
+            StandardAmbient::Environment { map } => {
+                let (bindings, reflection) = if map {
+                    (
+                        "@group(0) @binding(2) var kansei_environment : texture_cube<f32>;\n@group(0) @binding(3) var kansei_environment_sampler : sampler;",
+                        "return skyEnvironment(kansei_environment, kansei_environment_sampler, r, roughness);",
+                    )
+                } else {
+                    ("", "return skyRadiance(kansei_sky, r);")
+                };
+                let chunk = ENVIRONMENT_AMBIENT_WGSL.replace("KANSEI_ENVIRONMENT_BINDINGS", bindings).replace("KANSEI_ENVIRONMENT_REFLECTION", reflection);
+                format!("{}\n{}\n{chunk}", crate::atmosphere::SKY_LIGHTING_WGSL, crate::atmosphere::SKY_ENVIRONMENT_WGSL)
+            }
+        };
         format!(
-            "{}\n{}\n{}\n{}\n{motion}\n{body}",
+            "{}\n{}\n{}\n{}\n{motion}\n{environment}\n{body}",
             crate::lights::LIGHTS_WGSL,
             crate::shadows::SHADOW_MAP_WGSL,
             crate::shadows::CASCADED_SHADOWS_WGSL,
@@ -167,6 +220,33 @@ impl Material {
         let material_options = MaterialOptions { mrt_output_count: Some(4), outputs_velocity: options.outputs_velocity, ..Default::default() };
         let mut material = Material::new(label, &options.shader(), vec![Binding::uniform(0, wgpu::ShaderStages::FRAGMENT)], material_options);
         material.set_uniform_bindable(0, &format!("{label}/Surface"), &options.uniform());
+        material
+    }
+
+    /// `standard_lit` with its ambient from an environment (`environment::EnvironmentLighting`:
+    /// a `GradientEnvironment`, `SkyAtmosphere::lighting` or an `HdrEnvironment`) on top of
+    /// `sky_up` and `sky_down` (leave them at zero): the irradiance of its SH on the diffuse albedo
+    /// (the materials' own sky light the GI effects' `material_ambient` replaces), and, unless
+    /// `rt::RtReflectionsEffect` traces the surface (`traced`), its specular from the
+    /// environment's cubemap at the roughness (its SH without one). It binds the environment's
+    /// handles, which follow its settings (an `HdrEnvironment`'s turn or intensity); another
+    /// environment needs the material made again.
+    pub fn standard_lit_environment(label: &str, options: &StandardLitOptions, environment: &crate::environment::EnvironmentLighting) -> Material {
+        let ambient = StandardAmbient::Environment { map: environment.environment.is_some() };
+        let fragment = wgpu::ShaderStages::FRAGMENT;
+        let mut bindings = vec![Binding::uniform(0, fragment), Binding::uniform(1, fragment)];
+        if environment.environment.is_some() {
+            bindings.extend([Binding::texture_cube(2, fragment), Binding::sampler(3, fragment)]);
+        }
+        let material_options = MaterialOptions { mrt_output_count: Some(4), outputs_velocity: options.outputs_velocity, ..Default::default() };
+        let mut material = Material::new(label, &options.shader_with(ambient), bindings, material_options);
+        material.set_uniform_bindable(0, &format!("{label}/Surface"), &options.uniform());
+        let sky = crate::buffers::ComputeBuffer::from_external(&format!("{label}/Sky"), environment.sky_lighting.clone(), crate::buffers::BufferType::Uniform);
+        material.set_bindable(1, sky);
+        if let Some(map) = &environment.environment {
+            material.set_bindable(2, External::View(map.view.clone()));
+            material.set_bindable(3, External::Sampler(map.sampler.clone()));
+        }
         material
     }
 
@@ -255,6 +335,20 @@ mod tests {
                 assert_eq!(struct_size(&module, "KanseiStandardSurface"), std::mem::size_of_val(&options.uniform()));
             }
         }
+    }
+
+    #[test]
+    fn the_environment_variants_validate() {
+        for map in [false, true] {
+            for traced in [StandardTraced::None, StandardTraced::Reflective] {
+                let options = StandardLitOptions { traced, outputs_velocity: map, ..Default::default() };
+                let module = validate(&format!("environment map {map}"), &options.shader_with(StandardAmbient::Environment { map }));
+                assert_eq!(struct_size(&module, "KanseiStandardSurface"), std::mem::size_of_val(&options.uniform()));
+                assert_eq!(struct_size(&module, "SkyLighting"), std::mem::size_of::<crate::gi::SkyLightingData>());
+            }
+        }
+        // the hemisphere's shader reads no environment
+        assert!(!StandardLitOptions::default().shader().contains("kansei_environment"));
     }
 
     #[test]

@@ -755,6 +755,14 @@ impl SkyAtmosphere {
         &self.bindings
     }
 
+    /// The atmosphere as an environment source (`environment::EnvironmentLighting`): its sky
+    /// lighting and its sky cubemap, both written by `update`.
+    pub fn lighting(&self) -> crate::environment::EnvironmentLighting {
+        let b = &self.bindings;
+        let map = crate::environment::EnvironmentMap { view: b.environment.clone(), sampler: b.environment_sampler.clone(), mips: self.environment.mip_level_count() };
+        crate::environment::EnvironmentLighting { sky_lighting: b.sky_lighting.clone(), environment: Some(map) }
+    }
+
     /// Planet-frame position (km) of a world-space point (metres).
     pub fn to_planet_km(&self, world: Vec3) -> glam::Vec3 {
         glam::Vec3::new(world.x, world.y + self.origin_altitude_m, world.z) * 0.001

@@ -9,3 +9,13 @@ Model License:
 
 If you use this 3D model in your project be sure to copy paste this credit wherever you share it:
 This work is based on "Stanford Dragon (Vrip)" (https://sketchfab.com/3d-models/stanford-dragon-vrip-b602a35846e74533b1d9f06034a3b730) by 3D graphics 101 (https://sketchfab.com/3dgraphics) licensed under CC-BY-NC-4.0 (http://creativecommons.org/licenses/by-nc/4.0/)
+---
+
+HDRI Information:
+* title:	Studio Small 09 (studio_small_09_1k.hdr, 1024 x 512, Radiance RGBE)
+* source:	https://polyhaven.com/a/studio_small_09 (https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/1k/studio_small_09_1k.hdr, MD5 d5d7eb9d26d341d6aa4d11c1a54fd97c)
+* author:	Sergej Majboroda (Poly Haven)
+
+HDRI License:
+* license type:	CC0 1.0 (https://polyhaven.com/license, https://creativecommons.org/publicdomain/zero/1.0/)
+* requirements:	None; no credit required.

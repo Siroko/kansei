@@ -78,6 +78,15 @@ impl PostProcessingVolume {
         self.effects.iter_mut().find_map(|e| e.as_any_mut().downcast_mut::<T>())
     }
 
+    /// Light every effect of the chain by `environment` (`PostProcessingEffect::set_environment`):
+    /// the reflections' and the glass's misses, the GI's, the fog's sky, the background. Give the
+    /// renderer the same (`Renderer::set_environment`, the voxel GI's sky).
+    pub fn set_environment(&mut self, environment: &crate::environment::EnvironmentLighting) {
+        for effect in &mut self.effects {
+            effect.set_environment(environment);
+        }
+    }
+
     pub fn wants_jitter(&self) -> bool {
         self.effects.iter().any(|e| self.runs(e.as_ref()) && e.wants_jitter())
     }

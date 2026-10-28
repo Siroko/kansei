@@ -1,7 +1,8 @@
 // Kansei's standard lit material (materials::StandardLitOptions, Material::standard_lit): a GGX
 // / Lambert surface (lights/spot_lights.wgsl's kansei_brdf) lit by every light in the scene:
 // the directional lights (the sun through the cascaded shadow map, or the single map), the point
-// lights (the shadow-casting one through its cube shadow), the spot lights with their shadows, a hemisphere of sky, and its own emission. It writes
+// lights (the shadow-casting one through its cube shadow), the spot lights with their shadows, a hemisphere of sky (or, with
+// KANSEI_AMBIENT, an environment: environment_ambient.wgsl), and its own emission. It writes
 // the GBuffer's four targets (and the velocity target with `outputs_velocity`). Prefixed by
 // LIGHTS_WGSL, SHADOW_MAP_WGSL, CASCADED_SHADOWS_WGSL, SPOT_LIGHTS_WGSL (and MOTION_VECTORS_WGSL);
 // the Rust side fills the KANSEI_* placeholders.
@@ -86,6 +87,7 @@ fn fragment_main(in: KanseiStandardVaryings) -> KanseiStandardOut {
     let sky = mix(kansei_surface.skyDown.rgb, kansei_surface.skyUp.rgb, N.y * 0.5 + 0.5);
     let emissive = kansei_surface.emissive.rgb;
     radiance += base * (1.0 - metallic) * sky + emissive;
+    KANSEI_AMBIENT
 
     var out: KanseiStandardOut;
     out.color = vec4f(radiance, 1.0);
