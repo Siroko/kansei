@@ -31,6 +31,13 @@ voxels' irradiance, so the room in them carries the GI on screen. The GI's own r
 maps see through the glass; the chrome is dark to them. The panel's "Mirror & glass" folder turns
 each on and off and sets the chrome's roughness and the glass's index of refraction and roughness.
 
+Past the box's opening is black unless an environment lights it (`env=`): a studio gradient
+(`GradientEnvironment`, shown on a dome) or a studio HDRI (Poly Haven's CC0 `studio_small_09`,
+`HdrEnvironment`), which the background shows, the chrome mirrors (sharp, or through the HDRI's
+GGX-prefiltered levels when rough), the glass reflects and refracts, and whose light the GI's rays
+and cones bring in through the opening. The panel's "Environment" folder switches it and sets its
+intensity (in stops), its turn about the vertical and the background's blur.
+
 With `reflect=1` the floor is polished and reflects the room: rays traced through a grid of the
 room's triangles (96 cells of 4.8 cm each way, rebuilt on the GPU when something in it moves), the
 hits lit by the voxels, the voxel cone past the grid. The dragon goes into the grid as the cut of
@@ -51,7 +58,10 @@ grid below; with `reflect=1`,
 `kansei_gbuffer_out_specular` (the floor's F0 and roughness); for the balls,
 `Material::standard_lit` with `StandardLitOptions::mirror` and `StandardLitOptions::glass`
 (`set_standard_lit` for the panel's changes), `RtSurface::glass`, and `RtReflectionsEffect`'s
-`set_glass` (`RtGlass`), `set_spot_lights`, `screen_hits` and `hit_indirect`.
+`set_glass` (`RtGlass`), `set_spot_lights`, `screen_hits` and `hit_indirect`; with `env=`,
+`environment::GradientEnvironment` and `HdrEnvironment` (`HdrEnvironmentSettings`, `prepare`),
+`Renderer::set_environment`, `PostProcessingEffect::set_environment`,
+`EnvironmentBackgroundEffect` and `Material::gradient_sky`.
 
 | URL parameter | Effect |
 |---|---|
@@ -71,7 +81,12 @@ grid below; with `reflect=1`,
 | `sdf_ao=<0..1>` | strength of the distance field's AO on the GI (default 0) |
 | `sdf_shadows=off\|fallback\|always` | the voxels' shadows through the distance field: never (default), where no shadow map covers them, or always |
 | `shadows=map\|sdf` | the direct light's shadows from the shadow atlas (default) or the distance field |
-| `cam=front\|corner\|low\|floor\|glass` | starting camera (default front; `floor` looks down onto the floor, `glass` close on the glass ball) |
+| `cam=front\|corner\|low\|floor\|glass\|chrome` | starting camera (default front; `floor` looks down onto the floor, `glass` close on the glass ball, `chrome` close on the chrome ball) |
+| `env=none\|gradient\|hdri` | what lies past the box's opening: black (default), a studio gradient on a dome, or the studio HDRI (fetched, 1.6 MB) |
+| `env_ev=<stops>` | the environment's intensity over its default (0) |
+| `env_rotation=<degrees>` | the HDRI's turn about the vertical |
+| `env_blur=<0..1>` | the HDRI background's softness (a rough level of its prefiltered cubemap) |
+| `env_spin=<degrees/s>` | turn the HDRI continuously, preparing it again every frame (to time its preparation with `stats=1`) |
 | `mirror=0`, `glass=0` | no chrome ball, no glass ball (without both, `reflect`, `gi=rt` and `rt=1`, no grid is built and voxel GI runs only for its modes) |
 | `mirror_rough=<0..1>` | the chrome's roughness (default 0, a mirror) |
 | `glass_ior=<ior>` | the glass's index of refraction (default 1.5) |
@@ -102,7 +117,9 @@ Controls: drag to orbit, wheel or pinch to zoom, right-drag, shift-drag or two f
 Tweakpane panel (loaded from jsDelivr; collapsed on phones) switches the same settings at run
 time; `window.kansei` exposes its setters and `info()` for scripted captures.
 
-Assets: the Stanford dragon, fetched only when shown: `www/assets/stanford_dragon_pbr.glb` and
+Assets: "Studio Small 09" by Sergej Majboroda, from Poly Haven
+(https://polyhaven.com/a/studio_small_09), CC0, at 1K (`www/assets/studio_small_09_1k.hdr`, fetched
+only with `env=hdri`; recorded in `www/assets/license.txt`). The Stanford dragon, fetched only when shown: `www/assets/stanford_dragon_pbr.glb` and
 `www/assets/scene.gltf` + `scene.bin`. "Stanford Dragon (Vrip)" by 3D graphics 101 on Sketchfab,
 CC-BY-NC-4.0 (`www/assets/license.txt`); the page shows the credit while the dragon is on. The
 rug's texture is generated in code.

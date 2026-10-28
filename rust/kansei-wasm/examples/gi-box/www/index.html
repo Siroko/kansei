@@ -32,12 +32,13 @@
             set_rug, set_textured, set_camera, set_stats, set_sdf_ao, set_sdf_shadows, set_shadows, set_slice,
             set_reflections, set_reflection_view, set_reflection_grid, set_reflection_resolution, set_rtgi,
             set_mirror, set_glass, set_mirror_rough, set_glass_ior, set_glass_rough, set_screen_hits,
+            set_env, set_env_ev, set_env_rotation, set_env_blur, set_env_spin,
         } from '../pkg/kansei_wasm_gi_box.js';
         await init();
         await start('kansei');
 
         // for scripted captures: window.kansei.set_preset('best') and so on
-        window.kansei = { info, presets, set_preset, set_gi, set_voxels, set_view, set_dragon, set_animate, set_rug, set_textured, set_camera, set_stats, set_sdf_ao, set_sdf_shadows, set_shadows, set_slice, set_reflections, set_reflection_view, set_reflection_grid, set_reflection_resolution, set_rtgi, set_mirror, set_glass, set_mirror_rough, set_glass_ior, set_glass_rough, set_screen_hits };
+        window.kansei = { info, presets, set_preset, set_gi, set_voxels, set_view, set_dragon, set_animate, set_rug, set_textured, set_camera, set_stats, set_sdf_ao, set_sdf_shadows, set_shadows, set_slice, set_reflections, set_reflection_view, set_reflection_grid, set_reflection_resolution, set_rtgi, set_mirror, set_glass, set_mirror_rough, set_glass_ior, set_glass_rough, set_screen_hits, set_env, set_env_ev, set_env_rotation, set_env_blur, set_env_spin };
         const params = new URLSearchParams(location.search);
         const read = () => JSON.parse(info());
         let s = read();
@@ -94,12 +95,20 @@
         }));
         pane.addBinding(p, 'voxels', { label: 'voxel tier', options: { low: 'low', medium: 'medium', high: 'high' } }).on('change', custom(() => set_voxels(p.voxels)));
         pane.addBinding(p, 'view', { options: { lit: 'lit', 'indirect only': 'indirect', 'voxels (debug)': 'voxels', 'SDF slice (debug)': 'sdf', 'probes (debug)': 'probes' } }).on('change', custom(() => set_view(p.view)));
-        pane.addBinding(p, 'camera', { options: { front: 'front', 'inside corner': 'corner', 'low angle': 'low', 'down onto the floor': 'floor', 'through the glass ball': 'glass' } }).on('change', () => set_camera(p.camera));
+        pane.addBinding(p, 'camera', { options: { front: 'front', 'inside corner': 'corner', 'low angle': 'low', 'down onto the floor': 'floor', 'through the glass ball': 'glass', 'close on the chrome ball': 'chrome' } }).on('change', () => set_camera(p.camera));
         const sdf = pane.addFolder({ title: 'Distance field' });
         sdf.addBinding(p, 'sdfAo', { label: 'AO on GI', min: 0, max: 1, step: 0.05 }).on('change', custom(() => set_sdf_ao(p.sdfAo)));
         sdf.addBinding(p, 'sdfShadows', { label: 'voxel shadows', options: { 'shadow maps': 'off', 'field where no map': 'fallback', 'field always': 'always' } }).on('change', custom(() => set_sdf_shadows(p.sdfShadows)));
         sdf.addBinding(p, 'shadows', { label: 'direct shadows', options: { 'shadow atlas': 'map', 'distance field': 'sdf' } }).on('change', custom(() => set_shadows(p.shadows)));
         sdf.addBinding(p, 'slice', { label: 'slice height', min: 0, max: 4, step: 0.05 }).on('change', () => set_slice(p.slice));
+        // the environment past the box's opening: lights the GI's rays that leave the box, the
+        // balls' reflections and refraction and (the HDRI) the background
+        const e = { env: s.env.mode, ev: s.env.ev, rotation: s.env.rotation, blur: s.env.blur };
+        const envFolder = pane.addFolder({ title: 'Environment' });
+        envFolder.addBinding(e, 'env', { label: 'sky', options: { 'none (black)': 'none', 'studio gradient': 'gradient', 'studio HDRI': 'hdri' } }).on('change', async () => { await set_env(e.env); });
+        envFolder.addBinding(e, 'ev', { label: 'intensity (EV)', min: -6, max: 6, step: 0.1 }).on('change', () => set_env_ev(e.ev));
+        envFolder.addBinding(e, 'rotation', { label: 'rotation (deg)', min: -180, max: 180, step: 1 }).on('change', () => set_env_rotation(e.rotation));
+        envFolder.addBinding(e, 'blur', { label: 'background blur', min: 0, max: 1, step: 0.01 }).on('change', () => set_env_blur(e.blur));
         const scene = pane.addFolder({ title: 'Scene' });
         scene.addBinding(p, 'dragon', { options: { off: 'off', '19k triangles': 'light', '871k triangles': 'full' } }).on('change', async () => { p.preset = ''; await set_dragon(p.dragon); sync(); });
         // animation changes nothing else: no preset reset, no refresh of the others
