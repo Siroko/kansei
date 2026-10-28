@@ -231,6 +231,7 @@ fn main() {
                     let mut c = RtCausticsEffect::new(renderer.device(), handle.clone(), RtCausticsOptions::default());
                     c.tint_distance = 0.01;
                     c.update_lights(scene.lights());
+                    c.set_visibility(Some(shadows.visibility()));
                     c
                 });
                 let rolling = mode == Mode::Rolling;
