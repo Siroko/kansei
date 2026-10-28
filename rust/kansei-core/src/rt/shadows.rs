@@ -121,6 +121,35 @@ pub(crate) fn light_size() -> usize {
     std::mem::size_of::<LightGpu>()
 }
 
+/// `RtShadowsEffect`'s visibility of its lights as its last frame left it (`RtShadowsEffect::visibility`),
+/// for a pass after it in the same frame that weighs light by it: the caustics
+/// (`RtCausticsEffect::set_visibility`) add and take light only where the light reaches.
+#[derive(Clone, Default)]
+pub struct RtShadowVisibility {
+    shared: std::sync::Arc<std::sync::Mutex<Option<VisibilityFrame>>>,
+}
+
+/// One frame's visibility: lights 0-3 and 4-7 (rgba16float, 1 lit; directional lights first,
+/// then spot lights, as `update_lights` packs them), the guide (rgba32float: the normal
+/// octahedral-packed, the view depth; 0 where the effect lights nothing), at the trace resolution
+/// (`downscale` pixels a texel), for the camera's `frame`.
+#[derive(Clone)]
+pub(crate) struct VisibilityFrame {
+    pub vis: [wgpu::TextureView; 2],
+    pub guide: wgpu::TextureView,
+    pub trace_size: [u32; 2],
+    pub downscale: u32,
+    pub frame: u32,
+}
+
+impl RtShadowVisibility {
+    /// The visibility the effect left for the camera's `frame` (none when it didn't render that
+    /// frame).
+    pub(crate) fn frame(&self, frame: u32) -> Option<VisibilityFrame> {
+        self.shared.lock().unwrap().clone().filter(|f| f.frame == frame)
+    }
+}
+
 const FLAG_HISTORY: u32 = 1;
 const FLAG_CONTACT: u32 = 2;
 const ITERATIONS: usize = 3;
@@ -203,6 +232,7 @@ pub struct RtShadowsEffect {
     frame: u32,
     prev_view_proj: Option<glam::Mat4>,
     last_camera_frame: Option<u32>,
+    visibility: RtShadowVisibility,
     gpu: Option<Gpu>,
 }
 
@@ -230,8 +260,15 @@ impl RtShadowsEffect {
             frame: 0,
             prev_view_proj: None,
             last_camera_frame: None,
+            visibility: RtShadowVisibility::default(),
             gpu: None,
         }
+    }
+
+    /// Its denoised visibility of each light, which it leaves each frame for the passes after it
+    /// (`RtCausticsEffect::set_visibility`).
+    pub fn visibility(&self) -> RtShadowVisibility {
+        self.visibility.clone()
     }
 
     /// The `index`th spot light (in `update_lights`' order, counting spot lights only) emits from a
@@ -515,6 +552,13 @@ impl PostProcessingEffect for RtShadowsEffect {
             ],
         });
         pass(encoder, "RtShadows/Composite", &gpu.composite, &[&composite_group], (width.div_ceil(8), height.div_ceil(8)));
+        *self.visibility.shared.lock().unwrap() = Some(VisibilityFrame {
+            vis: [source[0].clone(), source[1].clone()],
+            guide: t.history[cur][2].clone(),
+            trace_size: [tw, th],
+            downscale,
+            frame: camera_frame,
+        });
         self.frame = self.frame.wrapping_add(1);
         self.prev_view_proj = Some(view_proj);
     }

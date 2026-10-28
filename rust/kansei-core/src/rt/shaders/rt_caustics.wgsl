@@ -1,7 +1,10 @@
 // Caustics (rt::RtCausticsEffect), the photons: from each light toward each glass caster whose
 // tile takes photons this frame (`tasks`, made on the CPU), a grid of photons over the caster's
 // box as the light sees it (one a cell, jittered by the tile's history, so a moving caster's
-// photons keep their pattern and a still one's fill in) is traced through the grid of triangles.
+// photons keep their pattern and a still one's fill in) is traced through the grid of triangles,
+// each from a point of the light's emitter as RtShadowsEffect samples it (the sun's disk, a spot
+// light's disk or rectangle) through its cell, so a photon stopped on its way is light those
+// rays find stopped too.
 // Those whose first hit is glass within the caster's box carry the light through it: at every
 // glass surface they cross, reflected or refracted by its exact dielectric Fresnel (chosen at
 // random, the photon keeping its flux: no light is lost to the choice), Beer-Lambert inside (the
@@ -10,9 +13,11 @@
 // lands), takes it away there. The tile thus holds what the glass changes of the direct light:
 // the light it focuses, and the shadow it leaves. Only surfaces that face up keep it, outside
 // every caster's box, at the height they landed at. Each photon splats a tent about as wide as
-// the photons lie apart there, into fixed-point atomics: rgb (lux * scale), the weight and the
-// weighted height. Prefixed with the grid's library (its bindings in group 1), RT_OPAQUE_WGSL and
-// rt_caustics_lookup.wgsl.
+// the photons lie apart there, into its light's layer of the tile, fixed-point atomics: rgb
+// (lux * scale), the weight and the weighted height. With `unoccluded`, the composite weighs each
+// light's layer by RtShadowsEffect's visibility at the surface, so the photons pass whatever
+// stands between the light and the caster (that visibility has it). Prefixed with the grid's
+// library (its bindings in group 1), RT_OPAQUE_WGSL and rt_caustics_lookup.wgsl.
 
 struct CausticsParams {
     taskCount    : u32,
@@ -29,13 +34,19 @@ struct CausticsParams {
     glassTint    : vec3f,
     // metres the tints are the light left after
     tintDistance : f32,
+    // 1: the photons start at their caster's box (see above)
+    unoccluded   : u32,
+    _pad0        : u32,
+    _pad1        : u32,
+    _pad2        : u32,
 }
 
-// A light's photons at a caster: kind 0 a directional light (parallel, from the plane origin +
-// u e1 + v e2, along axis; color its illuminance; emitterX's length the tan of its angular
-// radius), 1 a spot light (from origin toward axis + u e1 + v e2; color its intensity, cd;
-// emitterX, emitterY the half sides of its emitter). The emitter's penumbra blurs where they land.
-// `tile` the caster's, `seed` its jitter, `bias` how far rays leave a surface (m).
+// A light's photons at a caster: kind 0 a directional light (along axis through the plane origin
+// + u e1 + v e2; color its illuminance; emitterX, emitterY the tangents of its angular radius
+// along e1, e2), 1 or 2 a spot light (from origin, its emitter's centre, along axis + u e1 + v e2;
+// color its intensity, cd; emitterX, emitterY a disk's radius along two tangents (1) or a
+// rectangle's half sides (2)). `tile` the caster's, `layer` the light's at it, `seed` its jitter,
+// `bias` how far rays leave a surface (m).
 struct CausticTask {
     origin   : vec3f,
     kind     : u32,
@@ -59,12 +70,13 @@ struct CausticTask {
     seed     : u32,
     light    : u32,
     bias     : f32,
+    layer    : u32,
     _pad0    : u32,
-    _pad1    : u32,
 }
 
 // a tile's texel weight in fixed point
 const CAUSTICS_WEIGHT : f32 = 4096.0;
+
 
 @group(0) @binding(0) var<uniform> cp : CausticsParams;
 @group(0) @binding(1) var<storage, read> tasks : array<CausticTask>;
@@ -116,13 +128,13 @@ fn inCaster(p: vec3f) -> bool {
     return false;
 }
 
-// Splat irradiance (lux: flux over a texel's area, times the receiver's n.y) at p into `tile`, a
-// tent of `radius` metres (at least a texel and a half, at most `splatTexels` texels).
-fn deposit(tile: u32, p: vec3f, flux: vec3f, radius: f32) {
+// Splat irradiance (lux: flux over a texel's area, times the receiver's n.y) at p into `tile`'s
+// `layer`, a tent of `radius` metres (at least a texel and a half, at most `splatTexels` texels).
+fn deposit(tile: u32, layer: u32, p: vec3f, flux: vec3f, radius: f32) {
     let t = caustics.tiles[tile];
     let texel = t.size.x / f32(t.dims.x);
     let c = (p.xz - t.min) / texel - 0.5;
-    let r = clamp(radius / texel, 1.5, max(cp.splatTexels, 1.5));
+    let r = clamp(radius / texel, 2.0, max(cp.splatTexels, 2.0));
     let k = i32(ceil(r));
     let base = vec2i(round(c));
     if (any(base + k < vec2i(0)) || any(base - k >= vec2i(t.dims))) {
@@ -138,7 +150,7 @@ fn deposit(tile: u32, p: vec3f, flux: vec3f, radius: f32) {
         return;
     }
     let e = flux / (texel * texel * sum) * caustics.scale;
-    let layer = tile * caustics.texels * caustics.texels;
+    let base0 = layer * caustics.texels * caustics.texels;
     let h = p.y - t.refY;
     for (var y = -k; y <= k; y++) {
         for (var x = -k; x <= k; x++) {
@@ -147,7 +159,7 @@ fn deposit(tile: u32, p: vec3f, flux: vec3f, radius: f32) {
             if (w <= 0.0 || any(q < vec2i(0)) || any(q >= vec2i(t.dims))) {
                 continue;
             }
-            let at = (layer + u32(q.y) * caustics.texels + u32(q.x)) * 5u;
+            let at = (base0 + u32(q.y) * caustics.texels + u32(q.x)) * 5u;
             let v = e * w;
             atomicAdd(&acc[at], i32(round(v.r)));
             atomicAdd(&acc[at + 1u], i32(round(v.g)));
@@ -179,32 +191,81 @@ fn photons(@builtin(global_invocation_id) gid : vec3u, @builtin(num_workgroups) 
     let xi = hash4(i, j, task.seed, task.light);
     let u = task.u0 + (f32(i) + xi.x) * task.du;
     let v = task.v0 + (f32(j) + xi.y) * task.dv;
+    // the photon from the emitter's centre through its cell (the sun's along its axis), and the
+    // point where it meets the plane its caster stands on (the tile's height; past the caster's
+    // centre at least): each photon leaves a point of the emitter (a uniform one, the cell's own)
+    // toward that point, so the photons land there on the centre's even grid, from whichever
+    // point they left, and the emitter's size softens the shadow and the caustics only through
+    // which of them the glass stops or bends, as RtShadowsEffect's rays soften its shadows
+    let mid = 0.5 * (tile.boxMin + tile.boxMax);
+    var c : vec3f;
+    var dc : vec3f;
+    if (task.kind == 0u) {
+        c = task.origin + task.e1 * u + task.e2 * v;
+        dc = task.axis;
+    } else {
+        c = task.origin;
+        dc = normalize(task.axis + task.e1 * u + task.e2 * v);
+    }
+    var reach = max(dot(mid - c, dc), 1e-3);
+    if (dc.y < -1e-3) {
+        reach = max((tile.refY - c.y) / dc.y, reach);
+    }
+    let aim = c + dc * reach;
+    // the emitter's point, from the cell's place in a 16 x 16 ordered dither (a Bayer matrix's
+    // bits, the coarsest split of the emitter first): every aligned block of 2^k x 2^k cells
+    // leaves all 4^k of its strata, so the photons a splat gathers in a penumbra leave all of
+    // the emitter. Jittered within the finest stratum, turned each frame (R2).
+    var xe = vec2f(0.0);
+    for (var b = 0u; b < 4u; b++) {
+        xe += vec2f(f32(((i ^ j) >> b) & 1u), f32((j >> b) & 1u)) * exp2(-f32(b + 1u));
+    }
+    xe = fract(xe + hash4(i, j, task.seed, task.light + 211u).xy / 16.0 + fract(vec2f(0.7548776662, 0.5698402910) * f32(task.seed)));
+    var onEmitter = xe * 2.0 - 1.0;
+    if (task.kind != 2u) {
+        let r = sqrt(xe.x);
+        let a = 6.2831853 * xe.y;
+        onEmitter = r * vec2f(cos(a), sin(a));
+    }
+    let offset = task.emitterX * onEmitter.x + task.emitterY * onEmitter.y;
     var o : vec3f;
     var d : vec3f;
     if (task.kind == 0u) {
-        o = task.origin + task.e1 * u + task.e2 * v;
-        d = task.axis;
+        // a direction within the sun's disk, from as far before the caster
+        d = normalize(dc + offset);
+        o = aim - d * reach;
     } else {
-        // from the emitter's centre: its size blurs where the photons land instead (`penumbra`),
-        // so the photons stay as even where they land as on the grid
-        o = task.origin;
-        d = normalize(task.axis + task.e1 * u + task.e2 * v);
+        o = c + offset;
+        d = normalize(aim - o);
+    }
+    // unoccluded: from just before the caster's box, past what stands between it and the light
+    var tStart = 0.0;
+    if (cp.unoccluded != 0u) {
+        let grow = task.bias * 4.0;
+        let inv = 1.0 / select(d, vec3f(1e-12), abs(d) < vec3f(1e-12));
+        let ta = (tile.boxMin - grow - o) * inv;
+        let tb = (tile.boxMax + grow - o) * inv;
+        let near = max(max(min(ta.x, tb.x), min(ta.y, tb.y)), min(ta.z, tb.z));
+        let far = min(min(max(ta.x, tb.x), max(ta.y, tb.y)), max(ta.z, tb.z));
+        if (far < max(near, 0.0)) { return; }
+        tStart = max(near - task.bias, 0.0);
     }
     // the first surface: this caster's glass, or the photon is the direct light's (left to the
     // lights) or another caster's
-    let first = kansei_rt_trace(o, d, 0.0, cp.maxDistance, KANSEI_RT_SOLID | KANSEI_RT_GLASS_HITS);
+    let first = kansei_rt_trace(o, d, tStart, cp.maxDistance, KANSEI_RT_SOLID | KANSEI_RT_GLASS_HITS);
     if (!first.found || !isGlass(first.triangle)) { return; }
     let h0 = o + d * first.t;
     if (!inBox(h0, tile.boxMin, tile.boxMax, task.bias * 4.0)) { return; }
     var flux : vec3f;
     var spread : f32;
     if (task.kind == 0u) {
-        // the sun reaches the plane only where nothing stands between (a room's walls)
-        if (kansei_rt_trace(o, -d, 0.0, 1e5, KANSEI_RT_ANY_HIT | KANSEI_RT_SOLID).found) { return; }
+        // the sun reaches the plane only where nothing stands between (a room's walls), unless
+        // the visibility has that
+        if (cp.unoccluded == 0u && kansei_rt_trace(o, -d, 0.0, 1e5, KANSEI_RT_ANY_HIT | KANSEI_RT_SOLID).found) { return; }
         flux = task.color * (task.du * task.dv);
         spread = 0.0;
     } else {
-        let cosT = dot(d, task.axis);
+        let cosT = dot(dc, task.axis);
         let omega = task.du * task.dv * cosT * cosT * cosT;
         let cone = saturate((dot(d, task.lightDir) - task.cosOuter) / max(task.cosInner - task.cosOuter, 1e-4));
         let r = first.t * first.t / (task.range * task.range);
@@ -217,16 +278,12 @@ fn photons(@builtin(global_invocation_id) gid : vec3u, @builtin(num_workgroups) 
     // parallel, a spot light's spread with the distance), so a few overlap every texel
     let apart = select(2.0 * sqrt(task.du * task.dv), 0.0, task.kind != 0u);
     spread *= 2.0;
-    // and at least the penumbra the emitter casts past the glass (m a metre past it; a tent 1.29
-    // times a disk's radius spreads as the disk does): the light from all of the emitter, as
-    // RtShadowsEffect's rays reach it, without a random point a photon
-    let penumbra = 1.29 * select(length(task.emitterX), 0.5 * (length(task.emitterX) + length(task.emitterY)) / max(first.t, 1e-4), task.kind != 0u);
     // straight on through no glass: the direct light the glass changes, taken away
     let straight = kansei_rt_trace(h0, d, 0.0, cp.maxDistance, KANSEI_RT_SOLID);
     if (straight.found && straight.normal.y > 0.2) {
         let p = h0 + d * straight.t;
         if (!inCaster(p)) {
-            deposit(task.tile, p, -flux * straight.normal.y, max(apart + spread * (first.t + straight.t), penumbra * straight.t));
+            deposit(task.tile, task.layer, p, -flux * straight.normal.y, apart + spread * (first.t + straight.t));
         }
     }
     // through the glass: `depth` the glasses the photon is in (a core inside a shell: two), each
@@ -257,7 +314,7 @@ fn photons(@builtin(global_invocation_id) gid : vec3u, @builtin(num_workgroups) 
             let at = select(h, origin, through);
             if (hit.normal.y > 0.2 && !inCaster(at)) {
                 let far = select(travelled, travelled - hit.t, through);
-                deposit(task.tile, at, flux * throughput * hit.normal.y * cp.focusGain, max(apart + spread * far, penumbra * (far - first.t)) * cp.focusSharpen);
+                deposit(task.tile, task.layer, at, flux * throughput * hit.normal.y * cp.focusGain, (apart + spread * far) * cp.focusSharpen);
             }
             return;
         }

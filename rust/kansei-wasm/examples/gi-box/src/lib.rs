@@ -1042,13 +1042,15 @@ fn build_effects(renderer: &Renderer, config: &Config, phone: bool, stats: bool,
     let indirect = config.view == View::Indirect;
     let mut effects: Vec<Box<dyn PostProcessingEffect>> = Vec::new();
     // the lamp's direct light with ray-traced shadows (shadows=rt): first, so the GI and the
-    // reflections' screen hits see it
+    // reflections' screen hits see it (and its visibility weighs the caustics)
+    let mut visibility = None;
     if let (Direct::Rt, Some(grid)) = (config.direct, renderer.rt_grid()) {
         let mut shadows = RtShadowsEffect::new(grid.handle());
         let r = config.rt_shadows;
         shadows.view = r.view;
         shadows.half_resolution = !r.full;
         shadows.contact_length = r.contact;
+        visibility = Some(shadows.visibility());
         effects.push(Box::new(shadows));
         if r.view != RtShadowsView::Lit {
             // its debug views alone: the direct light exposed as the image is, the visibility and
@@ -1107,6 +1109,8 @@ fn build_effects(renderer: &Renderer, config: &Config, phone: bool, stats: bool,
         // (its triangles carry its tint, the light left after a metre)
         caustics.set_glass(config.glass_ior, [1.0; 3]);
         caustics.view = if config.rt_shadows.caustics_view { RtCausticsView::Caustics } else { RtCausticsView::Lit };
+        // the light they add and take only where the lamp reaches
+        caustics.set_visibility(visibility);
         effects.push(Box::new(caustics));
     }
     // the polished floor's reflections, the chrome ball and the glass, through the room's grid

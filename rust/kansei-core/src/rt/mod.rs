@@ -51,14 +51,14 @@ mod scene;
 mod scene_grid;
 mod shadows;
 
-pub use caustics::{RtCausticReceivers, RtCausticsEffect, RtCausticsOptions, RtCausticsView, RT_CAUSTICS_LOOKUP_WGSL, RT_CAUSTICS_MAX_CASTERS};
+pub use caustics::{RtCausticReceivers, RtCausticsEffect, RtCausticsOptions, RtCausticsView, RT_CAUSTICS_LOOKUP_WGSL, RT_CAUSTICS_MAX_CASTERS, RT_CAUSTICS_MAX_LIGHTS};
 pub use diffuse::{RtDiffuseGiEffect, RtDiffuseGiOptions, RtGiDenoise, RtGiHitLighting, RtGiKernel, RtGiMode, RtGiResolution, RtGiShadows, RtGiStats, RtGiView};
 pub use effect::{RtGlass, RtReflectionStats, RtReflectionsEffect, RtReflectionsOptions, RtReflectionsView, RtTraceResolution};
 pub use grid::{RtBackend, RtGrid, RtGridBindings, RtGridHandle, RtGridOptions, RtGridStats, RtPlacement, RtSource, RtSurface, RT_MAX_CELLS, RT_TRIANGLE_BYTES};
 pub use mesh::{split_large_triangles, transform_box, RtMesh};
 pub use scene::{RtInstance, RtScene};
 pub use scene_grid::{SceneRtGrid, SceneRtGridOptions, SceneRtGridStats};
-pub use shadows::{RtShadowsEffect, RtShadowsView, RT_SHADOWS_GBUFFER_WGSL, RT_SHADOW_MAX_LIGHTS};
+pub use shadows::{RtShadowVisibility, RtShadowsEffect, RtShadowsView, RT_SHADOWS_GBUFFER_WGSL, RT_SHADOW_MAX_LIGHTS};
 
 /// Ray tracing through an `RtGrid` from a compute pass: `KanseiRtGrid`, `KanseiRtHit` and
 /// `kansei_rt_trace(origin, dir, t_min, t_max, flags)`, the closest hit of a ray among the grid's

@@ -29,8 +29,10 @@ filters them and lights the pixels (Lambert plus GGX toward the disk). Penumbrae
 distance to the blocker; short screen-space rays darken the contacts the grid's cells miss. The
 shadow map is still drawn for what reads it (voxel GI's light injection, `rtgi_shadows=maps`).
 The rays pass through the glass ball; `rt::RtCausticsEffect` puts back what it changes of the
-lamp's light (`caustics=1`, the default): photons from the lamp through the ball, into a tile of
-texels round it, the light it focuses less the light that passed straight through.
+lamp's light (`caustics=1`, the default): photons from points of the lamp's disk through the ball,
+into a tile of texels round it, the light it focuses less the light that passed straight through,
+added where `RtShadowsEffect` finds the lamp reaching (so the ball's shadow merges into the
+others).
 
 A chrome ball stands on the short block and a glass ball on the rug, ray traced through a grid of
 the room's triangles (below) whatever the GI: the chrome (`StandardLitOptions::mirror`) mirrors the
@@ -71,7 +73,8 @@ grid below; with `reflect=1`,
 (`set_standard_lit` for the panel's changes), `RtSurface::glass`, and `RtReflectionsEffect`'s
 `set_glass` (`RtGlass`), `set_spot_lights`, `screen_hits` and `hit_indirect`; with `shadows=rt`,
 `RtShadowsEffect` (`update_lights`, `RtShadowsView`) and `rt::RT_SHADOWS_GBUFFER_WGSL`, and
-`RtCausticsEffect` (`set_casters` with the glass ball's box, `update_lights`, `set_glass`); with `env=`,
+`RtCausticsEffect` (`set_casters` with the glass ball's box, `update_lights`, `set_glass`,
+`set_visibility` with `RtShadowsEffect::visibility`); with `env=`,
 `environment::GradientEnvironment` and `HdrEnvironment` (`HdrEnvironmentSettings`, `prepare`),
 `Renderer::set_environment`, `PostProcessingEffect::set_environment`,
 `EnvironmentBackgroundEffect` and `Material::gradient_sky`.
