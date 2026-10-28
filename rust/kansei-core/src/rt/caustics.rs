@@ -443,10 +443,12 @@ struct Gpu {
 /// passes through glass) lands. A tile thus holds the change the glass makes to the direct light:
 /// dark where the light is bent away or absorbed, bright where it is focused, coloured by a tinted
 /// core; in sum the light the glass reflects out of reach and absorbs, nothing more. It lights the
-/// surfaces that face up at the height the photons landed (`RtCausticReceivers`), a layer of the
-/// tile a light: with `set_visibility`, each light's only where `RtShadowsEffect` finds that light
-/// reaching the surface, so a caster's shadow and caustics merge into another object's shadow
-/// rather than stack on it.
+/// surfaces that face up at the height the photons landed (`RtCausticReceivers`), two layers of the
+/// tile a light (the light added and the light taken away): with `set_visibility`, the light taken
+/// away only where `RtShadowsEffect` finds that light reaching the surface, so a caster's shadow
+/// merges into another object's shadow rather than stack on it, and the light added as its photons
+/// brought it (stopped by whatever they met from the emitter on), so the focus under a marble's
+/// opaque core, which hides the light from its centre, stays.
 ///
 /// A still caster's tile accumulates `max_history` frames of photons, each with its own jitter,
 /// then sends none. One that moves, or whose lights move, is cleared and fed again every frame
@@ -455,8 +457,8 @@ struct Gpu {
 ///
 /// Put it after `RtShadowsEffect` (and the GI), whose direct light it corrects; its `intensity`
 /// matches the shadows'. A photon costs a ray to its caster and, when it hits the glass, one
-/// straight on and one a surface it crosses; without `set_visibility`, directional lights cost
-/// one more, back toward the light.
+/// straight on and one a surface it crosses; directional lights cost one more, back toward the
+/// light, and with `set_visibility` every photon one more from the emitter to the caster's box.
 pub struct RtCausticsEffect {
     enabled: bool,
     pub view: RtCausticsView,
@@ -494,12 +496,13 @@ pub struct RtCausticsEffect {
     shadow_slots: Vec<u32>,
     rects: Vec<(usize, [f32; 2])>,
     visibility: Option<RtShadowVisibility>,
-    /// whether last frame's photons were weighed by the visibility (and so left the occluders
-    /// between the lights and the casters to it)
+    /// whether last frame's light taken away was weighed by the visibility (and so left the
+    /// occluders between the lights and the casters to it)
     weighted: bool,
     planner: Planner,
     sent: (usize, u32, usize),
-    /// the map's layers: a light's at a caster's tile is `caster * lights + light`
+    /// the map's layers: a light's at a caster's tile are `(caster * lights + light) * 2` (the
+    /// light added) and the next (the light taken away)
     layers: u32,
     map: wgpu::Texture,
     map_view: wgpu::TextureView,
@@ -629,13 +632,15 @@ impl RtCausticsEffect {
         }
     }
 
-    /// Weigh the light each light's photons add and take at a surface by `RtShadowsEffect`'s
+    /// Weigh the light each light's photons take away at a surface by `RtShadowsEffect`'s
     /// visibility of that light there (`RtShadowsEffect::visibility`; it must render before this
-    /// effect, in the same frame), so the caustics and the shadow the glass leaves add and take
-    /// only light that reaches the surface: where another object shadows it they merge into that
-    /// shadow. The photons then leave the occluders between the lights and the casters to the
-    /// visibility. `None`: every surface under a tile takes the map whole, and the photons find
-    /// those occluders themselves.
+    /// effect, in the same frame), so the shadow the glass leaves takes only light that reaches the
+    /// surface: where another object shadows it, it merges into that shadow. The photons counting
+    /// it then leave the occluders between the lights and the casters to the visibility. The light
+    /// they add is not weighed: it is theirs, traced from the emitter through the glass to where it
+    /// lands (the visibility, of the straight ray to the light, is dark under a marble's opaque core
+    /// where the shell focuses). `None`: every surface under a tile takes the map whole, and the
+    /// photons find those occluders themselves.
     pub fn set_visibility(&mut self, visibility: Option<RtShadowVisibility>) {
         self.visibility = visibility;
     }
@@ -665,18 +670,20 @@ impl RtCausticsEffect {
         &self.options
     }
 
-    /// The map (a layer a light at each caster's tile, `caster * lights + light`; rgb: the
-    /// irradiance that light's photons add, lux, signed; a: the height they landed at over the
-    /// tile's) and its uniform (`KanseiRtCaustics`), for `RT_CAUSTICS_LOOKUP_WGSL`. The map grows
-    /// (a new texture) when casters or lights are added: bind it anew each frame.
+    /// The map (two layers a light at each caster's tile, `map_layers`; rgb: the irradiance that
+    /// light's photons add through the glass, lux, then the irradiance the glass takes from where
+    /// it passed straight on, negative; a: the height they landed at over the tile's) and its
+    /// uniform (`KanseiRtCaustics`), for `RT_CAUSTICS_LOOKUP_WGSL`. The map grows (a new texture)
+    /// when casters or lights are added: bind it anew each frame.
     pub fn map(&self) -> (&wgpu::TextureView, &wgpu::Buffer) {
         (&self.map_view, &self.lookup)
     }
 
-    /// The map's layer of the `light`th light (in `update_lights`' order, counting the lights that
-    /// send photons) at the `caster`th tile.
-    pub fn map_layer(&self, caster: usize, light: usize) -> u32 {
-        (caster * self.lights.len().max(1) + light) as u32
+    /// The map's layers of the `light`th light (in `update_lights`' order, counting the lights
+    /// that send photons) at the `caster`th tile: the light it adds, and the light it takes away.
+    pub fn map_layers(&self, caster: usize, light: usize) -> [u32; 2] {
+        let added = (caster * self.lights.len().max(1) + light) as u32 * 2;
+        [added, added + 1]
     }
 
     /// The map's texture (for reading it back).
@@ -762,7 +769,7 @@ impl RtCausticsEffect {
                             seed: tile.history,
                             light: index as u32,
                             bias,
-                            layer: k as u32 * lights + index as u32,
+                            layer: (k as u32 * lights + index as u32) * 2,
                             ..Default::default()
                         });
                     }
@@ -850,7 +857,7 @@ impl RtCausticsEffect {
                             seed: tile.history,
                             light: index as u32,
                             bias,
-                            layer: k as u32 * lights + index as u32,
+                            layer: (k as u32 * lights + index as u32) * 2,
                             ..Default::default()
                         });
                     }
@@ -1007,9 +1014,9 @@ impl PostProcessingEffect for RtCausticsEffect {
     }
 
     fn render(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, gbuffer: &GBuffer, input: &wgpu::TextureView, depth: &wgpu::TextureView, output: &wgpu::TextureView, camera: &Camera, width: u32, height: u32) {
-        // a layer a light at each caster's tile: the map grows to hold them
+        // two layers a light at each caster's tile: the map grows to hold them
         let lights = self.lights.len().max(1) as u32;
-        let needed = self.casters.len().max(1) as u32 * lights;
+        let needed = self.casters.len().max(1) as u32 * lights * 2;
         if needed > self.layers {
             self.layers = needed.next_power_of_two();
         }
@@ -1018,8 +1025,8 @@ impl PostProcessingEffect for RtCausticsEffect {
             self.init_gpu(device);
         }
         self.grid.prepare_trace(device, queue);
-        // RtShadowsEffect's visibility this frame: the photons leave the occluders before the
-        // casters to it (a change of mode starts the tiles over)
+        // RtShadowsEffect's visibility this frame: the light taken away leaves the occluders
+        // before the casters to it (a change of mode starts the tiles over)
         let visibility = match self.receivers {
             RtCausticReceivers::RtLit => self.visibility.as_ref().and_then(|v| v.frame(camera.frame())),
             RtCausticReceivers::All => None,
@@ -1126,14 +1133,14 @@ impl PostProcessingEffect for RtCausticsEffect {
             });
             pass.dispatch_workgroups(w.min(texels).div_ceil(8), h.min(texels).div_ceil(8), self.layers);
             drop(pass);
-            // each fed tile's layers, one a light
+            // each fed tile's layers, two a light
             for &k in &fed_tiles {
                 let d = lookup.tiles[k].dims;
-                let origin = wgpu::Origin3d { x: 0, y: 0, z: k as u32 * lights };
+                let origin = wgpu::Origin3d { x: 0, y: 0, z: k as u32 * lights * 2 };
                 encoder.copy_texture_to_texture(
                     wgpu::TexelCopyTextureInfo { texture: &gpu.scratch, mip_level: 0, origin, aspect: wgpu::TextureAspect::All },
                     wgpu::TexelCopyTextureInfo { texture: &self.map, mip_level: 0, origin, aspect: wgpu::TextureAspect::All },
-                    wgpu::Extent3d { width: d[0], height: d[1], depth_or_array_layers: lights },
+                    wgpu::Extent3d { width: d[0], height: d[1], depth_or_array_layers: lights * 2 },
                 );
             }
         }

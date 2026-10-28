@@ -30,9 +30,9 @@ distance to the blocker; short screen-space rays darken the contacts the grid's 
 shadow map is still drawn for what reads it (voxel GI's light injection, `rtgi_shadows=maps`).
 The rays pass through the glass ball; `rt::RtCausticsEffect` puts back what it changes of the
 lamp's light (`caustics=1`, the default): photons from points of the lamp's disk through the ball,
-into a tile of texels round it, the light it focuses less the light that passed straight through,
-added where `RtShadowsEffect` finds the lamp reaching (so the ball's shadow merges into the
-others).
+into a tile of texels round it, the light it focuses (as its photons bring it) less the light that
+passed straight through, taken only where `RtShadowsEffect` finds the lamp reaching (so the ball's
+shadow merges into the others).
 
 A chrome ball stands on the short block and a glass ball on the rug, ray traced through a grid of
 the room's triangles (below) whatever the GI: the chrome (`StandardLitOptions::mirror`) mirrors the

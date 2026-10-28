@@ -4,7 +4,8 @@
 // `blend`; `composite` adds the map's light to the image where the GBuffer shows an
 // upward-facing surface under a tile, times its albedo / pi (not on glass or the sky, and with
 // `receivers` 0 only on the surfaces RtShadowsEffect lights, whose direct light passes through
-// glass), each light's `weighted` by RtShadowsEffect's visibility of it there. Prefixed with
+// glass), the light each light's photons take away `weighted` by RtShadowsEffect's visibility of
+// that light there (the light they add is theirs, traced from the emitter). Prefixed with
 // rt_caustics_lookup.wgsl.
 
 const CAUSTICS_WEIGHT : f32 = 4096.0;
@@ -17,7 +18,7 @@ const CAUSTICS_WEIGHT : f32 = 4096.0;
 @compute @workgroup_size(8, 8)
 fn resolve(@builtin(global_invocation_id) gid : vec3u) {
     let layer = gid.z;
-    let k = layer / max(caustics.lights, 1u);
+    let k = layer / max(caustics.lights * 2u, 1u);
     if (k >= min(caustics.count, KANSEI_RT_CAUSTIC_TILES)) { return; }
     let t = caustics.tiles[k];
     if (t.blend <= 0.0 || any(gid.xy >= t.dims)) { return; }
@@ -45,7 +46,7 @@ struct CompositeParams {
     // the pixels the tiles may cover (min x, y, max x, y): the others pass through
     rect      : vec4f,
     // RtShadowsEffect's trace resolution and pixels a texel, and whether its visibility weighs
-    // each light's change (visA, visB, visGuide)
+    // the light each light's photons take away (visA, visB, visGuide)
     traceSize : vec2u,
     downscale : u32,
     weighted  : u32,
@@ -133,8 +134,9 @@ fn composite(@builtin(global_invocation_id) gid : vec3u) {
         let view = cc.invProj * vec4f(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
         let world = (cc.invView * vec4f(view.xyz / view.w, 1.0)).xyz;
         let n = normalize(textureLoad(normalTex, px, 0).xyz * 2.0 - 1.0);
-        // each light's change (a layer of each tile covering the point), where that light reaches:
-        // RtShadowsEffect's visibility of it, read the first time a light changes anything
+        // each light's change (two layers of each tile covering the point): the light its
+        // photons add, as they brought it, and the light they take away where that light reaches:
+        // RtShadowsEffect's visibility of it, read the first time a light takes any
         var vis = array<f32, 8>(1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0);
         var read = cc.weighted == 0u;
         if (lookup.enabled != 0u && n.y >= 0.3) {
@@ -146,14 +148,19 @@ fn composite(@builtin(global_invocation_id) gid : vec3u) {
                 let d = vec2f(t.dims);
                 let q = clamp(uv * d, vec2f(0.5), d - 0.5) / f32(lookup.texels);
                 for (var l = 0u; l < lookup.lights; l++) {
-                    let s = textureSampleLevel(causticsMap, causticsSampler, q, k * lookup.lights + l, 0.0);
-                    if (abs(s.a + t.refY - world.y) > t.tolerance || all(s.rgb == vec3f(0.0))) { continue; }
+                    let layer = (k * lookup.lights + l) * 2u;
+                    let added = textureSampleLevel(causticsMap, causticsSampler, q, layer, 0.0);
+                    if (abs(added.a + t.refY - world.y) <= t.tolerance) {
+                        white += added.rgb;
+                    }
+                    let taken = textureSampleLevel(causticsMap, causticsSampler, q, layer + 1u, 0.0);
+                    if (abs(taken.a + t.refY - world.y) > t.tolerance || all(taken.rgb == vec3f(0.0))) { continue; }
                     if (!read) {
                         vis = visibility(px, -view.z / view.w, n);
                         read = true;
                     }
                     let slot = kansei_rt_caustics_shadow_slot(lookup, l);
-                    white += s.rgb * select(1.0, saturate(vis[min(slot, 7u)]), slot < 8u);
+                    white += taken.rgb * select(1.0, saturate(vis[min(slot, 7u)]), slot < 8u);
                 }
             }
         }
