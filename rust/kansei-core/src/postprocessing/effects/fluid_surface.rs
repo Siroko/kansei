@@ -80,6 +80,41 @@ pub enum FluidMask {
 
 /// The fluid surface's GBuffer material (`FluidSurfaceEffect::surface_renderable`).
 const SURFACE_MESH_WGSL: &str = include_str!("../../shaders/fluid_surface_mesh.wgsl");
+/// Its glass material (`FluidSurfaceEffect::surface_renderable_glass`).
+const SURFACE_GLASS_WGSL: &str = include_str!("../../shaders/fluid_surface_glass.wgsl");
+
+fn surface_glass_wgsl() -> String {
+    format!("{}\n{}\n{SURFACE_GLASS_WGSL}", crate::materials::GBUFFER_OUT_WGSL, crate::simulations::fluid::WATER_RIPPLES_WGSL)
+}
+
+/// The fluid's surface as glass (`FluidSurfaceEffect::surface_renderable_glass`), its material's
+/// uniform: write `uniform()` into the material's binding 0 buffer as it changes (each frame for
+/// the ripples' `time`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FluidGlassSurface {
+    /// The light left after a metre through it (linear rgb).
+    pub tint: [f32; 3],
+    pub ior: f32,
+    /// 0 clear, 1 frosted.
+    pub roughness: f32,
+    /// Scale of the small wind ripples on its upward faces (`WATER_RIPPLES_WGSL`; 0: none).
+    pub ripples: f32,
+    /// Seconds, for the ripples.
+    pub time: f32,
+}
+
+impl Default for FluidGlassSurface {
+    fn default() -> Self {
+        Self { tint: [0.6, 0.85, 0.85], ior: 1.33, roughness: 0.0, ripples: 0.0, time: 0.0 }
+    }
+}
+
+impl FluidGlassSurface {
+    /// The material's uniform (`FluidGlass` in the shader).
+    pub fn uniform(&self) -> [f32; 8] {
+        [self.tint[0], self.tint[1], self.tint[2], self.ior, self.roughness, self.ripples, self.time, 0.0]
+    }
+}
 
 /// Fluid surface post-processing effect.
 ///
@@ -112,6 +147,13 @@ pub struct FluidSurfaceEffect {
     pub active: bool,
     /// How the composite finds the fluid's pixels (any normal, by default).
     pub mask: FluidMask,
+    /// Whether the effect composites the screen-space refraction (the default); off, it only
+    /// extracts the surface (and its `heightfield`) and passes the image through: for a surface
+    /// drawn as glass (`surface_renderable_glass`), which `rt::RtReflectionsEffect` draws.
+    pub composite: bool,
+    /// The surface as a height field and a mesh for the ray tracing grid, updated with the
+    /// surface (`FluidHeightfield`; none by default).
+    pub heightfield: Option<crate::simulations::fluid::FluidHeightfield>,
 }
 
 impl FluidSurfaceEffect {
@@ -134,7 +176,7 @@ impl FluidSurfaceEffect {
             options, sim, density_field, marching_cubes, marching_cubes_bg,
             composite_pipeline: None, composite_bgl: None, params_buf: None,
             composite_bg: None, cached_input_ptr: 0, initialized: false, splat_radius: None,
-            extract: true, active: true, mask: FluidMask::AnyNormal,
+            extract: true, active: true, mask: FluidMask::AnyNormal, composite: true, heightfield: None,
         }
     }
 
@@ -155,6 +197,23 @@ impl FluidSurfaceEffect {
         let options = MaterialOptions { cull_mode: CullMode::None, mrt_output_count: Some(4), ..Default::default() };
         let mut material = Material::new("FluidSurface/Mesh", SURFACE_MESH_WGSL, vec![Binding::uniform(0, wgpu::ShaderStages::FRAGMENT)], options);
         material.set_uniform_bindable(0, "FluidSurface/Color", &color);
+        let mut renderable = crate::objects::Renderable::new(geometry, material);
+        renderable.cast_shadow = false;
+        renderable
+    }
+
+    /// The surface as glass in the GBuffer (GBUFFER_OUT_WGSL's `kansei_gbuffer_out_glass`), for
+    /// `rt::RtReflectionsEffect`'s glass pass to refract and reflect through the ray tracing grid
+    /// instead of the screen-space composite (turn `composite` off): the same mesh, double-sided,
+    /// casting no shadow, its uniform `surface.uniform()` (binding 0). Put the water in the grid
+    /// too (`heightfield`'s `rt_mesh`, as `RtSurface::glass`) for the mirrors to see it.
+    pub fn surface_renderable_glass(&self, surface: &FluidGlassSurface) -> crate::objects::Renderable {
+        use crate::materials::{Binding, CullMode, Material, MaterialOptions};
+        let mc = &self.marching_cubes;
+        let geometry = crate::geometries::Geometry::from_gpu_buffers("FluidSurface/GlassMesh", mc.vertex_buffer().clone(), mc.index_buffer().clone(), Some(mc.indirect_args_buffer().clone()));
+        let options = MaterialOptions { cull_mode: CullMode::None, mrt_output_count: Some(4), ..Default::default() };
+        let mut material = Material::new("FluidSurface/Glass", &surface_glass_wgsl(), vec![Binding::uniform(0, wgpu::ShaderStages::FRAGMENT)], options);
+        material.set_uniform_bindable(0, "FluidSurface/Glass", &surface.uniform());
         let mut renderable = crate::objects::Renderable::new(geometry, material);
         renderable.cast_shadow = false;
         renderable
@@ -245,6 +304,9 @@ impl PostProcessingEffect for FluidSurfaceEffect {
             self.marching_cubes.update_with_encoder_and_queue(
                 encoder, queue, &self.marching_cubes_bg, source,
             );
+            if let Some(heightfield) = &self.heightfield {
+                heightfield.update(encoder);
+            }
         }
 
         // 2. Upload composite params
@@ -273,7 +335,7 @@ impl PostProcessingEffect for FluidSurfaceEffect {
                 self.options.sky_color[0], self.options.sky_color[1],
                 self.options.sky_color[2], self.options.sky_reflection,
             ],
-            mask: (self.mask == FluidMask::EmissiveAlpha) as u32,
+            mask: if !self.composite { 2 } else { (self.mask == FluidMask::EmissiveAlpha) as u32 },
             _pad: [0; 3],
         };
         queue.write_buffer(self.params_buf.as_ref().unwrap(), 0, bytemuck::bytes_of(&params));
@@ -329,6 +391,9 @@ mod tests {
 
     #[test]
     fn the_shader_validates_and_the_params_layout_matches() {
+        let glass = surface_glass_wgsl();
+        let glass = naga::front::wgsl::parse_str(&glass).unwrap_or_else(|e| panic!("{}", e.emit_to_string(&glass)));
+        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all()).validate(&glass).unwrap();
         let surface = naga::front::wgsl::parse_str(SURFACE_MESH_WGSL).unwrap_or_else(|e| panic!("{}", e.emit_to_string(SURFACE_MESH_WGSL)));
         naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all()).validate(&surface).unwrap();
         let module = naga::front::wgsl::parse_str(COMPOSITE_SHADER).unwrap_or_else(|e| panic!("{}", e.emit_to_string(COMPOSITE_SHADER)));

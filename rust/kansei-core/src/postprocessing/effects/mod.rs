@@ -25,7 +25,7 @@ pub use contact_ao::{ContactAoEffect, ContactAoOptions};
 pub use distance_fog::{DistanceFogColor, DistanceFogEffect};
 pub use dof::{DepthOfFieldEffect, DepthOfFieldOptions};
 pub use environment_background::EnvironmentBackgroundEffect;
-pub use fluid_surface::{FluidMask, FluidSurfaceEffect, FluidSurfaceOptions};
+pub use fluid_surface::{FluidGlassSurface, FluidMask, FluidSurfaceEffect, FluidSurfaceOptions};
 pub use height_fog::{HeightFogEffect, HeightFogLayer};
 pub use motion_blur::{MotionBlurEffect, MotionBlurOptions};
 pub use screen_space_glass::{ScreenSpaceGlassEffect, ScreenSpaceGlassOptions};

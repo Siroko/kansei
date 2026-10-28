@@ -40,9 +40,19 @@ pub struct Renderable {
     /// Where its instance records put its mesh, for the grid (the material's vertex stage does it
     /// on screen): needed by instanced renderables, unless their `ClusterLod::transform` says.
     pub rt_placement: Option<crate::rt::RtPlacement>,
+    /// A mesh for the grid that the GPU writes (`rt::RtGpuMesh`: a compute pass fills its
+    /// `RtMesh` words), gathered in place of the geometry's CPU vertices: a fluid's surface
+    /// (`simulations::fluid::FluidHeightfield`). Bump `Geometry::revision` after writing it, so the
+    /// grid gathers it again.
+    pub rt_mesh: Option<crate::rt::RtGpuMesh>,
     /// How the path tracer (`pathtracer::BVHBuilder::scene_materials`) sees this renderable;
     /// `None`: `PathTracerMaterial::default()`.
     pub path_tracer_material: Option<crate::pathtracer::PathTracerMaterial>,
+    /// A cheaper mesh the shadow maps draw in its place (cascades, spot and point lights, the sky
+    /// occlusion map), through the same material: a game's shadow LOD, a dense model simplified to
+    /// what its shadow shows. `None` (the default) casts the geometry. Not for instanced or cluster
+    /// renderables, which cast their own cuts.
+    pub shadow_geometry: Option<Geometry>,
     /// World matrix the renderer uploaded last frame (for motion vectors); updated by it.
     pub(crate) previous_world_matrix: std::cell::Cell<Option<crate::math::Mat4>>,
 }
@@ -82,7 +92,9 @@ impl Renderable {
             gi: None,
             rt: None,
             rt_placement: None,
+            rt_mesh: None,
             path_tracer_material: None,
+            shadow_geometry: None,
             previous_world_matrix: std::cell::Cell::new(None),
         }
     }

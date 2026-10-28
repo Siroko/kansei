@@ -43,6 +43,13 @@ impl Default for SceneVoxelGiOptions {
 /// irradiance probes traced in it (`enable_probes`), updated after the mips.
 pub struct SceneVoxelGi {
     pub settings: SceneGiSettings,
+    /// Light the volume (the injection and the mips) every this many frames (1, the default:
+    /// every frame), and whenever the static surfaces were voxelized again. The light lags as
+    /// many frames: for consumers that blend it over time anyway, such as the probes (`enable_probes`,
+    /// whose irradiance settles over tens of frames), 2 to 4 halve or quarter its cost.
+    pub lighting_interval: u32,
+    /// Frames since the volume was last lit.
+    lighting_age: u32,
     quality: VoxelGiQuality,
     volume: VoxelVolume,
     voxelizer: MeshVoxelizer,
@@ -73,7 +80,7 @@ impl SceneVoxelGi {
         });
         let injection = RadianceInjection::new(device, &volume, &sky);
         let settings = SceneGiSettings { bounce_steps: quality.cone_steps() / 2, ..Default::default() };
-        Self { settings, quality, volume, voxelizer, injection, sky_source: sky.clone(), sky, sdf: None, probes: None, sdf_stale: false, device: device.clone() }
+        Self { settings, lighting_interval: 1, lighting_age: u32::MAX, quality, volume, voxelizer, injection, sky_source: sky.clone(), sky, sdf: None, probes: None, sdf_stale: false, device: device.clone() }
     }
 
     /// The tier in use (the one asked for, or lower if the device could not hold it).
@@ -197,8 +204,14 @@ impl SceneVoxelGi {
         }
     }
 
-    /// Record the injection and the mips (after the voxelization).
-    pub(crate) fn encode_lighting(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder) {
+    /// Record the injection and the mips (after the voxelization) when they are due
+    /// (`lighting_interval`), or `now` (the static surfaces changed).
+    pub(crate) fn encode_lighting(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, now: bool) {
+        self.lighting_age = self.lighting_age.saturating_add(1);
+        if !now && self.lighting_age < self.lighting_interval.max(1) {
+            return;
+        }
+        self.lighting_age = 0;
         self.injection.encode(device, queue, encoder, &self.volume, &self.voxelizer, self.sdf.as_ref(), &self.settings);
         self.volume.build_mips(encoder);
     }

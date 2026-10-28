@@ -10,9 +10,11 @@
 // bounces alone it would leave those directions dark: the voxels' light from the same share of
 // the hemisphere, (1 - open) * E_voxels, is the least the screen's part gives.
 //
-// With probes (gi::SdfProbes, `probes`), the far field is their irradiance at each pixel
-// (`kansei_gi_irradiance`), in place of the traced cones: the same split, with the probes as the
-// scene representation.
+// With probes (gi::SdfProbes, `probes`), the far field is their irradiance (`kansei_gi_irradiance`)
+// in place of the traced cones: looked up at the trace's resolution (`trace_probes`, a quarter of
+// the pixels at half) and upsampled by depth as the cones' are; the same split, with the probes as
+// the scene representation. (`main_probes` looks them up at every pixel: the TS port's composite
+// with probes, and the probes' debug view.)
 //
 // The voxels' irradiance holds the sky they see past the volume, so with the sky's lighting
 // bound the material's own sky ambient (albedo / pi times the sky's irradiance around its normal)
@@ -171,8 +173,40 @@ fn upsample(tex: texture_2d<f32>, size: vec2f, uv: vec2f, z: f32) -> vec4f {
     return sum / max(weight, 1e-6);
 }
 
+// `upsample` over the 2x2 texels round the pixel: enough for the probes' smooth light, a quarter
+// of the reads.
+fn upsample2(tex: texture_2d<f32>, size: vec2f, uv: vec2f, z: f32) -> vec4f {
+    let pos = uv * size - 0.5;
+    let base = floor(pos);
+    let f = pos - base;
+    var sum = vec4f(0.0);
+    var weight = 0.0;
+    for (var i = 0u; i < 4u; i++) {
+        let o = vec2f(f32(i & 1u), f32(i >> 1u));
+        let t = clamp(vec2i(base + o), vec2i(0), vec2i(size) - 1);
+        let tuv = (vec2f(t) + 0.5) / size;
+        let tz = -gpViewPos(tuv, gpDepth(gpPixel(tuv))).z;
+        let bilinear = mix(1.0 - f.x, f.x, o.x) * mix(1.0 - f.y, f.y, o.y);
+        let w = bilinear * exp(-abs(tz - z) / (0.02 * z + 0.05)) + 1e-5 * bilinear;
+        sum += textureLoad(tex, t, 0) * w;
+        weight += w;
+    }
+    return sum / max(weight, 1e-6);
+}
+
 @compute @workgroup_size(8, 8)
 fn main(@builtin(global_invocation_id) gid : vec3u) {
+    composite(gid, false);
+}
+
+// `main` over the probes' irradiance traced at the trace's resolution (`trace_probes`): the 2x2
+// upsample.
+@compute @workgroup_size(8, 8)
+fn main_traced_probes(@builtin(global_invocation_id) gid : vec3u) {
+    composite(gid, true);
+}
+
+fn composite(gid: vec3u, twoByTwo: bool) {
     if (any(vec2f(gid.xy) >= gp.fullSize)) { return; }
     let color = textureLoad(colorTex, gid.xy, 0);
     let px = vec2i(gid.xy);
@@ -204,7 +238,12 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
     }
     let uv = (vec2f(gid.xy) + 0.5) / gp.fullSize;
     let z = -gpViewPos(uv, depth).z;
-    var e = upsample(giTex, gp.traceSize, uv, z).rgb;
+    var e: vec3f;
+    if (twoByTwo) {
+        e = upsample2(giTex, gp.traceSize, uv, z).rgb;
+    } else {
+        e = upsample(giTex, gp.traceSize, uv, z).rgb;
+    }
     if (gp.nearField != 0u) {
         let near = upsample(nearTex, gp.nearSize, uv, z);
         e = max(near.rgb, (1.0 - near.a) * e) + near.a * e;
@@ -227,10 +266,27 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
     textureStore(outTex, gid.xy, vec4f(result, color.a));
 }
 
-// The composite with the probes as the far field (`VoxelGIEffect::set_probes`): main's, with each
-// pixel's irradiance from the probes around it in place of the traced cones, and the probes' debug
-// view (the voxels and the slice views run main). A separate entry point, so main's code (and what
-// it outputs) stays as it was.
+// The probes' irradiance at each texel of the trace (rgb; a 1), for `main` to upsample.
+@compute @workgroup_size(8, 8)
+fn trace_probes(@builtin(global_invocation_id) gid : vec3u) {
+    if (any(vec2f(gid.xy) >= gp.traceSize)) { return; }
+    let px = gpPixel((vec2f(gid.xy) + 0.5) / gp.traceSize);
+    let depth = gpDepth(px);
+    if (depth >= 1.0) {
+        textureStore(outTex, gid.xy, vec4f(0.0));
+        return;
+    }
+    let uv = (vec2f(px) + 0.5) / gp.fullSize;
+    let view = gpViewPos(uv, depth);
+    let ns = surfaceNormal(px, view);
+    let world = (gp.invView * vec4f(view, 1.0)).xyz;
+    // the lookup moved off the surface toward the viewer as well as along the normal (DDGI)
+    let toEye = normalize((gp.invView * vec4f(-view, 0.0)).xyz);
+    textureStore(outTex, gid.xy, vec4f(kanseiProbeIrradiance(world, ns, ns * 0.4 + toEye * 0.6), 1.0));
+}
+
+// The composite with the probes as the far field looked up at each pixel: the TS port's
+// (`VoxelGIEffect.setProbes`) and the probes' debug view (the voxels and the slice views run main).
 @compute @workgroup_size(8, 8)
 fn main_probes(@builtin(global_invocation_id) gid : vec3u) {
     if (any(vec2f(gid.xy) >= gp.fullSize)) { return; }

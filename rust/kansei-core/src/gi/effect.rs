@@ -139,6 +139,10 @@ struct Gpu {
     composite: wgpu::ComputePipeline,
     /// The composite with the probes as the far field (`main_probes`).
     composite_probes: wgpu::ComputePipeline,
+    /// The probes' irradiance at the trace's resolution (`trace_probes`), and the composite
+    /// that upsamples it (`main_traced_probes`).
+    trace_probes: wgpu::ComputePipeline,
+    composite_traced_probes: wgpu::ComputePipeline,
     composite_bgl: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     /// The sky past the volume until `set_sky_lighting`: `sky_gradient`.
@@ -456,6 +460,8 @@ impl VoxelGIEffect {
             temporal_bgl,
             composite: pipeline("VoxelGI/Composite", COMPOSITE_WGSL, &composite_bgl),
             composite_probes: pipeline_at("VoxelGI/CompositeProbes", COMPOSITE_WGSL, &composite_bgl, "main_probes"),
+            trace_probes: pipeline_at("Probes/Trace", COMPOSITE_WGSL, &composite_bgl, "trace_probes"),
+            composite_traced_probes: pipeline_at("Probes/Composite", COMPOSITE_WGSL, &composite_bgl, "main_traced_probes"),
             composite_bgl,
             sampler: device.create_sampler(&wgpu::SamplerDescriptor {
                 label: Some("VoxelGI/Linear"),
@@ -678,34 +684,47 @@ impl PostProcessingEffect for VoxelGIEffect {
         );
         let near_view = near.as_ref().map_or(&gpu.no_near, |(v, _)| v);
         let probe_buffers = self.probes.as_ref().unwrap_or(&gpu.no_probes);
-        let composite = group(
-            "VoxelGI/CompositeBG",
-            &gpu.composite_bgl,
-            vec![
-                p(),
-                tex(input),
-                tex(depth),
-                tex(if self.clipmap_probes.is_some() { &t.trace } else { &t.history[current] }),
-                tex(near_view),
-                tex(&gbuffer.albedo_view),
-                tex(&gbuffer.normal_view),
-                sky.as_entire_binding(),
-                tex(output),
-                volume.0.as_entire_binding(),
-                tex(volume.1),
-                wgpu::BindingResource::Sampler(volume.2),
-                tex(sdf_view),
-                probe_buffers[0].as_entire_binding(),
-                probe_buffers[1].as_entire_binding(),
-                probe_buffers[2].as_entire_binding(),
-                probe_buffers[3].as_entire_binding(),
-            ],
-        );
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("VoxelGI/Screen"), timestamp_writes: crate::profiling::gpu_pass("VoxelGI/Screen").as_ref().map(crate::profiling::PassStamp::compute) });
-        // with probes the composite reads them per pixel: no cones to trace and accumulate (the
-        // voxels and slice views show without them)
+        // with probes the far field is their irradiance, looked up at the trace's resolution into
+        // its texture and upsampled by the composite as the cones' are: no cones to trace and
+        // accumulate (the voxels and slice views show without them; the probes' own view looks
+        // them up a pixel)
         let probes = self.probes.is_some() && !matches!(params.debug, 2 | 3);
-        if !probes {
+        let probe_trace = probes && params.debug != 4;
+        let composite_group = |gi: &wgpu::TextureView, out: &wgpu::TextureView| {
+            let tex = wgpu::BindingResource::TextureView;
+            group(
+                "VoxelGI/CompositeBG",
+                &gpu.composite_bgl,
+                vec![
+                    p(),
+                    tex(input),
+                    tex(depth),
+                    tex(gi),
+                    tex(near_view),
+                    tex(&gbuffer.albedo_view),
+                    tex(&gbuffer.normal_view),
+                    sky.as_entire_binding(),
+                    tex(out),
+                    volume.0.as_entire_binding(),
+                    tex(volume.1),
+                    wgpu::BindingResource::Sampler(volume.2),
+                    tex(sdf_view),
+                    probe_buffers[0].as_entire_binding(),
+                    probe_buffers[1].as_entire_binding(),
+                    probe_buffers[2].as_entire_binding(),
+                    probe_buffers[3].as_entire_binding(),
+                ],
+            )
+        };
+        let composite = composite_group(if self.clipmap_probes.is_some() || probe_trace { &t.trace } else { &t.history[current] }, output);
+        // (named for what runs: the probes' lookup and composite, or the cones')
+        let label = if probes { "Probes/Apply" } else { "VoxelGI/Screen" };
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(label), timestamp_writes: crate::profiling::gpu_pass(label).as_ref().map(crate::profiling::PassStamp::compute) });
+        if probe_trace {
+            pass.set_pipeline(&gpu.trace_probes);
+            pass.set_bind_group(0, &composite_group(&t.history[current], &t.trace), &[]);
+            pass.dispatch_workgroups(t.width.div_ceil(8), t.height.div_ceil(8), 1);
+        } else if !probes {
             pass.set_pipeline(match &gpu.clipmap {
                 Some(clipmap) if self.clipmap_probes.is_some() => &clipmap.probe_trace,
                 Some(clipmap) => &clipmap.trace,
@@ -720,7 +739,13 @@ impl PostProcessingEffect for VoxelGIEffect {
                 pass.dispatch_workgroups(t.width.div_ceil(8), t.height.div_ceil(8), 1);
             }
         }
-        pass.set_pipeline(if probes { &gpu.composite_probes } else { &gpu.composite });
+        pass.set_pipeline(if probe_trace {
+            &gpu.composite_traced_probes
+        } else if probes {
+            &gpu.composite_probes
+        } else {
+            &gpu.composite
+        });
         pass.set_bind_group(0, &composite, &[]);
         pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
     }

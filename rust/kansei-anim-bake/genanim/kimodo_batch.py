@@ -26,6 +26,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import paths  # noqa: E402
+import effectors  # noqa: E402
 
 from kimodo import load_model  # noqa: E402
 from kimodo.constraints import load_constraints_lst  # noqa: E402
@@ -107,7 +108,7 @@ def main():
         output = model(
             prompts,
             num_frames,
-            constraint_lst=load_constraints_lst(constraints, model.skeleton) if constraints else [],
+            constraint_lst=(load_constraints_lst(constraints, model.skeleton) if constraints else []) + (effectors.build(model.skeleton, clip["effectors"], frames, model.fps) if "effectors" in clip else []),
             num_denoising_steps=steps,
             num_samples=samples,
             multi_prompt=True,
@@ -132,6 +133,7 @@ def main():
             "loop": clip.get("loop", False),
             "legs": legs,
             "constraints": constraints,
+            "effectors": clip.get("effectors"),
             "samples": samples,
             "seed": seed,
             "cfg": cfg,

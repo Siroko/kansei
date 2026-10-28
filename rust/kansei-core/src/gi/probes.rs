@@ -406,8 +406,8 @@ impl SdfProbes {
         });
         self.bound = (has_dynamic, Some(sky.clone()));
 
-        let stamp = crate::profiling::gpu_pass("VoxelGI/Probes");
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("VoxelGI/Probes"), timestamp_writes: stamp.as_ref().map(crate::profiling::PassStamp::compute) });
+        let stamp = crate::profiling::gpu_pass("Probes/Update");
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("Probes/Update"), timestamp_writes: stamp.as_ref().map(crate::profiling::PassStamp::compute) });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &*group, &[]);
         pass.dispatch_workgroups(batch, 1, 1);

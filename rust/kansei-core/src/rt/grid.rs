@@ -360,6 +360,21 @@ pub struct RtSurface {
     /// Glass (`RtSurface::glass`): rays pass straight through it (diffuse GI, shadow rays, any
     /// trace without `KANSEI_RT_GLASS_HITS`); `RtReflectionsEffect`'s glass refracts at it.
     pub glass: bool,
+    /// Its material lights it on screen itself (not `RtShadowsEffect` or the GI's composites), so
+    /// the GBuffer's background image (`GBuffer::background_view`, before the refractive pass)
+    /// holds its light: `RtReflectionsEffect` takes a hit there from it where the camera sees the
+    /// point only through what that pass draws (the bed under ray-traced water), not tracing its
+    /// lights.
+    pub self_lit: bool,
+    /// Its triangles are a coarse copy of a surface the camera draws finely (a fluid's surface,
+    /// `FluidHeightfield::rt_mesh`): `RtReflectionsEffect`'s glass paths that leave the fine
+    /// surface pass through the copy within `RT_APPROXIMATE_SKIN` of where they leave it, so the
+    /// copy lying a little above or below doesn't bend them twice.
+    pub approximate: bool,
+    /// A layer of the albedo texture array the reflections' hits read by uv
+    /// (`RtReflectionsEffect::set_albedo_texture`), times `albedo`: a textured surface in a
+    /// mirror. Needs the triangles' uvs (not `smooth_normals`).
+    pub albedo_layer: Option<u8>,
     /// An instanced surface's albedo per instance, in place of `albedo`: the word of each instance
     /// record (0 the first) holding it as `pack4x8unorm` (alpha unused), for instances the GPU
     /// colours (particles).
@@ -378,14 +393,26 @@ pub struct RtSurface {
 
 impl RtSurface {
     pub fn new(albedo: [f32; 3]) -> Self {
-        Self { albedo, alpha_layer: None, smooth_normals: false, glass: false, record_albedo: None, record_emission: None, specular: 0.0 }
+        Self { albedo, alpha_layer: None, smooth_normals: false, glass: false, albedo_layer: None, self_lit: false, approximate: false, record_albedo: None, record_emission: None, specular: 0.0 }
     }
 
     /// The surface of a glass object (the triangles `RtReflectionsEffect` refracts through, with
     /// smooth normals) whose material is `StandardLitOptions::glass`: `tint` its albedo, for the
     /// rays that pass through it.
     pub fn glass(tint: [f32; 3]) -> Self {
-        Self { albedo: tint, alpha_layer: None, smooth_normals: true, glass: true, record_albedo: None, record_emission: None, specular: 0.0 }
+        Self { albedo: tint, alpha_layer: None, smooth_normals: true, glass: true, albedo_layer: None, self_lit: false, approximate: false, record_albedo: None, record_emission: None, specular: 0.0 }
+    }
+
+    /// See `approximate`.
+    pub fn with_approximate(mut self) -> Self {
+        self.approximate = true;
+        self
+    }
+
+    /// See `self_lit`.
+    pub fn with_self_lit(mut self) -> Self {
+        self.self_lit = true;
+        self
     }
 
     /// See `specular`.
@@ -414,8 +441,19 @@ impl RtSurface {
         self
     }
 
+    /// See `albedo_layer`.
+    pub fn with_albedo_layer(mut self, layer: u8) -> Self {
+        self.albedo_layer = Some(layer);
+        self
+    }
+
     pub(crate) fn surface_word(&self) -> u32 {
-        self.alpha_layer.map_or(0, |layer| 1 | (layer as u32) << 8) | if self.smooth_normals { 4 } else { 0 } | if self.glass { 8 } else { 0 }
+        self.alpha_layer.map_or(0, |layer| 1 | (layer as u32) << 8)
+            | if self.smooth_normals { 4 } else { 0 }
+            | if self.glass { 8 } else { 0 }
+            | if self.self_lit { 32 } else { 0 }
+            | if self.approximate { 64 } else { 0 }
+            | self.albedo_layer.filter(|_| !self.smooth_normals).map_or(0, |layer| 16 | (layer as u32) << 16)
     }
 
     pub(crate) fn albedo_word(&self) -> u32 {

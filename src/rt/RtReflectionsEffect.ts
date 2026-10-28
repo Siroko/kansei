@@ -484,6 +484,7 @@ export class RtReflectionsEffect extends PostProcessingEffect {
         f32.set(viewProj, 64);
         u32[80] = this.glass ? Math.max(this.glass.interfaces, 1) : 0;
         u32[81] = this.glass ? Math.max(this.glass.samples, 1) : 1;
+        f32[82] = 1; // indirectScale (Rust: RtReflectionsEffect::hit_indirect_scale)
         device.queue.writeBuffer(gpu.params, 0, data);
         const current = this.frame % 2;
         this.frame = (this.frame + 1) >>> 0;

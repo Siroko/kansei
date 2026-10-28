@@ -15,7 +15,7 @@ struct Params {
     light_dir: vec4<f32>,   // xyz = direction light travels (world), w = intensity
     light_color: vec4<f32>, // rgb, w = rim strength
     sky: vec4<f32>,         // rgb, w = sky reflection
-    mask: u32,              // 0: any GBuffer normal is fluid; 1: only where emissive alpha >= 0.5
+    mask: u32,              // 0: any GBuffer normal is fluid; 1: only where emissive alpha >= 0.5; 2: none (passes the image through)
     _pad0: u32,
     _pad1: u32,
     _pad2: u32,
@@ -32,7 +32,7 @@ struct Params {
 // fluid material's mark (other materials writing normals, for GI, are not the fluid).
 fn is_fluid(texel: vec2u) -> bool {
     if (length(textureLoad(normal_tex, texel, 0).rgb) < 0.01) { return false; }
-    return params.mask == 0u || textureLoad(emissive_tex, texel, 0).a >= 0.5;
+    return params.mask == 0u || (params.mask == 1u && textureLoad(emissive_tex, texel, 0).a >= 0.5);
 }
 
 // A refracted sample, where the fluid covers it: elsewhere the texel shows something in front of
