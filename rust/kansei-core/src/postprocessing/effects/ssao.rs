@@ -260,6 +260,14 @@ fn kernel() -> [[f32; 4]; MAX_KERNEL] {
 }
 
 impl PostProcessingEffect for SSAOEffect {
+    /// Materials lit by the sky's SH (`SSAOAmbient::Sky`) take the environment's; the other
+    /// ambients stay as they are.
+    fn set_environment(&mut self, environment: &crate::environment::EnvironmentLighting) {
+        if let SSAOAmbient::Sky(sky) = &mut self.options.ambient {
+            *sky = environment.sky_lighting.clone();
+        }
+    }
+
     fn initialize(&mut self, device: &wgpu::Device, _gbuffer: &GBuffer, _camera: &Camera) {
         if self.gpu.is_none() {
             self.init_gpu(device);

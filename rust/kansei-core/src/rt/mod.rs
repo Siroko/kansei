@@ -225,6 +225,22 @@ mod tests {
         }
     }
 
+    /// Sampled textures a stage binds: core WebGPU's limit is 16 (`maxSampledTexturesPerShaderStage`).
+    fn sampled_textures(groups: &[Vec<wgpu::BindGroupLayoutEntry>]) -> usize {
+        groups.iter().flatten().filter(|e| matches!(e.ty, wgpu::BindingType::Texture { .. })).count()
+    }
+
+    #[test]
+    fn rt_passes_fit_webgpus_sampled_textures() {
+        for backend in BACKENDS {
+            for clipmap in [true, false] {
+                let gi = sampled_textures(&super::diffuse::trace_layout_entries(clipmap, backend));
+                let reflections = sampled_textures(&super::effect::trace_layout_entries(clipmap, backend));
+                assert!(gi <= 16 && reflections <= 16, "{backend:?}, clipmap {clipmap}: GI trace {gi}, reflections {reflections} of 16");
+            }
+        }
+    }
+
     #[test]
     fn shaders_validate_reflections() {
         let custom = "fn kansei_rt_covered(layer: u32, uv: vec2f) -> bool { if (uv.x > 1.5) { return true; } return textureSampleLevel(kansei_rt_alpha_texture, kansei_rt_alpha_sampler, uv, 0.0).a >= 0.5; }";

@@ -159,9 +159,15 @@ export function rtGlassWgsl(covered: string, clipmap: boolean = false): string {
 /** The default `kansei_rt_hit_albedo` (Rust: `RtReflectionsOptions::albedo_wgsl`): the triangle's albedo. */
 export const RT_DEFAULT_HIT_ALBEDO_WGSL = 'fn kansei_rt_hit_albedo(triangle: u32, p: vec3f, bary: vec2f) -> vec3f {\n    return kansei_rt_albedo(triangle);\n}\n';
 
+/**
+ * The sky past the voxels (`rtSky`, which Rust's `rt_reflect_sky.wgsl` also reads from an
+ * environment cubemap): the sky lighting's SH.
+ */
+const RT_SKY_WGSL = 'fn rtSky(d: vec3f, tanHalf: f32) -> vec3f {\n    return skyRadiance(sky, d);\n}\n';
+
 function rtTracedWgsl(covered: string, clipmap: boolean, main: string): string {
     const source = clipmap ? `${CLIPMAP_WGSL}${CLIPMAP_SOURCE_WGSL}${CLIPMAP_IRRADIANCE_WGSL}` : `${VOXEL_CONES_WGSL}${voxelIrradiance}${VOLUME_SOURCE_WGSL}`;
-    return `${SKY_LIGHTING_WGSL}\n${SPOT_LIGHT_TYPES_WGSL}\n${rtReflectCommon}\n${RT_GRID_WGSL}\n${rtGridBindingsWgsl(1, 0)}\n${ALPHA_BINDINGS_WGSL}${covered}\n${RT_DEFAULT_HIT_ALBEDO_WGSL}${source}\n${rtReflectHit}\n${main}`;
+    return `${SKY_LIGHTING_WGSL}\n${SPOT_LIGHT_TYPES_WGSL}\n${rtReflectCommon}\n${RT_GRID_WGSL}\n${rtGridBindingsWgsl(1, 0)}\n${ALPHA_BINDINGS_WGSL}${covered}\n${RT_DEFAULT_HIT_ALBEDO_WGSL}${source}\n${RT_SKY_WGSL}${rtReflectHit}\n${main}`;
 }
 
 /** `RtReflectionsEffect`'s resolve. */

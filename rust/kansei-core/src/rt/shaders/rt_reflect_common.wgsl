@@ -44,6 +44,8 @@ const RT_REFLECT_ANISO : u32 = 64u;
 const RT_REFLECT_NO_INDIRECT : u32 = 128u;
 // glass is drawn (rt_glass.wgsl): the rays hit the grid's glass triangles too
 const RT_REFLECT_GLASS : u32 = 256u;
+// the sky past the voxels is the environment cubemap (bindings 16, 17), not the SH
+const RT_REFLECT_ENV : u32 = 512u;
 
 fn rtViewPos(uv: vec2f, depth: f32) -> vec3f {
     let p = rp.invProj * vec4f(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);

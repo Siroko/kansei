@@ -25,5 +25,6 @@ pub mod sdf;
 pub mod animation;
 pub mod collision;
 pub mod gi;
+pub mod environment;
 pub mod rt;
 pub mod debug;
