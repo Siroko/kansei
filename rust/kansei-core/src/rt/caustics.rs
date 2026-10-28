@@ -60,19 +60,19 @@ pub struct RtCausticsOptions {
     /// The most surfaces a photon crosses or reflects off.
     pub interfaces: u32,
     pub max_distance: f32,
-    /// The widest splat, texels (a photon's tent is about as wide as photons lie apart there).
+    /// The widest splat, texels (a photon's tent is twice as wide as photons lie apart there).
     pub splat_texels: f32,
     /// A surface takes the map's light only within this height (m) of where the photons landed
     /// (and within half its caster's height).
     pub height_tolerance: f32,
-    /// How far below its caster's box a tile reaches (m) for the lights' slant (0: twice the
-    /// box's height).
+    /// How far below its caster's box a tile reaches (m) for the lights' slant (0: half the box's
+    /// height; a marble on its table needs none, glass over a floor further down more).
     pub reach: f32,
 }
 
 impl Default for RtCausticsOptions {
     fn default() -> Self {
-        Self { texel: 0.0005, tile_texels: 256, photons_per_texel: 2.0, photons: 256, max_history: 32, interfaces: 8, max_distance: 60.0, splat_texels: 3.0, height_tolerance: 0.3, reach: 0.0 }
+        Self { texel: 0.0005, tile_texels: 256, photons_per_texel: 2.0, photons: 256, max_history: 64, interfaces: 8, max_distance: 60.0, splat_texels: 3.0, height_tolerance: 0.3, reach: 0.0 }
     }
 }
 
@@ -309,7 +309,7 @@ impl Planner {
         let mut moved: Vec<([f32; 2], [f32; 2])> = Vec::new();
         for (k, &(lo, hi)) in casters.iter().enumerate() {
             if let Some(t) = self.tiles[k].filter(|t| t.lo != lo || t.hi != hi) {
-                let reach = if options.reach > 0.0 { options.reach } else { 2.0 * (hi.y - lo.y) };
+                let reach = if options.reach > 0.0 { options.reach } else { 0.5 * (hi.y - lo.y) };
                 moved.push(footprint(t.lo, t.hi, lights, reach));
                 moved.push(footprint(lo, hi, lights, reach));
             }
@@ -320,7 +320,7 @@ impl Planner {
                 self.tiles[k] = None;
                 continue;
             };
-            let reach = if options.reach > 0.0 { options.reach } else { 2.0 * (hi.y - lo.y) };
+            let reach = if options.reach > 0.0 { options.reach } else { 0.5 * (hi.y - lo.y) };
             let (a, b) = footprint(lo, hi, lights, reach);
             let corners: Vec<Vec3> = (0..8).map(|i| Vec3::new(if i & 1 == 0 { a[0] } else { b[0] }, if i & 2 == 0 { lo.y } else { hi.y.max(lo.y - reach) }, if i & 4 == 0 { a[1] } else { b[1] })).collect();
             let mut points = corners.clone();
@@ -421,10 +421,14 @@ pub struct RtCausticsEffect {
     pub intensity: f32,
     /// Frames between a tile's photons while it accumulates (1: every frame).
     pub interval: u32,
-    /// Photons leave a spot light's emitter (`set_rect_emitter`, its disk) as it is, as
-    /// `RtShadowsEffect`'s rays reach it (soft edges under a large emitter); off, from its centre
-    /// (sharper caustics, less physical).
+    /// The emitters' size (a spot light's disk or `set_rect_emitter`'s rectangle, the sun's
+    /// `sun_angle`) blurs where the photons land by the penumbra it casts past the glass, as
+    /// `RtShadowsEffect`'s rays reaching all of it soften its shadows (the photons themselves
+    /// leave its centre: an even grid, smooth from the first frame); off, a point's crisp
+    /// caustics.
     pub area_emitters: bool,
+    /// The sun's angular radius (radians): `RtShadowsEffect::sun_angle`.
+    pub sun_angle: f32,
     /// The light the glass brings (its photons through it) times this, and their splats this
     /// much narrower (1 and 1: physical; the shadow the glass leaves stays as it is): a game's
     /// caustics, bright, crisp lines and spots where a physical glass's light spreads faint.
@@ -474,6 +478,7 @@ impl RtCausticsEffect {
             intensity: 1.0,
             interval: 1,
             area_emitters: true,
+            sun_angle: 0.02,
             focus_gain: 1.0,
             focus_sharpen: 1.0,
             tint_distance: 1.0,
@@ -626,6 +631,7 @@ impl RtCausticsEffect {
                         let side = side_for((u[1] - u[0]).max(v[1] - v[0]));
                         // the photons' plane just outside the box, toward the light
                         let origin = dir * (t - 0.05 * (hi - lo).length() - 1e-3);
+                        let blur = if self.area_emitters { self.sun_angle.max(0.0).tan() } else { 0.0 };
                         tasks.push(TaskGpu {
                             origin: origin.to_array(),
                             kind: 0,
@@ -637,6 +643,7 @@ impl RtCausticsEffect {
                             v0: v[0],
                             color: color.to_array(),
                             du: (u[1] - u[0]) / side as f32,
+                            emitter_x: (e1 * blur).to_array(),
                             dv: (v[1] - v[0]) / side as f32,
                             tile: k as u32,
                             seed: tile.history,

@@ -143,6 +143,9 @@
         rtsFolder.addBinding(rts, 'res', { label: 'trace', options: { 'half (1 ray / 2x2)': 'half', 'full (1 ray / pixel)': 'full' } }).on('change', () => rtShadows('res', rts.res));
         rtsFolder.addBinding(rts, 'contact', { label: 'contact rays (m)', min: 0, max: 1, step: 0.05 }).on('change', (e) => { if (e.last !== false) rtShadows('contact', rts.contact); });
         rtsFolder.addBinding(rts, 'view', { label: 'debug view', options: { lit: 'lit', visibility: 'visibility', 'direct light': 'direct', 'lit mask': 'mask' } }).on('change', () => rtShadows('view', rts.view));
+        // the glass ball's caustics on the light the shadow rays let through it
+        rtsFolder.addBinding(rts, 'caustics', { label: 'glass caustics' }).on('change', () => rtShadows('caustics', rts.caustics));
+        rtsFolder.addBinding(rts, 'caustics_view', { label: 'caustics view', options: { lit: 'lit', 'their light over grey': 'caustics' } }).on('change', () => rtShadows('caustics_view', rts.caustics_view));
         const showRt = () => { rtFolder.hidden = p.gi !== 'rt'; rtsFolder.hidden = p.shadows !== 'rt'; };
         showRt();
         // the chrome and glass balls, ray traced whatever the GI
@@ -180,6 +183,7 @@
                 `SSGI ${i.ssgi_ms.toFixed(3)} ms` + (i.sdf ? `, distance field ${i.sdf_ms.toFixed(3)} ms` : '') + (i.probes ? `, probes ${i.probe_dims.join('x')} ${i.probes_ms.toFixed(3)} ms` : '') + '\n' +
                 (i.grid ? `rt grid: ${i.grid.triangles} triangles, ${i.grid.references} refs, ${i.grid.big} big, ${i.grid.mib} MiB; ${i.grid.rebuilt ? 'rebuilt' : 'kept'} (${i.grid.rebuilds}), GPU ${i.rt_ms.toFixed(3)} ms\n` : '') +
                 (i.shadows === 'rt' ? `RT shadows: ${i.rt_shadows_ms.toFixed(3)} ms (${i.rt_shadows.res})\n` : '') +
+                (i.caustics ? `caustics: ${i.caustics_ms.toFixed(3)} ms, ${i.caustics.photons} photons` + (i.caustics.tile ? `, tile ${i.caustics.tile.dims.join('x')} of ${i.caustics.tile.texel_mm} mm, ${i.caustics.tile.history} frames` : '') + '\n' : '') +
                 (i.rtgi.on ? `hybrid GI: ${i.rtgi_ms.toFixed(3)} ms, ${i.rtgi.mib} MiB; ${i.rtgi.rays} rays, ${i.rtgi.rays ? (100 * i.rtgi.hits / i.rtgi.rays).toFixed(0) : 0}% hit, ${i.rtgi.rays ? (i.rtgi.cost / i.rtgi.rays).toFixed(1) : 0} cells + triangles a ray` + (i.rtgi.accum ? `, ${i.rtgi.accumulated} frames accumulated` : '') + '\n' : '') +
                 (i.balls ? `mirror & glass: glass ${i.glass_ms.toFixed(3)} ms, ${i.balls.glass_pixels} pixels, ${i.balls.glass_pixels ? (i.balls.glass_cost / i.balls.glass_pixels).toFixed(1) : 0} cells + triangles a pixel; reflections ${i.reflect_ms.toFixed(3)} ms, ${i.balls.rays} rays\n` : '') +
                 (i.reflect ? `reflections: trace + resolve ${i.reflect_ms.toFixed(3)} ms; ${i.reflect.rays} rays, ${i.reflect.rays ? (100 * i.reflect.hits / i.reflect.rays).toFixed(0) : 0}% hit, ${i.reflect.rays ? ((i.reflect.cells + i.reflect.tests) / i.reflect.rays).toFixed(1) : 0} cells + triangles a ray\n` : '') + top;

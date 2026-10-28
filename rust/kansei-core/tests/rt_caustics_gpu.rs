@@ -5,11 +5,13 @@
 //!
 //! - glass of index 1 (it bends nothing, absorbs nothing) changes nothing: every texel's change is
 //!   a hair from zero, the light with the glass the light without it;
-//! - clear glass of index 1.5 moves light (a ball lens on the floor: its paraxial light focused to
-//!   a spot several times the direct light, its marginal light bent across the axis and spread
-//!   over the rest of its footprint, a little darker) but loses no more than its surfaces reflect
-//!   away from the floor;
-//! - a tinted core takes its colour from the light through it.
+//! - clear glass of index 1.5 moves light (a ball lens on the floor: a spot many times the direct
+//!   light under it, a dark ring round it) but loses no more than its two surfaces reflect away
+//!   from the floor (about a tenth each way through a ball);
+//! - a tinted core takes its colour from the light through it;
+//! - a rolling marble's tile, cleared and fed one frame of photons each frame, is already smooth,
+//!   and moving the marble a texel or a fraction of one moves its caustics without changing them
+//!   (no crawling).
 //!
 //! Through the grid's cells and, where the adapter has ray queries, through hardware ray queries
 //! (`RtBackend::Hardware`). Skipped (passes) when no adapter is available.
@@ -114,9 +116,9 @@ struct Tile {
     centres: Vec<[f32; 2]>,
 }
 
-/// The marble (index `ior`; `core`: a tinted sphere of half its radius inside it) on the floor,
-/// `frames` frames of the shadows and the caustics.
-fn run(backend: RtBackend, ior: f32, core: Option<[f32; 3]>, frames: usize) -> Option<Tile> {
+/// The marble (index `ior`; `core`: a tinted sphere of half its radius inside it) on the floor at
+/// x = `x`, `frames` frames of the shadows and the caustics.
+fn run(backend: RtBackend, ior: f32, core: Option<[f32; 3]>, frames: usize, x: f32) -> Option<Tile> {
     let mut renderer = renderer()?;
     renderer.enable_rt_grid(SceneRtGridOptions { grid: RtGridOptions { dims: [64, 32, 64], cell: 0.4 / 64.0, fixed_origin: Some(glam::Vec3::new(-0.2, -0.05, -0.2)), backend, ..Default::default() }, ..Default::default() });
     let mut scene = Scene::new();
@@ -124,11 +126,11 @@ fn run(backend: RtBackend, ior: f32, core: Option<[f32; 3]>, frames: usize) -> O
     floor.object.set_position(0.0, -0.01, 0.0);
     scene.add(SceneNode::Renderable(floor));
     let mut marble = Renderable::new(IcosphereGeometry::new(RADIUS, 5), glass_material()).with_rt(RtSurface::glass([1.0; 3]));
-    marble.object.set_position(0.0, RADIUS, 0.0);
+    marble.object.set_position(x, RADIUS, 0.0);
     scene.add(SceneNode::Renderable(marble));
     if let Some(tint) = core {
         let mut inner = Renderable::new(IcosphereGeometry::new(0.5 * RADIUS, 4), glass_material()).with_rt(RtSurface::glass(tint));
-        inner.object.set_position(0.0, RADIUS, 0.0);
+        inner.object.set_position(x, RADIUS, 0.0);
         scene.add(SceneNode::Renderable(inner));
     }
     let spot = SpotLight::new(Vec3::new(0.0, LAMP, 0.0), Vec3::new(0.0, -1.0, 0.0), Vec3::new(1.0, 1.0, 1.0), CANDELA, 100.0, 50f32.to_radians(), 60f32.to_radians());
@@ -161,7 +163,7 @@ fn run(backend: RtBackend, ior: f32, core: Option<[f32; 3]>, frames: usize) -> O
     // a centimetre: the core's tint is the light it leaves after one
     caustics.tint_distance = 0.01;
     caustics.update_lights(scene.lights());
-    caustics.set_casters(&[(GVec3::new(-RADIUS, 0.0, -RADIUS), GVec3::new(RADIUS, 2.0 * RADIUS, RADIUS))]);
+    caustics.set_casters(&[(GVec3::new(x - RADIUS, 0.0, -RADIUS), GVec3::new(x + RADIUS, 2.0 * RADIUS, RADIUS))]);
     for _ in 0..frames {
         renderer.render_scene_offscreen(&mut scene, &mut camera, &gbuffer);
         let mut encoder = renderer.device().create_command_encoder(&Default::default());
@@ -189,9 +191,25 @@ fn direct_under_lamp() -> f32 {
     CANDELA / (LAMP * LAMP)
 }
 
+/// The tile's mean in 1 mm rings round (x, 0), and the spread of its texels from 6 to 12 mm out
+/// (all shadow).
+fn rings(tile: &Tile, x: f32) -> ([f32; 16], f32) {
+    let r = |c: &[f32; 2]| ((c[0] - x).powi(2) + c[1] * c[1]).sqrt();
+    let mut sums = [(0.0f32, 0u32); 16];
+    for (t, c) in tile.texels.iter().zip(&tile.centres) {
+        let k = ((r(c) / 0.001) as usize).min(15);
+        sums[k].0 += t[1];
+        sums[k].1 += 1;
+    }
+    let annulus: Vec<f32> = tile.texels.iter().zip(&tile.centres).filter(|(_, c)| (6e-3..12e-3).contains(&r(c))).map(|(t, _)| t[1]).collect();
+    let mean = annulus.iter().sum::<f32>() / annulus.len() as f32;
+    let rms = (annulus.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / annulus.len() as f32).sqrt();
+    (sums.map(|(s, n)| s / n.max(1) as f32), rms)
+}
+
 fn conservation(backend: RtBackend) {
     // index 1: no change at all
-    let Some(tile) = run(backend, 1.0, None, 8) else { return eprintln!("no GPU adapter: skipping") };
+    let Some(tile) = run(backend, 1.0, None, 8, 0.0) else { return eprintln!("no GPU adapter: skipping") };
     assert_eq!(tile.history, 8, "a still marble's tile accumulates");
     let area = tile.texel * tile.texel;
     let sum: f32 = tile.texels.iter().map(|t| t[1]).sum::<f32>() * area;
@@ -202,32 +220,28 @@ fn conservation(backend: RtBackend) {
     assert!(worst < 0.02 * direct_under_lamp(), "nor any texel's ({worst} lux)");
 
     // clear glass: the light moves, little is lost
-    let tile = run(backend, 1.5, None, 32).unwrap();
+    let tile = run(backend, 1.5, None, 32, 0.0).unwrap();
     let area = tile.texel * tile.texel;
     let sum: f32 = tile.texels.iter().map(|t| t[1]).sum::<f32>() * area;
     let brightest = tile.texels.iter().map(|t| t[1]).fold(f32::MIN, f32::max);
     let darkest = tile.texels.iter().map(|t| t[1]).fold(f32::MAX, f32::min);
     let direct = direct_under_lamp();
     let with = 1.0 + sum / flux;
-    let mut rings = [(0.0f32, 0u32); 16];
-    for (t, c) in tile.texels.iter().zip(&tile.centres) {
-        let k = (((c[0] * c[0] + c[1] * c[1]).sqrt() / 0.001) as usize).min(15);
-        rings[k].0 += t[1];
-        rings[k].1 += 1;
-    }
-    eprintln!("radial (1 mm rings): {:?}", rings.iter().map(|(s, n)| (s / (*n).max(1) as f32).round()).collect::<Vec<_>>());
+    let (profile, rms) = rings(&tile, 0.0);
     eprintln!("index 1.5: the light through the marble's footprint with the glass {with:.3} of without; texels {darkest:.1}..{brightest:.1} lux over {direct:.1} direct");
-    assert!(sum <= 0.01 * flux && sum >= -0.15 * flux, "clear glass loses only what its surfaces reflect away ({sum} of {flux})");
-    assert!(brightest > 2.0 * direct, "the marble focuses the light under it ({brightest} lux)");
-    assert!(darkest < -0.1 * direct, "and leaves a shadow round the focus ({darkest} lux)");
+    eprintln!("1 mm rings: {:?}; the shadow 6-12 mm out varies {rms:.2} lux", profile.map(|v| v.round()));
+    assert!(sum <= 0.01 * flux && sum >= -0.2 * flux, "clear glass loses only what its surfaces reflect away ({sum} of {flux})");
+    assert!(brightest > 5.0 * direct, "the marble focuses the light under it ({brightest} lux)");
+    assert!(darkest < -0.9 * direct, "and leaves a shadow round the focus ({darkest} lux)");
     // the focus lies under the marble (within 3 mm of its axis), the light it took round it
-    let mean = |r: std::ops::Range<usize>| rings[r.clone()].iter().map(|x| x.0).sum::<f32>() / rings[r].iter().map(|x| x.1).sum::<u32>() as f32;
-    let (focus, shadow) = (mean(0..3), mean(4..14));
-    assert!(focus > direct && shadow < -0.05 * direct, "the focus ({focus:.1} lux) inside the shadow ({shadow:.1} lux)");
+    let mean = |r: std::ops::Range<usize>| profile[r.clone()].iter().sum::<f32>() / r.len() as f32;
+    let (focus, shadow) = (mean(0..3), mean(5..14));
+    assert!(focus > direct && shadow < -0.8 * direct, "the focus ({focus:.1} lux) inside the shadow ({shadow:.1} lux)");
+    assert!(rms < 0.1 * direct, "the shadow is smooth ({rms:.2} lux from texel to texel)");
 
     // a red core: the light through it red
     let r = |c: [f32; 2]| (c[0] * c[0] + c[1] * c[1]).sqrt();
-    let tile = run(backend, 1.5, Some([0.9, 0.05, 0.05]), 32).unwrap();
+    let tile = run(backend, 1.5, Some([0.9, 0.05, 0.05]), 32, 0.0).unwrap();
     let (mut red, mut green) = (0.0, 0.0);
     for (t, c) in tile.texels.iter().zip(&tile.centres) {
         if r(*c) < 0.5 * RADIUS {
@@ -237,6 +251,28 @@ fn conservation(backend: RtBackend) {
     }
     eprintln!("red core: under the marble red {red:.1}, green {green:.1}");
     assert!(red > green + 0.1 * red.abs().max(1.0), "the core's colour reaches the floor ({red} red, {green} green)");
+
+    // rolling: one frame of photons (as a moving marble's tile has), here and a texel and 0.37 of
+    // one along: the same caustics about the marble wherever it is, ring by ring for a whole
+    // texel; for a fraction of one (where the rings' texel centres sample the focus's steep edge
+    // elsewhere) the light within 6.5 mm, its rim in the flat shadow
+    let texel = tile.texel;
+    let within = |tile: &Tile, x: f32| tile.texels.iter().zip(&tile.centres).filter(|(_, c)| (c[0] - x).hypot(c[1]) < 0.0065).map(|(t, _)| t[1]).sum::<f32>() * texel * texel;
+    let still = run(backend, 1.5, None, 32, 0.0).unwrap();
+    let (still_rings, _) = rings(&still, 0.0);
+    let still_within = within(&still, 0.0);
+    for x in [0.0, texel, 0.37 * texel] {
+        let tile = run(backend, 1.5, None, 1, x).unwrap();
+        let (profile, rms) = rings(&tile, x);
+        let inside = within(&tile, x);
+        eprintln!("one frame, the marble {:.2} mm along: 1 mm rings {:?}, within 6.5 mm {:.3e} lm (still {still_within:.3e}), the shadow varies {rms:.2} lux", x * 1e3, profile.map(|v| v.round()), inside);
+        assert!(rms < 0.05 * direct, "a rolling marble's shadow is smooth ({rms:.2} lux from texel to texel)");
+        assert!((inside - still_within).abs() < 0.02 * still_within.abs(), "and brings the still marble's light ({inside} lm of {still_within})");
+        if x != 0.37 * texel {
+            let worst = profile.iter().zip(&still_rings).map(|(a, b)| (a - b).abs() / (0.05 * direct + 0.05 * b.abs())).fold(0.0, f32::max);
+            assert!(worst < 1.0, "its caustics are the still marble's, a texel along ({worst:.2} of the tolerance)");
+        }
+    }
 }
 
 #[test]
