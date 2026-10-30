@@ -25,11 +25,14 @@ pub const RT_TRIANGLE_BYTES: u64 = 64;
 /// Bytes between sources' parameters (WebGPU's dynamic uniform offset alignment, at most).
 const SOURCE_STRIDE: u64 = 256;
 const NO_WORD: u32 = u32::MAX;
+/// The layer flag (rt_types.wgsl `KANSEI_RT_CLIP`) of a build that keeps only what its uniform's
+/// second layer's box meets too.
+const CLIP: u32 = 2;
 
-/// The WGSL `KanseiRtGrid` (rt_types.wgsl).
+/// The WGSL `KanseiRtLayer` (rt_types.wgsl): a layer's box, cells and regions of the buffers.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
-pub(crate) struct RtGridGpu {
+pub(crate) struct RtLayerGpu {
     origin: [f32; 3],
     cell: f32,
     dims: [u32; 3],
@@ -44,6 +47,17 @@ pub(crate) struct RtGridGpu {
     triangle_capacity: u32,
     big_capacity: u32,
     big_cells: u32,
+    cells_base: u32,
+    triangle_base: u32,
+    pad: [u32; 2],
+}
+
+/// The WGSL `KanseiRtGrid` (rt_types.wgsl): the static layer, then the moving one.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
+pub(crate) struct RtGridGpu {
+    layer: RtLayerGpu,
+    moving: RtLayerGpu,
 }
 
 /// The WGSL `RtSource` (rt_gather.wgsl).
@@ -102,6 +116,12 @@ pub struct RtGridOptions {
     /// What `kansei_rt_trace` finds hits with: the cells (software) or hardware ray queries,
     /// picked once at `RtGrid::new` (`Auto`: hardware where the device has it and it is trusted).
     pub backend: RtBackend,
+    /// Cells the moving layer (`RtGrid::begin_moving`) has at most: its box is cut into cells as
+    /// fine as `cell` where they fit, coarser where its box is too big for them.
+    pub moving_cells: u32,
+    /// Triangles and references the moving layer's buffers start with room for; they grow too.
+    pub moving_triangle_capacity: u32,
+    pub moving_reference_capacity: u32,
 }
 
 /// What traces an `RtGrid`'s rays: its cells walked in a compute shader (`RT_GRID_WGSL`, the web's
@@ -179,6 +199,9 @@ impl Default for RtGridOptions {
             triangle_capacity: 1 << 16,
             reference_capacity: 1 << 20,
             backend: RtBackend::Auto,
+            moving_cells: 1 << 18,
+            moving_triangle_capacity: 1 << 12,
+            moving_reference_capacity: 1 << 15,
         }
     }
 }
@@ -201,13 +224,10 @@ impl RtGridOptions {
     fn cell_count(&self) -> u32 {
         self.dims.iter().product()
     }
-
-    fn macro_dims(&self) -> [u32; 3] {
-        self.dims.map(|d| d.div_ceil(MACRO))
-    }
 }
 
-/// What the last build read back needed, and the room the buffers have.
+/// What the last build read back needed, and the room the buffers have: the static layer's, then
+/// the moving layer's.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RtGridStats {
     /// Triangles gathered (meeting the box), whether they fitted or not.
@@ -224,6 +244,15 @@ pub struct RtGridStats {
     /// readback before, with room to grow): those gathered past it were left out, and
     /// `SceneRtGrid` rebuilds. 0 in software.
     pub accel_triangles: u32,
+    /// The moving layer's triangles gathered, references needed and room.
+    pub moving_triangles: u32,
+    pub moving_references: u32,
+    pub moving_triangle_capacity: u32,
+    pub moving_reference_capacity: u32,
+    pub moving_builds: u64,
+    /// Its cells now (0: empty), and where its triangles start in the triangles' buffer.
+    pub moving_cells: u32,
+    pub moving_triangle_base: u32,
 }
 
 /// The buffers a pass traces an `RtGrid` through, which follow the grid when its buffers are made
@@ -519,8 +548,8 @@ type SourceKey = (wgpu::Buffer, Option<wgpu::Buffer>, Option<wgpu::Buffer>, Opti
 struct Readback {
     staging: wgpu::Buffer,
     pending: Option<Arc<AtomicU8>>,
-    /// the hardware BLAS's triangles at the build in flight
-    accel_triangles: u32,
+    /// each layer's hardware BLAS's triangles at the build in flight
+    accel_triangles: [u32; 2],
     /// readbacks taken
     taken: u64,
 }
@@ -529,32 +558,110 @@ const MAPPING: u8 = 0;
 const MAPPED: u8 = 1;
 const FAILED: u8 = 2;
 
+/// The static layer, and the moving one.
+const STATIC: usize = 0;
+const MOVING: usize = 1;
+
+/// One of the grid's two layers (rt_types.wgsl's `KanseiRtLayer`): its box and cells, its regions
+/// of the triangles and the cell words, and its own counters, build uniform, sources and BLAS.
+struct Layer {
+    /// the box's corner, a cell's size and the cells each way: the static layer's from the
+    /// options, the moving layer's fitted round what moves at each build (no cells: empty)
+    origin: Vec3,
+    cell: f32,
+    dims: [u32; 3],
+    /// the uniform its build reads, this layer as `KanseiRtGrid`'s own fields (the static layer's
+    /// is the grid's uniform, which the traces read)
+    uniform: wgpu::Buffer,
+    written: Option<RtGridGpu>,
+    counters: wgpu::Buffer,
+    dispatch: wgpu::Buffer,
+    sources: wgpu::Buffer,
+    /// the sources' indirect dispatches, and the bind group writing them
+    gather_dispatch: wgpu::Buffer,
+    gather_dispatch_group: Option<wgpu::BindGroup>,
+    source_groups: HashMap<SourceKey, wgpu::BindGroup>,
+    bind_groups: Option<(wgpu::BindGroup, wgpu::BindGroup, wgpu::BindGroup)>,
+    /// cells its region of the cell words has room for (a multiple of 64)
+    cell_capacity: u32,
+    triangle_capacity: u32,
+    reference_capacity: u32,
+    /// what the last readback said: triangles gathered, references needed, big triangles
+    need: [u32; 3],
+    builds: u64,
+    /// the hardware backend's BLAS: rebuilt for speed of building or of tracing, whether the last
+    /// gather held non-opaque sources (its second geometry), its triangles this build
+    query: Option<RtQuery>,
+    fast_build: bool,
+    split: bool,
+    accel_slots: u32,
+    accel_read: u32,
+}
+
+impl Layer {
+    fn new(device: &wgpu::Device, uniform: wgpu::Buffer, cell_capacity: u32, query: Option<RtQuery>) -> Self {
+        let storage = |label, size: u64, usage| device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage: wgpu::BufferUsages::STORAGE | usage, mapped_at_creation: false });
+        Self {
+            origin: Vec3::ZERO,
+            cell: 1.0,
+            dims: [0; 3],
+            uniform,
+            written: None,
+            counters: storage("RtGrid/Counters", 16, wgpu::BufferUsages::empty()),
+            dispatch: storage("RtGrid/Dispatch", 32, wgpu::BufferUsages::INDIRECT),
+            sources: device.create_buffer(&wgpu::BufferDescriptor { label: Some("RtGrid/Sources"), size: SOURCE_STRIDE, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }),
+            gather_dispatch: storage("RtGrid/GatherDispatch", 16, wgpu::BufferUsages::INDIRECT),
+            gather_dispatch_group: None,
+            source_groups: HashMap::new(),
+            bind_groups: None,
+            cell_capacity,
+            triangle_capacity: 0,
+            reference_capacity: 0,
+            need: [0; 3],
+            builds: 0,
+            query,
+            fast_build: false,
+            split: false,
+            accel_slots: 0,
+            accel_read: 0,
+        }
+    }
+
+    fn cell_count(&self) -> u32 {
+        self.dims.iter().product()
+    }
+
+    /// Words of its region of the cell words before the references: its cells, its macro cells
+    /// and its big list.
+    fn head_words(&self, big_capacity: u32) -> u32 {
+        self.cell_capacity + self.cell_capacity / (MACRO * MACRO * MACRO) + 1 + big_capacity
+    }
+}
+
 /// A uniform grid of world triangles in a box round the camera (or a fixed one), rebuilt on the
 /// GPU, for rays: see the module docs. Each rebuild, between `begin` and `finish`, one `gather`
 /// appends the sources' triangles; after the frame's submit, `read_back` reads what it needed.
+///
+/// It has two layers in the same buffers, which every trace tests, keeping the nearer hit: the
+/// static one (`begin`), rebuilt only when what it holds changes, and the moving one
+/// (`begin_moving`), a small grid fitted round what moves and rebuilt every frame, so the moving
+/// triangles cost a frame what they hold rather than what the scene holds. `clear_moving` empties
+/// it. A layer's buffers grow without losing the other's, except that the static layer's growing
+/// empties the moving one until its next build.
 pub struct RtGrid {
     options: RtGridOptions,
     origin: Vec3,
     placed: bool,
-    uniform: wgpu::Buffer,
-    written: Option<RtGridGpu>,
     triangles: wgpu::Buffer,
     cells: wgpu::Buffer,
-    counters: wgpu::Buffer,
-    dispatch: wgpu::Buffer,
-    sources: wgpu::Buffer,
     empty: wgpu::Buffer,
-    triangle_capacity: u32,
-    reference_capacity: u32,
+    layers: [Layer; 2],
     build_bgl: wgpu::BindGroupLayout,
     prepare_bgl: wgpu::BindGroupLayout,
     gather_grid_bgl: wgpu::BindGroupLayout,
     gather_source_bgl: wgpu::BindGroupLayout,
     gather_prepare_bgl: wgpu::BindGroupLayout,
     gather_prepare: wgpu::ComputePipeline,
-    /// the sources' indirect dispatches, and the bind group writing them
-    gather_dispatch: wgpu::Buffer,
-    gather_dispatch_group: Option<wgpu::BindGroup>,
     prepare: wgpu::ComputePipeline,
     prepare_wide: wgpu::ComputePipeline,
     count: wgpu::ComputePipeline,
@@ -566,25 +673,16 @@ pub struct RtGrid {
     scan_add: wgpu::ComputePipeline,
     gather_layout: wgpu::PipelineLayout,
     gather_pipelines: HashMap<(String, bool), wgpu::ComputePipeline>,
-    bind_groups: Option<(wgpu::BindGroup, wgpu::BindGroup, wgpu::BindGroup)>,
-    source_groups: HashMap<SourceKey, wgpu::BindGroup>,
     readback: Readback,
-    stats: RtGridStats,
     generation: u64,
     handle: RtGridHandle,
-    /// between `begin` and `finish`: whether this build gathered yet
-    gathered: Option<bool>,
-    /// what traces it (never `Auto`), and the hardware backend's acceleration structures
+    /// between `begin` (or `begin_moving`) and `finish`: the layer, and whether it gathered yet
+    building: Option<(usize, bool)>,
+    /// what traces it (never `Auto`), and the hardware backend's TLAS of the layers' BLASes
     backend: RtBackend,
-    query: Option<RtQuery>,
+    tlas_state: Option<Arc<std::sync::Mutex<TlasState>>>,
     /// its TLAS, to bind
     tlas: Option<wgpu::Tlas>,
-    /// the hardware BLAS: rebuilt for speed of building (every frame) or of tracing, and whether
-    /// the last gather held non-opaque sources (its second geometry)
-    fast_build: bool,
-    split: bool,
-    /// the BLAS's triangles this build
-    accel_slots: u32,
 }
 
 impl RtGrid {
@@ -645,25 +743,23 @@ impl RtGrid {
             })
         };
         let storage = |label, size: u64, usage| device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage: wgpu::BufferUsages::STORAGE | usage, mapped_at_creation: false });
+        let uniform_buffer = |label| {
+            device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size: std::mem::size_of::<RtGridGpu>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false })
+        };
+        let tlas_state = (backend == RtBackend::Hardware).then(|| RtQuery::new_tlas(device));
+        let query = |slot| tlas_state.as_ref().map(|t| RtQuery::new(device, t.clone(), slot));
+        let moving_cells = (options.moving_cells / 64 * 64).clamp(64, RT_MAX_CELLS);
+        let mut layers = [Layer::new(device, uniform_buffer("RtGrid/Uniform"), options.cell_count(), query(STATIC)), Layer::new(device, uniform_buffer("RtGrid/MovingUniform"), moving_cells, query(MOVING))];
+        layers[STATIC].cell = options.cell;
+        layers[STATIC].dims = options.dims;
         let mut grid = Self {
             options,
             origin: options.fixed_origin.unwrap_or(Vec3::ZERO),
             placed: false,
-            uniform: device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("RtGrid/Uniform"),
-                size: std::mem::size_of::<RtGridGpu>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            }),
-            written: None,
             triangles: storage("RtGrid/Triangles", 16, wgpu::BufferUsages::empty()),
             cells: storage("RtGrid/Cells", 16, wgpu::BufferUsages::empty()),
-            counters: storage("RtGrid/Counters", 16, wgpu::BufferUsages::empty()),
-            dispatch: storage("RtGrid/Dispatch", 32, wgpu::BufferUsages::INDIRECT),
-            sources: device.create_buffer(&wgpu::BufferDescriptor { label: Some("RtGrid/Sources"), size: SOURCE_STRIDE, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }),
             empty: storage("RtGrid/Empty", 16, wgpu::BufferUsages::empty()),
-            triangle_capacity: 0,
-            reference_capacity: 0,
+            layers,
             prepare: pipeline("prepare", &prepare_bgl),
             prepare_wide: pipeline("prepare_wide", &prepare_bgl),
             count: pipeline("count", &build_bgl),
@@ -679,19 +775,14 @@ impl RtGrid {
             gather_source_bgl,
             gather_prepare_bgl,
             gather_prepare,
-            gather_dispatch: storage("RtGrid/GatherDispatch", 16, wgpu::BufferUsages::INDIRECT),
-            gather_dispatch_group: None,
             gather_layout,
             gather_pipelines: HashMap::new(),
-            bind_groups: None,
-            source_groups: HashMap::new(),
             readback: Readback {
-                staging: device.create_buffer(&wgpu::BufferDescriptor { label: Some("RtGrid/Readback"), size: 16, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }),
+                staging: device.create_buffer(&wgpu::BufferDescriptor { label: Some("RtGrid/Readback"), size: 32, usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false }),
                 pending: None,
-                accel_triangles: 0,
+                accel_triangles: [0; 2],
                 taken: 0,
             },
-            stats: RtGridStats::default(),
             generation: 0,
             handle: RtGridHandle {
                 shared: Arc::new(std::sync::Mutex::new(GridBuffers {
@@ -706,16 +797,14 @@ impl RtGrid {
                     tlas: None,
                 })),
             },
-            gathered: None,
-            query: (backend == RtBackend::Hardware).then(|| RtQuery::new(device)),
-            tlas: None,
+            building: None,
+            tlas: tlas_state.as_ref().map(|t| t.lock().unwrap().tlas().clone()),
+            tlas_state,
             backend,
-            fast_build: false,
-            split: false,
-            accel_slots: 0,
         };
-        grid.tlas = grid.query.as_ref().map(|q| q.tlas().lock().unwrap().tlas().clone());
-        grid.resize(device, options.triangle_capacity.max(64), options.reference_capacity.max(1024));
+        let (triangles, references) = (options.triangle_capacity.max(64), options.reference_capacity.max(1024));
+        let (moving_triangles, moving_references) = (options.moving_triangle_capacity.max(64), options.moving_reference_capacity.max(1024));
+        grid.resize(device, None, [triangles, moving_triangles], [references, moving_references]);
         grid
     }
 
@@ -729,10 +818,11 @@ impl RtGrid {
         self.backend
     }
 
-    /// The hardware backend's next BLAS builds fast rather than tracing fast: for a grid rebuilt
-    /// every frame (`SceneRtGrid` sets it while its box moves or a dynamic renderable is in it).
+    /// The hardware backend's next static BLAS builds fast rather than tracing fast: for a static
+    /// layer rebuilt every frame (`SceneRtGrid` sets it while its box moves). The moving layer's
+    /// always builds fast.
     pub fn set_prefer_fast_build(&mut self, on: bool) {
-        self.fast_build = on;
+        self.layers[STATIC].fast_build = on;
     }
 
     /// The box's corner.
@@ -745,16 +835,51 @@ impl RtGrid {
         (self.origin, self.origin + self.options.extent())
     }
 
-    /// What the last readback said, and the room the buffers have.
-    pub fn stats(&self) -> RtGridStats {
-        RtGridStats { triangle_capacity: self.triangle_capacity, reference_capacity: self.reference_capacity, ..self.stats }
+    /// The moving layer's box (the static box while it is empty).
+    pub fn moving_bounds(&self) -> (Vec3, Vec3) {
+        let m = &self.layers[MOVING];
+        if m.cell_count() == 0 {
+            return self.bounds();
+        }
+        (m.origin, m.origin + Vec3::new(m.dims[0] as f32, m.dims[1] as f32, m.dims[2] as f32) * m.cell)
     }
 
-    /// Whether the build read back gathered more triangles than it had room for (the buffers', or
-    /// the hardware BLAS's): rebuild.
+    /// The box of the layer being built (between `begin` or `begin_moving` and `finish`), whose
+    /// triangles a gather keeps; the static layer's otherwise.
+    pub fn gather_bounds(&self) -> (Vec3, Vec3) {
+        match self.building {
+            Some((MOVING, _)) => self.moving_bounds(),
+            _ => self.bounds(),
+        }
+    }
+
+    /// What the last readback said, and the room the buffers have.
+    pub fn stats(&self) -> RtGridStats {
+        let (s, m) = (&self.layers[STATIC], &self.layers[MOVING]);
+        RtGridStats {
+            triangles: s.need[0],
+            references: s.need[1],
+            big_triangles: s.need[2],
+            triangle_capacity: s.triangle_capacity,
+            reference_capacity: s.reference_capacity,
+            builds: s.builds,
+            accel_triangles: s.accel_read,
+            moving_triangles: m.need[0],
+            moving_references: m.need[1],
+            moving_triangle_capacity: m.triangle_capacity,
+            moving_reference_capacity: m.reference_capacity,
+            moving_builds: m.builds,
+            moving_cells: m.cell_count(),
+            moving_triangle_base: s.triangle_capacity,
+        }
+    }
+
+    /// Whether the static layer's build read back gathered more triangles than it had room for
+    /// (the buffers', or the hardware BLAS's): rebuild. (The moving layer, rebuilt every frame,
+    /// grows by itself.)
     pub fn overflowed(&self) -> bool {
         let s = self.stats();
-        s.triangles > s.triangle_capacity || s.references > s.reference_capacity || (self.query.is_some() && s.triangles > s.accel_triangles)
+        s.triangles > s.triangle_capacity || s.references > s.reference_capacity || (self.tlas_state.is_some() && s.triangles > s.accel_triangles)
     }
 
     /// Changes whenever the buffers `bind_group_entries` binds are made anew: bind groups made
@@ -763,10 +888,10 @@ impl RtGrid {
         self.generation
     }
 
-    /// Bytes on the GPU: the triangles, the cell words, the counters (with the wide triangles'
-    /// list) and the sources' parameters.
+    /// Bytes on the GPU: the triangles, the cell words, the layers' counters (with the wide
+    /// triangles' lists) and sources' parameters.
     pub fn memory_bytes(&self) -> u64 {
-        self.triangles.size() + self.cells.size() + self.counters.size() + self.sources.size() + self.query.as_ref().map_or(0, RtQuery::memory_bytes)
+        self.triangles.size() + self.cells.size() + self.layers.iter().map(|l| l.counters.size() + l.sources.size() + l.query.as_ref().map_or(0, RtQuery::memory_bytes)).sum::<u64>()
     }
 
     /// Place the box round `eye` (in steps of `snap_cells` cells, `below` of its height under the
@@ -785,12 +910,19 @@ impl RtGrid {
         moved
     }
 
+    /// Where layer `k`'s cell words start, and its macro cells, big list and references.
+    fn cells_layout_of(&self, k: usize) -> (u32, u32, u32, u32) {
+        let big = self.options.big_triangle_capacity;
+        let s = &self.layers[STATIC];
+        let base = if k == STATIC { 0 } else { s.head_words(big) + s.reference_capacity };
+        let l = &self.layers[k];
+        let macro_base = base + l.cell_capacity;
+        let big_base = macro_base + l.cell_capacity / (MACRO * MACRO * MACRO);
+        (base, macro_base, big_base, big_base + 1 + big)
+    }
+
     fn cells_layout(&self) -> (u32, u32, u32) {
-        let cells = self.options.cell_count();
-        let macro_cells = self.options.macro_dims().iter().product::<u32>();
-        let macro_base = cells;
-        let big_base = macro_base + macro_cells;
-        let refs_base = big_base + 1 + self.options.big_triangle_capacity;
+        let (_, macro_base, big_base, refs_base) = self.cells_layout_of(STATIC);
         (macro_base, big_base, refs_base)
     }
 
@@ -800,51 +932,92 @@ impl RtGrid {
         (limits.max_storage_buffer_binding_size as u64).min(limits.max_buffer_size)
     }
 
-    /// Make the buffers hold `triangles` and `references` (within what a binding holds); their
-    /// contents are lost.
-    fn resize(&mut self, device: &wgpu::Device, triangles: u32, references: u32) {
+    /// Give the layers room for `triangles` and `references` each (within what a binding holds).
+    /// With `encoder`, a layer whose region stays put keeps its contents (copied into the new
+    /// buffers: only the static layer's can, the moving layer's starting past it); without, or
+    /// when the static layer grows, the moving layer is emptied until its next build.
+    fn resize(&mut self, device: &wgpu::Device, mut encoder: Option<&mut wgpu::CommandEncoder>, triangles: [u32; 2], references: [u32; 2]) {
         let limit = Self::binding_limit(device);
-        let (_, _, refs_base) = self.cells_layout();
-        let triangles = (triangles as u64).min(limit / RT_TRIANGLE_BYTES) as u32;
+        let big = self.options.big_triangle_capacity;
+        let hardware = self.backend == RtBackend::Hardware;
+        // the static layer's region before, which a copy keeps
+        let (old_triangles, old_cells) = (self.layers[STATIC].triangle_capacity as u64 * RT_TRIANGLE_BYTES, self.cells_layout_of(MOVING).0 as u64 * 4);
+        let triangles = {
+            let static_max = (limit / RT_TRIANGLE_BYTES).saturating_sub(triangles[MOVING] as u64).max(64);
+            [(triangles[STATIC] as u64).min(static_max) as u32, (triangles[MOVING] as u64).min(limit / RT_TRIANGLE_BYTES - (triangles[STATIC] as u64).min(static_max)) as u32]
+        };
         // (the hardware backend lists no references: it keeps the 16-byte placeholder)
-        let references = if self.backend == RtBackend::Hardware { 0 } else { (references as u64).min(limit / 4 - refs_base as u64) as u32 };
-        if triangles != self.triangle_capacity {
-            self.triangle_capacity = triangles;
-            self.triangles = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("RtGrid/Triangles"),
-                size: triangles as u64 * RT_TRIANGLE_BYTES,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
-            });
-            // (every triangle may be wide)
-            self.counters = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("RtGrid/Counters"),
-                size: (COUNTER_WORDS + triangles as u64) * 4,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
-            });
+        let references = if hardware {
+            [0, 0]
+        } else {
+            let heads = (self.layers[STATIC].head_words(big) + self.layers[MOVING].head_words(big)) as u64;
+            let room = limit / 4 - heads;
+            let s = (references[STATIC] as u64).min(room - (references[MOVING] as u64).min(room / 2));
+            [s as u32, (references[MOVING] as u64).min(room - s) as u32]
+        };
+        let static_moves = triangles[STATIC] != self.layers[STATIC].triangle_capacity || (!hardware && references[STATIC] != self.layers[STATIC].reference_capacity);
+        let mut changed = false;
+        if triangles != [self.layers[STATIC].triangle_capacity, self.layers[MOVING].triangle_capacity] {
+            let old = std::mem::replace(
+                &mut self.triangles,
+                device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("RtGrid/Triangles"),
+                    size: (triangles[STATIC] as u64 + triangles[MOVING] as u64) * RT_TRIANGLE_BYTES,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }),
+            );
+            if let (Some(e), false, true) = (encoder.as_deref_mut(), static_moves, old_triangles > 0) {
+                e.copy_buffer_to_buffer(&old, 0, &self.triangles, 0, old_triangles);
+            }
+            for (layer, &n) in self.layers.iter_mut().zip(&triangles) {
+                if layer.triangle_capacity != n {
+                    layer.triangle_capacity = n;
+                    // (every triangle may be wide)
+                    layer.counters = device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("RtGrid/Counters"),
+                        size: (COUNTER_WORDS + n as u64) * 4,
+                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+                        mapped_at_creation: false,
+                    });
+                }
+            }
+            changed = true;
         }
-        if references != self.reference_capacity && references > 0 {
-            self.reference_capacity = references;
-            self.cells = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("RtGrid/Cells"),
-                size: (refs_base as u64 + references as u64) * 4,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
-            });
+        if !hardware && references != [self.layers[STATIC].reference_capacity, self.layers[MOVING].reference_capacity] {
+            self.layers[STATIC].reference_capacity = references[STATIC];
+            self.layers[MOVING].reference_capacity = references[MOVING];
+            let (moving_base, _, _, moving_refs) = self.cells_layout_of(MOVING);
+            let old = std::mem::replace(
+                &mut self.cells,
+                device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("RtGrid/Cells"),
+                    size: (moving_refs as u64 + references[MOVING] as u64) * 4,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                }),
+            );
+            if let (Some(e), false, true) = (encoder.as_deref_mut(), static_moves, old.size() > 16) {
+                e.copy_buffer_to_buffer(&old, 0, &self.cells, 0, old_cells.min(moving_base as u64 * 4));
+            }
+            changed = true;
         }
-        self.bind_groups = None;
+        if !changed {
+            return;
+        }
+        if static_moves || encoder.is_none() {
+            // the static layer's region moved the moving one's
+            self.layers[MOVING].dims = [0; 3];
+        }
+        for layer in &mut self.layers {
+            layer.bind_groups = None;
+            layer.written = None;
+        }
         self.generation += 1;
         *self.handle.shared.lock().unwrap() = GridBuffers {
-            bindings: RtGridBindings {
-                backend: self.backend,
-                uniform: self.uniform.clone(),
-                triangles: self.triangles.clone(),
-                cells: self.cells.clone(),
-                tlas: self.query.as_ref().map(|q| q.tlas().lock().unwrap().tlas().clone()),
-            },
+            bindings: RtGridBindings { backend: self.backend, uniform: self.layers[STATIC].uniform.clone(), triangles: self.triangles.clone(), cells: self.cells.clone(), tlas: self.tlas.clone() },
             generation: self.generation,
-            tlas: self.query.as_ref().map(RtQuery::tlas),
+            tlas: self.tlas_state.clone(),
         };
     }
 
@@ -853,120 +1026,196 @@ impl RtGrid {
         self.handle.clone()
     }
 
-    /// Room for `triangles` this build (call between `begin` and `gather`, when the sources know
-    /// how many they hold at most): no frame then loses triangles to a readback still in flight.
-    pub fn reserve_triangles(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, triangles: u32) {
-        if self.query.is_some() && self.gathered.is_some() && triangles > self.accel_slots {
+    /// Room for `triangles` in the layer being built (call between `begin` and `gather`, when the
+    /// sources know how many they hold at most): no frame then loses triangles to a readback still
+    /// in flight.
+    pub fn reserve_triangles(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, triangles: u32) {
+        let Some((k, _)) = self.building else { panic!("RtGrid::reserve_triangles between begin and gather") };
+        if self.layers[k].query.is_some() && triangles > self.layers[k].accel_slots {
             // the BLAS holds them all this build
-            self.accel_slots = triangles;
-            if triangles <= self.triangle_capacity {
-                self.prepare_query(device, queue);
+            self.layers[k].accel_slots = triangles;
+            if triangles <= self.layers[k].triangle_capacity {
+                self.prepare_query(device, queue, k);
             }
         }
-        if triangles > self.triangle_capacity {
-            self.resize(device, grow(triangles), self.reference_capacity);
-            self.ensure_bind_groups(device);
-            if self.gathered.is_some() {
-                self.write_uniform(queue);
-                self.prepare_query(device, queue);
-            }
+        if triangles > self.layers[k].triangle_capacity {
+            let mut want = [self.layers[STATIC].triangle_capacity, self.layers[MOVING].triangle_capacity];
+            want[k] = grow(triangles);
+            let refs = [self.layers[STATIC].reference_capacity, self.layers[MOVING].reference_capacity];
+            self.resize(device, Some(encoder), want, refs);
+            self.ensure_bind_groups(device, k);
+            self.write_uniforms(queue);
+            self.prepare_query(device, queue, k);
         }
     }
 
-    /// Ready the hardware backend's BLAS for this build.
-    fn prepare_query(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
-        if let Some(q) = self.query.as_mut() {
-            self.accel_slots = self.accel_slots.clamp(64.min(self.triangle_capacity), self.triangle_capacity);
-            // the filler under the box, a metre clear of it
-            let below = (self.origin - Vec3::Y).to_array();
-            q.prepare(device, queue, &self.triangles, &self.counters, self.accel_slots, self.split, self.fast_build, below);
+    /// Ready layer `k`'s hardware BLAS for this build.
+    fn prepare_query(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, k: usize) {
+        let base = if k == STATIC { 0 } else { self.layers[STATIC].triangle_capacity };
+        // the filler under the box, a metre clear of it
+        let below = (self.origin - Vec3::Y).to_array();
+        let (triangles, layer) = (&self.triangles, &mut self.layers[k]);
+        if let Some(q) = layer.query.as_mut() {
+            layer.accel_slots = layer.accel_slots.clamp(64.min(layer.triangle_capacity), layer.triangle_capacity);
+            q.prepare(device, queue, triangles, &layer.counters, base, layer.accel_slots, layer.split, layer.fast_build, below);
         }
     }
 
-    fn ensure_bind_groups(&mut self, device: &wgpu::Device) {
-        if self.bind_groups.is_some() {
+    fn ensure_bind_groups(&mut self, device: &wgpu::Device, k: usize) {
+        let (triangles, cells, layer) = (&self.triangles, &self.cells, &mut self.layers[k]);
+        if layer.bind_groups.is_some() {
             return;
         }
         let build = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("RtGrid/Build"),
             layout: &self.build_bgl,
-            entries: &[entry(0, &self.uniform), entry(1, &self.triangles), entry(2, &self.cells), entry(3, &self.counters)],
+            entries: &[entry(0, &layer.uniform), entry(1, triangles), entry(2, cells), entry(3, &layer.counters)],
         });
         let prepare = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("RtGrid/Prepare"),
             layout: &self.prepare_bgl,
-            entries: &[entry(0, &self.uniform), entry(3, &self.counters), entry(4, &self.dispatch)],
+            entries: &[entry(0, &layer.uniform), entry(3, &layer.counters), entry(4, &layer.dispatch)],
         });
         let gather = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("RtGrid/GatherGrid"),
             layout: &self.gather_grid_bgl,
-            entries: &[entry(0, &self.uniform), entry(1, &self.triangles), entry(2, &self.counters)],
+            entries: &[entry(0, &layer.uniform), entry(1, triangles), entry(2, &layer.counters)],
         });
-        self.bind_groups = Some((build, prepare, gather));
+        layer.bind_groups = Some((build, prepare, gather));
     }
 
-    /// Start a rebuild: take a finished readback (growing the buffers to what it needed), write
-    /// the box, and clear the triangles and the cells.
+    /// Start a rebuild of the static layer: take a finished readback (growing the buffers to what
+    /// it needed), write the box, and clear the layer's triangles and cells.
     pub fn begin(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder) {
-        assert!(self.gathered.is_none(), "RtGrid::begin twice without finish");
+        assert!(self.building.is_none(), "RtGrid::begin twice without finish");
         self.collect_readback(device);
-        let need_triangles = self.stats.triangles;
-        // (triangles that didn't fit listed nothing: their references in proportion)
-        let fitted = need_triangles.min(self.triangle_capacity).max(1);
-        let need_refs = (self.stats.references as u64 * need_triangles.max(1) as u64 / fitted as u64).min(u32::MAX as u64) as u32;
-        if need_triangles > self.triangle_capacity || need_refs > self.reference_capacity {
-            let triangles = if need_triangles > self.triangle_capacity { grow(need_triangles) } else { self.triangle_capacity };
-            let refs = if need_refs > self.reference_capacity { grow(need_refs) } else { self.reference_capacity };
-            self.resize(device, triangles, refs);
+        self.layers[STATIC].origin = self.origin;
+        self.begin_layer(device, queue, encoder, STATIC);
+    }
+
+    /// Start a rebuild of the moving layer, a grid of its own round `bounds` (within the static
+    /// layer's box; None: all of it) with cells as fine as the static layer's where
+    /// `RtGridOptions::moving_cells` allows: as `begin`, for the sources that move.
+    pub fn begin_moving(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, bounds: Option<(Vec3, Vec3)>) {
+        assert!(self.building.is_none(), "RtGrid::begin_moving twice without finish");
+        let (lo, hi) = self.bounds();
+        let eps = Vec3::splat(self.options.effective_epsilon());
+        let (a, b) = bounds.map_or((lo, hi), |(a, b)| ((a - eps).max(lo), (b + eps).min(hi)));
+        let (a, b) = if a.cmple(b).all() { (a, b) } else { (lo, lo + Vec3::splat(self.options.cell * MACRO as f32)) };
+        let capacity = self.layers[MOVING].cell_capacity;
+        let size = b - a;
+        let mut cell = self.options.cell.max(size.max_element() / (capacity as f32 / (MACRO * MACRO) as f32).max(1.0));
+        let dims = loop {
+            let dims = (size / cell).ceil().max(Vec3::ONE).to_array().map(|d| (d as u32).next_multiple_of(MACRO));
+            if dims.iter().map(|&d| d as u64).product::<u64>() <= capacity as u64 {
+                break dims;
+            }
+            cell *= 1.125;
+        };
+        let m = &mut self.layers[MOVING];
+        (m.origin, m.cell, m.dims) = (a, cell, dims);
+        m.fast_build = true;
+        self.begin_layer(device, queue, encoder, MOVING);
+    }
+
+    /// Empty the moving layer (nothing moves): traces test only the static one.
+    pub fn clear_moving(&mut self, queue: &wgpu::Queue) {
+        assert!(self.building.is_none(), "RtGrid::clear_moving while building");
+        let m = &mut self.layers[MOVING];
+        if m.cell_count() == 0 {
+            return;
         }
-        self.ensure_bind_groups(device);
-        self.write_uniform(queue);
-        if self.query.is_some() {
+        m.dims = [0; 3];
+        if let Some(q) = m.query.as_mut() {
+            q.remove();
+        }
+        self.write_uniforms(queue);
+    }
+
+    fn begin_layer(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, k: usize) {
+        let layer = &self.layers[k];
+        let need_triangles = layer.need[0];
+        // (triangles that didn't fit listed nothing: their references in proportion)
+        let fitted = need_triangles.min(layer.triangle_capacity).max(1);
+        let need_refs = (layer.need[1] as u64 * need_triangles.max(1) as u64 / fitted as u64).min(u32::MAX as u64) as u32;
+        if need_triangles > layer.triangle_capacity || need_refs > layer.reference_capacity {
+            let mut triangles = [self.layers[STATIC].triangle_capacity, self.layers[MOVING].triangle_capacity];
+            let mut refs = [self.layers[STATIC].reference_capacity, self.layers[MOVING].reference_capacity];
+            if need_triangles > triangles[k] {
+                triangles[k] = grow(need_triangles);
+            }
+            if need_refs > refs[k] {
+                refs[k] = grow(need_refs);
+            }
+            self.resize(device, Some(&mut *encoder), triangles, refs);
+        }
+        self.ensure_bind_groups(device, k);
+        self.write_uniforms(queue);
+        let taken = self.readback.taken;
+        let layer = &mut self.layers[k];
+        if layer.query.is_some() {
             // the BLAS from what the last readback gathered, with room to grow (grown past it, or
             // shrunk under half); the whole capacity before any readback. A BLAS's cost grows with
             // its triangles, and Metal's builds lost the real ones among many filler triangles.
-            let need = self.stats.triangles;
-            self.accel_slots = if self.readback.taken == 0 {
-                self.triangle_capacity
-            } else if need > self.accel_slots || need.saturating_mul(2) < self.accel_slots {
+            let need = layer.need[0];
+            layer.accel_slots = if taken == 0 {
+                layer.triangle_capacity
+            } else if need > layer.accel_slots || need.saturating_mul(2) < layer.accel_slots {
                 grow(need)
             } else {
-                self.accel_slots
+                layer.accel_slots
             };
         }
-        let (_, big_base, _) = self.cells_layout();
-        encoder.clear_buffer(&self.counters, 0, Some(16));
-        if self.query.is_none() {
+        let (base, _, big_base, _) = self.cells_layout_of(k);
+        encoder.clear_buffer(&self.layers[k].counters, 0, Some(16));
+        if self.layers[k].query.is_none() {
             // the cells' counts, the macro cells and the big list's count
-            encoder.clear_buffer(&self.cells, 0, Some((big_base as u64 + 1) * 4));
+            encoder.clear_buffer(&self.cells, base as u64 * 4, Some((big_base - base + 1) as u64 * 4));
         }
-        self.prepare_query(device, queue);
-        self.gathered = Some(false);
+        self.prepare_query(device, queue, k);
+        self.building = Some((k, false));
     }
 
-    /// Write the box and the buffers' layout, if they changed.
-    fn write_uniform(&mut self, queue: &wgpu::Queue) {
-        let (macro_base, big_base, refs_base) = self.cells_layout();
-        let o = self.options;
-        let gpu = RtGridGpu {
-            origin: self.origin.to_array(),
-            cell: o.cell,
-            dims: o.dims,
+    /// Layer `k` as the WGSL `KanseiRtLayer`.
+    fn layer_gpu(&self, k: usize) -> RtLayerGpu {
+        let (cells_base, macro_base, big_base, refs_base) = self.cells_layout_of(k);
+        let o = &self.options;
+        let l = &self.layers[k];
+        let dims = l.dims;
+        RtLayerGpu {
+            origin: l.origin.to_array(),
+            cell: l.cell,
+            dims,
             flags: o.macro_skip as u32,
-            macro_dims: o.macro_dims(),
+            macro_dims: dims.map(|d| d.div_ceil(MACRO)),
             epsilon: o.effective_epsilon(),
-            cell_count: o.cell_count(),
+            cell_count: l.cell_count(),
             macro_base,
             big_base,
             refs_base,
-            ref_capacity: self.reference_capacity,
-            triangle_capacity: self.triangle_capacity,
+            ref_capacity: l.reference_capacity,
+            triangle_capacity: l.triangle_capacity,
             big_capacity: o.big_triangle_capacity,
             big_cells: o.big_triangle_cells,
-        };
-        if self.written != Some(gpu) {
-            queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&gpu));
-            self.written = Some(gpu);
+            cells_base,
+            triangle_base: if k == STATIC { 0 } else { self.layers[STATIC].triangle_capacity },
+            pad: [0; 2],
+        }
+    }
+
+    /// Write the layers' uniforms, if they changed: the grid's (the static layer, then the moving
+    /// one) and the moving layer's build's (the moving layer, then the static one).
+    fn write_uniforms(&mut self, queue: &wgpu::Queue) {
+        let (s, m) = (self.layer_gpu(STATIC), self.layer_gpu(MOVING));
+        // (the moving layer's build keeps what the static layer's box would: its box rounds out to
+        // whole macro cells)
+        let clipped = RtLayerGpu { flags: m.flags | CLIP, ..m };
+        for (k, gpu) in [(STATIC, RtGridGpu { layer: s, moving: m }), (MOVING, RtGridGpu { layer: clipped, moving: s })] {
+            let layer = &mut self.layers[k];
+            if layer.written != Some(gpu) {
+                queue.write_buffer(&layer.uniform, 0, bytemuck::bytes_of(&gpu));
+                layer.written = Some(gpu);
+            }
         }
     }
 
@@ -992,8 +1241,8 @@ impl RtGrid {
         pipeline
     }
 
-    /// Append the triangles of `sources` that meet the box (once a build, between `begin` and
-    /// `finish`: their parameters go up in one write, which lands before the frame's work).
+    /// Append the triangles of `sources` that meet the layer's box (once a build, between `begin`
+    /// and `finish`: their parameters go up in one write, which lands before the frame's work).
     pub fn gather(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, sources: &[RtSource]) {
         let sources: Vec<GatherSource> = sources
             .iter()
@@ -1014,35 +1263,36 @@ impl RtGrid {
     /// `gather` for the crate's sources: each source's dispatch sized on the GPU from its count
     /// (`prepare`), then the gathers, dispatched indirectly.
     pub(crate) fn gather_sources(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, sources: &[GatherSource]) {
-        assert_eq!(self.gathered, Some(false), "RtGrid::gather once a build, between begin and finish");
-        self.gathered = Some(true);
+        let Some((k, false)) = self.building else { panic!("RtGrid::gather once a build, between begin and finish") };
+        self.building = Some((k, true));
         if sources.is_empty() {
             return;
         }
         // alpha-tested or glass triangles: the hardware BLAS's second, non-opaque geometry
-        self.split = sources.iter().any(|s| s.surface.alpha_layer.is_some() || s.surface.glass);
-        self.prepare_query(device, queue);
+        self.layers[k].split = sources.iter().any(|s| s.surface.alpha_layer.is_some() || s.surface.glass);
+        self.prepare_query(device, queue, k);
         let needed = sources.len() as u64 * SOURCE_STRIDE;
-        if self.sources.size() < needed {
-            self.sources = device.create_buffer(&wgpu::BufferDescriptor {
+        let layer = &mut self.layers[k];
+        if layer.sources.size() < needed {
+            layer.sources = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("RtGrid/Sources"),
                 size: needed.next_power_of_two(),
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            self.source_groups.clear();
+            layer.source_groups.clear();
         }
-        if self.gather_dispatch.size() < sources.len() as u64 * 16 {
-            self.gather_dispatch = device.create_buffer(&wgpu::BufferDescriptor {
+        if layer.gather_dispatch.size() < sources.len() as u64 * 16 {
+            layer.gather_dispatch = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("RtGrid/GatherDispatch"),
                 size: (sources.len() as u64 * 16).next_power_of_two(),
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT,
                 mapped_at_creation: false,
             });
-            self.gather_dispatch_group = None;
+            layer.gather_dispatch_group = None;
         }
         let mut bytes = vec![0u8; needed as usize];
-        for (k, s) in sources.iter().enumerate() {
+        for (slot, s) in sources.iter().enumerate() {
             let (triangles, kind) = match s.mesh {
                 GatherMesh::Mesh { triangles, .. } => (triangles, 0),
                 GatherMesh::Clusters { .. } => (0, 1),
@@ -1061,19 +1311,21 @@ impl RtGrid {
                 surface: s.surface.surface_word(),
                 albedo: s.surface.albedo_word(),
                 source: (s.id & 0xfff) << 20,
-                slot: k as u32,
+                slot: slot as u32,
                 kind,
                 albedo_record_word: s.surface.record_albedo.map_or(0, |w| w + 1),
                 emission_record_word: s.surface.record_emission.map_or(0, |w| w + 1),
             };
-            bytes[k * SOURCE_STRIDE as usize..][..std::mem::size_of::<RtSourceGpu>()].copy_from_slice(bytemuck::bytes_of(&gpu));
+            bytes[slot * SOURCE_STRIDE as usize..][..std::mem::size_of::<RtSourceGpu>()].copy_from_slice(bytemuck::bytes_of(&gpu));
         }
-        queue.write_buffer(&self.sources, 0, &bytes);
+        queue.write_buffer(&self.layers[k].sources, 0, &bytes);
         let pipelines: Vec<wgpu::ComputePipeline> = sources.iter().map(|s| self.gather_pipeline(device, &s.placement, matches!(s.mesh, GatherMesh::Clusters { .. }))).collect();
         let keys: Vec<SourceKey> = sources.iter().map(source_key).collect();
+        self.ensure_bind_groups(device, k);
+        let (bgl, empty, layer) = (&self.gather_source_bgl, &self.empty, &mut self.layers[k]);
         for (s, key) in sources.iter().zip(&keys) {
-            let (bgl, uniform, empty) = (&self.gather_source_bgl, &self.sources, &self.empty);
-            self.source_groups.entry(key.clone()).or_insert_with(|| {
+            let uniform = &layer.sources;
+            layer.source_groups.entry(key.clone()).or_insert_with(|| {
                 let size = std::num::NonZeroU64::new(std::mem::size_of::<RtSourceGpu>() as u64);
                 let (mesh, draws) = match s.mesh {
                     GatherMesh::Mesh { buffer, .. } => (buffer, empty),
@@ -1096,59 +1348,59 @@ impl RtGrid {
                 })
             });
         }
-        if self.gather_dispatch_group.is_none() {
-            self.gather_dispatch_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+        if layer.gather_dispatch_group.is_none() {
+            layer.gather_dispatch_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("RtGrid/GatherPrepare"),
                 layout: &self.gather_prepare_bgl,
-                entries: &[entry(5, &self.gather_dispatch)],
+                entries: &[entry(5, &layer.gather_dispatch)],
             }));
         }
-        self.ensure_bind_groups(device);
-        let gather = &self.bind_groups.as_ref().unwrap().2;
-        let mut pass = timed_pass(encoder, "Rt/Gather");
+        let gather = &layer.bind_groups.as_ref().unwrap().2;
+        let mut pass = timed_pass(encoder, if k == STATIC { "Rt/Gather" } else { "Rt/GatherMoving" });
         pass.set_pipeline(&self.gather_prepare);
-        pass.set_bind_group(0, self.gather_dispatch_group.as_ref().unwrap(), &[]);
-        for (k, key) in keys.iter().enumerate() {
-            pass.set_bind_group(1, &self.source_groups[key], &[(k as u64 * SOURCE_STRIDE) as u32]);
+        pass.set_bind_group(0, layer.gather_dispatch_group.as_ref().unwrap(), &[]);
+        for (slot, key) in keys.iter().enumerate() {
+            pass.set_bind_group(1, &layer.source_groups[key], &[(slot as u64 * SOURCE_STRIDE) as u32]);
             pass.dispatch_workgroups(1, 1, 1);
         }
         pass.set_bind_group(0, gather, &[]);
-        for (k, (key, pipeline)) in keys.iter().zip(&pipelines).enumerate() {
+        for (slot, (key, pipeline)) in keys.iter().zip(&pipelines).enumerate() {
             pass.set_pipeline(pipeline);
-            pass.set_bind_group(1, &self.source_groups[key], &[(k as u64 * SOURCE_STRIDE) as u32]);
-            pass.dispatch_workgroups_indirect(&self.gather_dispatch, k as u64 * 16);
+            pass.set_bind_group(1, &layer.source_groups[key], &[(slot as u64 * SOURCE_STRIDE) as u32]);
+            pass.dispatch_workgroups_indirect(&layer.gather_dispatch, slot as u64 * 16);
         }
     }
 
-    /// Build the cells from the gathered triangles: count (and the big list), scan, fill.
+    /// Build the layer's cells from the gathered triangles: count (and the big list), scan, fill.
     pub fn finish(&mut self, encoder: &mut wgpu::CommandEncoder) {
-        assert!(self.gathered.is_some(), "RtGrid::finish without begin");
-        self.gathered = None;
-        self.stats.builds += 1;
-        if let Some(q) = self.query.as_mut() {
-            // the BLAS; its TLAS after the submit (`read_back`)
+        let Some((k, _)) = self.building.take() else { panic!("RtGrid::finish without begin") };
+        let layer = &mut self.layers[k];
+        layer.builds += 1;
+        if let Some(q) = layer.query.as_mut() {
+            // the BLAS; the TLAS after the submit (`read_back`)
             q.record_blas(encoder);
             return;
         }
-        let (build, prepare, _) = self.bind_groups.as_ref().expect("begin first");
+        let labels = if k == STATIC { ["Rt/GridCount", "Rt/GridScan", "Rt/GridFill"] } else { ["Rt/MovingCount", "Rt/MovingScan", "Rt/MovingFill"] };
+        let (build, prepare, _) = layer.bind_groups.as_ref().expect("begin first");
         {
-            let mut p = timed_pass(encoder, "Rt/GridCount");
+            let mut p = timed_pass(encoder, labels[0]);
             p.set_pipeline(&self.prepare);
             p.set_bind_group(0, prepare, &[]);
             p.dispatch_workgroups(1, 1, 1);
             p.set_pipeline(&self.count);
             p.set_bind_group(0, build, &[]);
-            p.dispatch_workgroups_indirect(&self.dispatch, 0);
+            p.dispatch_workgroups_indirect(&layer.dispatch, 0);
             p.set_pipeline(&self.prepare_wide);
             p.set_bind_group(0, prepare, &[]);
             p.dispatch_workgroups(1, 1, 1);
             p.set_pipeline(&self.count_wide);
             p.set_bind_group(0, build, &[]);
-            p.dispatch_workgroups_indirect(&self.dispatch, 16);
+            p.dispatch_workgroups_indirect(&layer.dispatch, 16);
         }
         {
-            let cells = self.options.cell_count();
-            let mut p = timed_pass(encoder, "Rt/GridScan");
+            let cells = layer.cell_count();
+            let mut p = timed_pass(encoder, labels[1]);
             p.set_bind_group(0, build, &[]);
             p.set_pipeline(&self.scan_blocks);
             p.dispatch_workgroups(cells.div_ceil(1024), 1, 1);
@@ -1158,37 +1410,42 @@ impl RtGrid {
             p.dispatch_workgroups(cells.div_ceil(256), 1, 1);
         }
         {
-            let mut p = timed_pass(encoder, "Rt/GridFill");
+            let mut p = timed_pass(encoder, labels[2]);
             p.set_pipeline(&self.fill);
             p.set_bind_group(0, build, &[]);
-            p.dispatch_workgroups_indirect(&self.dispatch, 0);
+            p.dispatch_workgroups_indirect(&layer.dispatch, 0);
             p.set_pipeline(&self.fill_wide);
-            p.dispatch_workgroups_indirect(&self.dispatch, 16);
+            p.dispatch_workgroups_indirect(&layer.dispatch, 16);
         }
     }
 
-    /// After the submit of a build: read back what it needed (the gathered triangles, the
+    /// After the submit of a build: read back what each layer needed (the gathered triangles, the
     /// references, the big triangles), unless a readback is still in flight (`begin` takes it).
-    /// With the hardware backend, the TLAS is then to be built over the new BLAS before the next
-    /// trace (`prepare_trace`).
+    /// With the hardware backend, the TLAS is then to be built over the new BLASes before the
+    /// next trace (`prepare_trace`).
     pub fn read_back(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
-        if let Some(q) = self.query.as_mut() {
-            q.submitted(device, queue);
+        for layer in &mut self.layers {
+            if let Some(q) = layer.query.as_mut() {
+                q.submitted(device, queue);
+            }
         }
         if self.readback.pending.is_some() {
             return;
         }
-        let (_, big_base, _) = self.cells_layout();
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("RtGrid/Readback") });
-        if self.query.is_some() {
-            // no cells: the counters' wide triangles (none) for the big ones
-            encoder.copy_buffer_to_buffer(&self.counters, 0, &self.readback.staging, 0, 12);
-        } else {
-            encoder.copy_buffer_to_buffer(&self.counters, 0, &self.readback.staging, 0, 8);
-            encoder.copy_buffer_to_buffer(&self.cells, big_base as u64 * 4, &self.readback.staging, 8, 4);
+        for k in [STATIC, MOVING] {
+            let at = k as u64 * 12;
+            if self.tlas_state.is_some() {
+                // no cells: the counters' wide triangles (none) for the big ones
+                encoder.copy_buffer_to_buffer(&self.layers[k].counters, 0, &self.readback.staging, at, 12);
+            } else {
+                let (_, _, big_base, _) = self.cells_layout_of(k);
+                encoder.copy_buffer_to_buffer(&self.layers[k].counters, 0, &self.readback.staging, at, 8);
+                encoder.copy_buffer_to_buffer(&self.cells, big_base as u64 * 4, &self.readback.staging, at + 8, 4);
+            }
         }
         queue.submit(Some(encoder.finish()));
-        self.readback.accel_triangles = self.accel_slots;
+        self.readback.accel_triangles = self.layers.each_ref().map(|l| l.accel_slots);
         let state = Arc::new(AtomicU8::new(MAPPING));
         let done = state.clone();
         self.readback.staging.slice(..).map_async(wgpu::MapMode::Read, move |r| done.store(if r.is_ok() { MAPPED } else { FAILED }, Ordering::Release));
@@ -1215,11 +1472,11 @@ impl RtGrid {
         {
             let bytes = self.readback.staging.slice(..).get_mapped_range().unwrap();
             let words: &[u32] = bytemuck::cast_slice(&bytes);
-            self.stats.triangles = words[0];
-            self.stats.references = words[1];
-            self.stats.big_triangles = words[2];
+            for (k, layer) in self.layers.iter_mut().enumerate() {
+                layer.need = [words[k * 3], words[k * 3 + 1], words[k * 3 + 2]];
+                layer.accel_read = self.readback.accel_triangles[k];
+            }
         }
-        self.stats.accel_triangles = self.readback.accel_triangles;
         self.readback.taken += 1;
         self.readback.staging.unmap();
     }
@@ -1255,7 +1512,7 @@ impl RtGrid {
     }
 
     /// Ready the grid for tracing after a rebuild's submit and `read_back`, before the passes that
-    /// trace it: the hardware backend builds its TLAS over the new BLAS (on Metal once the BLAS's
+    /// trace it: the hardware backend builds its TLAS over the new BLASes (on Metal once the BLAS's
     /// submit has finished, which the CPU waits for: gfx-rs/wgpu#9215). Nothing in software.
     pub fn prepare_trace(&self, device: &wgpu::Device, queue: &wgpu::Queue) {
         self.handle.prepare_trace(device, queue);
@@ -1268,13 +1525,14 @@ impl RtGrid {
             None => self.cells.as_entire_binding(),
         };
         [
-            wgpu::BindGroupEntry { binding: first, resource: self.uniform.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: first, resource: self.layers[STATIC].uniform.as_entire_binding() },
             wgpu::BindGroupEntry { binding: first + 1, resource: self.triangles.as_entire_binding() },
             wgpu::BindGroupEntry { binding: first + 2, resource: third },
         ]
     }
 
-    /// The world triangles (64 bytes each, rt_types.wgsl), for tests and debugging.
+    /// The world triangles (64 bytes each, rt_types.wgsl: the static layer's from 0, the moving
+    /// layer's from `RtGridStats::moving_triangle_base`), for tests and debugging.
     pub fn triangles_buffer(&self) -> &wgpu::Buffer {
         &self.triangles
     }
@@ -1284,7 +1542,7 @@ impl RtGrid {
         &self.cells
     }
 
-    /// Where the macro cells, the big list and the references start in the cell words.
+    /// Where the static layer's macro cells, big list and references start in the cell words.
     pub fn cells_layout_words(&self) -> (u32, u32, u32) {
         self.cells_layout()
     }
