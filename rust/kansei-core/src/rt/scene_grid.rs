@@ -74,7 +74,8 @@ const SETTLE_FRAMES: u32 = 30;
 /// skinned proxy posed on the CPU, or whose `Renderable::rt_mesh` the GPU rewrote; a renderable
 /// turning `dynamic` or back), when a cut it gathered grew, and on `invalidate`. The `dynamic` ones
 /// go into its moving layer (`RtGrid::begin_moving`), fitted round their world boxes and rebuilt
-/// every frame, so what moves costs a frame its own triangles, not the scene's. The hardware
+/// every frame, so what moves costs a frame its own triangles, not the scene's (`set_moving_layer`
+/// turns that off: the dynamic ones then rebuild the static layer every frame). The hardware
 /// backend (`RtGridOptions::backend`) builds the static BLAS fast while the box moves, and once
 /// more to trace fast when it has rested `SETTLE_FRAMES` frames; the moving BLAS always fast.
 pub struct SceneRtGrid {
@@ -92,6 +93,8 @@ pub struct SceneRtGrid {
     warned: HashSet<usize>,
     /// frames since a hardware BLAS was built fast, while it stands (None: built to trace fast)
     fast_built: Option<u32>,
+    /// the dynamic renderables go into the moving layer (else into the static one)
+    moving_layer: bool,
 }
 
 impl SceneRtGrid {
@@ -108,6 +111,7 @@ impl SceneRtGrid {
             stats: SceneRtGridStats::default(),
             warned: HashSet::new(),
             fast_built: None,
+            moving_layer: true,
         }
     }
 
@@ -118,6 +122,20 @@ impl SceneRtGrid {
     /// Rebuild every frame or only when needed (see `SceneRtGridOptions::rebuild_every_frame`).
     pub fn set_rebuild_every_frame(&mut self, on: bool) {
         self.options.rebuild_every_frame = on;
+    }
+
+    /// Whether the dynamic renderables go into the grid's moving layer (the default), or, off,
+    /// into its static layer with the rest, which they then rebuild every frame while one is in
+    /// it (the grid before it had layers: for comparisons).
+    pub fn set_moving_layer(&mut self, on: bool) {
+        if on != self.moving_layer {
+            self.moving_layer = on;
+            self.force = true;
+        }
+    }
+
+    pub fn moving_layer(&self) -> bool {
+        self.moving_layer
     }
 
     /// The grid, for the passes that trace it.
@@ -155,10 +173,11 @@ impl SceneRtGrid {
         let changed = self.key.as_ref() != Some(&key);
         self.key = Some(key);
         let overflowed = self.grid.overflowed();
-        let moving = moved || self.options.rebuild_every_frame;
+        // (without the moving layer, a dynamic renderable rebuilds the static layer every frame)
+        let moving = moved || self.options.rebuild_every_frame || (any_dynamic && !self.moving_layer);
         self.rebuild = moving || changed || overflowed || std::mem::take(&mut self.force);
-        self.moving = any_dynamic;
-        self.clear_moving = !any_dynamic && self.grid.stats().moving_cells > 0;
+        self.moving = any_dynamic && self.moving_layer;
+        self.clear_moving = !self.moving && self.grid.stats().moving_cells > 0;
         if self.grid.backend() == super::RtBackend::Hardware {
             // a BLAS built fast while moving, rebuilt once to trace fast when it has rested
             let settle = self.fast_built.is_some_and(|f| f >= SETTLE_FRAMES);
@@ -238,7 +257,7 @@ impl SceneRtGrid {
             if r.rt.is_none() || !r.visible || !r.geometry.initialized {
                 continue;
             }
-            let dynamic = r.dynamic;
+            let dynamic = r.dynamic && self.moving_layer;
             if !(if dynamic { self.moving } else { self.rebuild }) {
                 continue;
             }
