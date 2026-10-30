@@ -51,7 +51,7 @@ fn shUpsample(px: vec2u, z: f32, n: vec3f) -> array<f32, 8> {
     return array<f32, 8>(a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w);
 }
 
-fn shGgx(n: vec3f, v: vec3f, l: vec3f, roughness: f32, f0: f32) -> f32 {
+fn shGgx(n: vec3f, v: vec3f, l: vec3f, roughness: f32, f0: f32, f90: f32) -> f32 {
     let h = normalize(v + l);
     let nl = max(dot(n, l), 0.0);
     let nv = max(dot(n, v), 1e-4);
@@ -62,7 +62,7 @@ fn shGgx(n: vec3f, v: vec3f, l: vec3f, roughness: f32, f0: f32) -> f32 {
     let dd = nh * nh * (a2 - 1.0) + 1.0;
     let d = a2 / (RT_SHADOW_PI * dd * dd);
     let vis = 0.5 / (nl * sqrt(nv * nv * (1.0 - a2) + a2) + nv * sqrt(nl * nl * (1.0 - a2) + a2));
-    let fr = f0 + (1.0 - f0) * pow(1.0 - vh, 5.0);
+    let fr = f0 + (f90 - f0) * pow(1.0 - vh, 5.0);
     return d * vis * fr * nl;
 }
 
@@ -113,6 +113,9 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     // reflective surfaces (their F0 in the normal's alpha) take their specular from the traced
     // reflections
     let reflective = rawN.w < 0.999;
+    // the others' specular factor, 2 - specular (GBUFFER_OUT_WGSL's kansei_gbuffer_with_specular):
+    // a dielectric's Fresnel, F0 0.04 and 1 at grazing angles, scaled by it
+    let specular = clamp(2.0 - rawN.w, 0.0, 1.0);
     let z = -shViewPos(uv, depth).z;
     let vis = shUpsample(px, z, n);
     let r = reflect(-v, n);
@@ -129,7 +132,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
             if (light.kind == 1u) {
                 l = normalize(shRepresentative(light, p, r));
             }
-            brdf += vec3f(shGgx(n, v, l, roughness, 0.04));
+            brdf += vec3f(shGgx(n, v, l, roughness, 0.04 * specular, specular));
         }
         direct += brdf * inc.illuminance * vis[k];
     }

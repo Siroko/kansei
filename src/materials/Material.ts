@@ -180,7 +180,7 @@ class Material {
     }
 
     /**
-     * Change a `standardLit` material's surface (colour, roughness, metallic, emission, sky,
+     * Change a `standardLit` material's surface (colour, roughness, metallic, specular, emission, sky,
      * traced) to `options`'; its instancing and velocity stay as it was made. Rust:
      * `Material::set_standard_lit`.
      */

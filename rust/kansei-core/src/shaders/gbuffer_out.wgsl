@@ -3,7 +3,7 @@
 // world normal and the albedo, which screen-space and voxel GI read. Prepend
 // `materials::GBUFFER_OUT_WGSL` and return `kansei_gbuffer_out(..)` from the fragment shader
 // (`kansei_gbuffer_out_specular(..)` for one that reflects, `kansei_gbuffer_out_glass(..)` for
-// glass).
+// glass; `kansei_gbuffer_with_specular(..)` round the first for a specular factor under 1).
 
 struct KanseiGBufferOut {
     @location(0) color    : vec4f,   // shaded radiance (HDR)
@@ -26,11 +26,27 @@ fn kansei_gbuffer_out(color: vec3f, emissive: vec3f, N: vec3f, albedo: vec3f) ->
 // reflections of the surfaces that call this): its reflectance at normal incidence `f0` (0.02 for
 // water, 0.04 for most dielectrics) is kept in the normal target's alpha as 1 - f0, and its
 // `roughness` (0 a mirror, 1 matte) in the albedo's as 1 - roughness / 2. Both alphas are 1
-// otherwise (no reflection), and both average sensibly where MSAA resolves an edge.
+// otherwise (no reflection), and both average sensibly where MSAA resolves an edge. An `f0` of 0
+// reflects nothing: the surface is written as a matte one (`kansei_gbuffer_with_specular` at 0).
 fn kansei_gbuffer_out_specular(color: vec3f, emissive: vec3f, N: vec3f, albedo: vec3f, f0: f32, roughness: f32) -> KanseiGBufferOut {
     var out = kansei_gbuffer_out(color, emissive, N, albedo);
-    out.normal.w = 1.0 - clamp(f0, 0.0, 1.0);
+    out.normal.w = select(1.0 - clamp(f0, 0.0, 1.0), 2.0, f0 <= 0.0);
     out.albedo.a = 1.0 - 0.5 * clamp(roughness, 0.0, 1.0);
+    return out;
+}
+
+// A surface's specular factor (glTF's KHR_materials_specular `specularFactor`): 1, the default,
+// keeps the dielectric's Fresnel (F0 0.04, rising to 1 at grazing angles); 0 removes it, a matte
+// surface with no highlight or sheen at any angle. The passes that light a surface from the
+// GBuffer (rt::RtShadowsEffect's GGX) scale its Fresnel by it. It goes in the normal target's
+// alpha as 2 - specular, over the 1 a surface the reflections don't trace leaves there, so 1 is
+// today's surface; a reflective surface carries it in its F0 instead (scale the `f0` passed to
+// `kansei_gbuffer_out_specular` by it), and glass keeps its own.
+fn kansei_gbuffer_with_specular(gbuffer: KanseiGBufferOut, specular: f32) -> KanseiGBufferOut {
+    var out = gbuffer;
+    if (out.normal.w >= 0.999 && out.albedo.a >= 0.475) {
+        out.normal.w = 2.0 - clamp(specular, 0.0, 1.0);
+    }
     return out;
 }
 

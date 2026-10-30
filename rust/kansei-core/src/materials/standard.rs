@@ -74,6 +74,15 @@ pub struct StandardLitOptions {
     pub roughness: f32,
     /// 0 (dielectric) to 1 (metal).
     pub metallic: f32,
+    /// The specular factor, 0 to 1 (glTF's `KHR_materials_specular` `specularFactor`; the
+    /// loader's `GLTFMaterialInfo::specular`): it scales a dielectric's Fresnel, its F0 of 0.04 and
+    /// its rise to 1 at grazing angles alike, so 1 (the default) is the usual dielectric and 0 is
+    /// matte, Lambert alone with no highlight or sheen at any angle (unfinished wood, chalk,
+    /// cloth). A metal's Fresnel is its own. The forward lights and the environment's specular
+    /// take it, and so does `rt::RtShadowsEffect` from the GBuffer (the normal target's alpha,
+    /// `kansei_gbuffer_with_specular`); a reflective (`traced`) surface's F0 for the traced
+    /// reflections is scaled by it, and at 0 it isn't traced.
+    pub specular: f32,
     /// Radiance the surface emits (cd/m²), also written to the GBuffer's emissive target.
     pub emissive: [f32; 3],
     /// Sky radiance from straight up (cd/m²): a hemisphere of ambient light, reflected by the
@@ -96,6 +105,7 @@ impl Default for StandardLitOptions {
             base_color: [0.5, 0.5, 0.5],
             roughness: 0.6,
             metallic: 0.0,
+            specular: 1.0,
             emissive: [0.0; 3],
             sky_up: [0.0; 3],
             sky_down: [0.0; 3],
@@ -125,6 +135,11 @@ impl StandardLitOptions {
         Self { base_color: tint, roughness, traced: StandardTraced::Glass { ior }, ..Default::default() }
     }
 
+    /// A matte surface of this albedo and roughness (`specular` 0): Lambert alone.
+    pub fn matte(color: [f32; 3], roughness: f32) -> Self {
+        Self { base_color: color, roughness, specular: 0.0, ..Default::default() }
+    }
+
     /// The material's group 0 uniform, as `KanseiStandardSurface` lays it out.
     fn uniform(&self) -> [f32; 20] {
         let [r, g, b] = self.base_color;
@@ -137,7 +152,7 @@ impl StandardLitOptions {
             StandardTraced::Glass { ior } => (2.0, ior.max(1.0)),
         };
         [
-            r, g, b, 1.0,
+            r, g, b, self.specular.clamp(0.0, 1.0),
             er, eg, eb, 0.0,
             ur, ug, ub, 0.0,
             dr, dg, db, 0.0,
@@ -180,7 +195,7 @@ impl StandardLitOptions {
                 "KANSEI_AMBIENT",
                 match ambient {
                     StandardAmbient::Hemisphere => "",
-                    StandardAmbient::Environment { .. } => "radiance += kansei_environment_ambient(N, V, base, roughness, metallic, kansei_surface.params.z);",
+                    StandardAmbient::Environment { .. } => "radiance += kansei_environment_ambient(N, V, base, roughness, metallic, kansei_surface.params.z, specular);",
                 },
             );
         let motion = if velocity { crate::cameras::MOTION_VECTORS_WGSL } else { "" };
@@ -250,8 +265,8 @@ impl Material {
         material
     }
 
-    /// Change a `standard_lit` material's surface (colour, roughness, metallic, emission, sky,
-    /// traced) to `options`'; its instancing and velocity stay as it was made.
+    /// Change a `standard_lit` material's surface (colour, roughness, metallic, specular, emission,
+    /// sky, traced) to `options`'; its instancing and velocity stay as it was made.
     pub fn set_standard_lit(&mut self, renderer: &crate::renderers::Renderer, options: &StandardLitOptions) {
         match self.bindable_buffer(0) {
             // drawn already: its uniform written in place (the scene's bundles keep its bind group)
@@ -362,6 +377,33 @@ mod tests {
         validate(
             "gbuffer out glass",
             &format!("{GBUFFER_OUT_WGSL}\n@fragment fn f() -> KanseiGBufferOut {{ return kansei_gbuffer_out_glass(vec3f(0.0, 1.0, 0.0), vec3f(0.9), 1.5, 0.2); }}"),
+        );
+    }
+
+    #[test]
+    fn the_specular_factor_rides_in_the_base_colours_alpha() {
+        // the default writes the 1 the uniform held there before the factor (the TS packer's too)
+        assert_eq!(StandardLitOptions::default().uniform()[3], 1.0);
+        assert_eq!(StandardLitOptions::mirror([0.95; 3], 0.2).uniform()[3], 1.0);
+        assert_eq!(StandardLitOptions::matte([0.5; 3], 0.7).uniform()[..4], [0.5, 0.5, 0.5, 0.0]);
+        assert_eq!(StandardLitOptions { specular: 0.25, ..Default::default() }.uniform()[3], 0.25);
+        // clamped to 0..1: over 1 would read as a reflective surface's F0 in the GBuffer
+        assert_eq!(StandardLitOptions { specular: 3.0, ..Default::default() }.uniform()[3], 1.0);
+        assert_eq!(StandardLitOptions { specular: -1.0, ..Default::default() }.uniform()[3], 0.0);
+        validate(
+            "gbuffer with specular",
+            &format!(
+                "{GBUFFER_OUT_WGSL}\n@fragment fn f() -> KanseiGBufferOut {{ return kansei_gbuffer_with_specular(kansei_gbuffer_out(vec3f(1.0), vec3f(0.0), vec3f(0.0, 1.0, 0.0), vec3f(0.5)), 0.0); }}"
+            ),
+        );
+        validate(
+            "brdf with specular",
+            &format!(
+                "{}\n{}\n{}\n@fragment fn f(@builtin(position) p: vec4f) -> @location(0) vec4f {{ let n = vec3f(0.0, 1.0, 0.0); return vec4f(kansei_brdf_specular(n, n, n, vec3f(0.5), 0.5, 0.0, 0.0) + kansei_spot_lights_radiance_specular(p.xyz, n, n, vec3f(0.5), 0.5, 0.0, 0.0, p.xy), 1.0); }}",
+                crate::lights::LIGHTS_WGSL,
+                crate::shadows::SHADOW_MAP_WGSL,
+                crate::lights::SPOT_LIGHTS_WGSL
+            ),
         );
     }
 

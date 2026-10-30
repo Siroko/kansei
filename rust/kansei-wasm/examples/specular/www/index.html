@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Kansei — Specular factor</title>
+    <style>
+        body { margin: 0; background: #000; overflow: hidden; }
+        canvas { width: 100vw; height: 100vh; display: block; touch-action: none; }
+        .labels { position: fixed; top: 12px; left: 0; right: 0; display: flex; justify-content: space-around; pointer-events: none;
+                  font: 14px/1.3 system-ui, sans-serif; color: #ddd; text-shadow: 0 1px 2px #000; }
+    </style>
+</head>
+<body>
+    <canvas id="kansei"></canvas>
+    <div class="labels"><span>specular 1 (default)</span><span id="matte">specular 0 (matte)</span></div>
+    <script type="module">
+        import init, { start } from '../pkg/kansei_wasm_specular.js';
+        const matte = new URLSearchParams(location.search).get('matte');
+        if (matte !== null) document.getElementById('matte').textContent = `specular ${matte}`;
+        await init();
+        await start('kansei');
+    </script>
+</body>
+</html>
