@@ -6,7 +6,8 @@
 //
 //     kansei_spot_lights_radiance(worldPos, N, V, baseColor, roughness, metallic, fragCoord.xy)
 //
-// for the light all spots reflect toward the viewer (cd/m², in the same units as the lights),
+// for the light all spots reflect toward the viewer (cd/m², in the same units as the lights)
+// (`kansei_spot_lights_radiance_specular` with a specular factor, as kansei_brdf_specular takes),
 // or loop over the fragment's lights yourself: kansei_light_cluster, kansei_cluster_light_count
 // and kansei_cluster_light give the indices into kansei_spot_lights.lights, and
 // kansei_spot_sample/kansei_spot_shadow evaluate one.
@@ -112,6 +113,13 @@ fn kansei_spot_shadow(light: KanseiSpotLight, worldPos: vec3f, worldNormal: vec3
 
 // GGX specular (height-correlated Smith) + Lambert diffuse, times N·L.
 fn kansei_brdf(N: vec3f, V: vec3f, L: vec3f, baseColor: vec3f, roughness: f32, metallic: f32) -> vec3f {
+    return kansei_brdf_specular(N, V, L, baseColor, roughness, metallic, 1.0);
+}
+
+// kansei_brdf with a specular factor (glTF's KHR_materials_specular `specularFactor`, 0 to 1): it
+// scales a dielectric's Fresnel, its F0 of 0.04 and its 1 at grazing angles alike, so 0 is a
+// matte surface (Lambert alone) and 1 is kansei_brdf. A metal's Fresnel is its own.
+fn kansei_brdf_specular(N: vec3f, V: vec3f, L: vec3f, baseColor: vec3f, roughness: f32, metallic: f32, specular: f32) -> vec3f {
     let NdotL = saturate(dot(N, L));
     if (NdotL <= 0.0) { return vec3f(0.0); }
     let H = normalize(V + L);
@@ -123,8 +131,9 @@ fn kansei_brdf(N: vec3f, V: vec3f, L: vec3f, baseColor: vec3f, roughness: f32, m
     let dd = NdotH * NdotH * (a2 - 1.0) + 1.0;
     let D = a2 / (KANSEI_PI * dd * dd);
     let vis = 0.5 / (NdotL * sqrt(NdotV * NdotV * (1.0 - a2) + a2) + NdotV * sqrt(NdotL * NdotL * (1.0 - a2) + a2));
-    let F0 = mix(vec3f(0.04), baseColor, metallic);
-    let F = F0 + (1.0 - F0) * pow(1.0 - VdotH, 5.0);
+    let F0 = mix(vec3f(0.04 * specular), baseColor, metallic);
+    let F90 = 1.0 - (1.0 - specular) * (1.0 - metallic);
+    let F = F0 + (F90 - F0) * pow(1.0 - VdotH, 5.0);
     let diffuse = (1.0 - metallic) * (1.0 - F) * baseColor / KANSEI_PI;
     return (diffuse + D * vis * F) * NdotL;
 }
@@ -132,6 +141,12 @@ fn kansei_brdf(N: vec3f, V: vec3f, L: vec3f, baseColor: vec3f, roughness: f32, m
 // Light reflected toward the viewer from every spot light, with shadows.
 fn kansei_spot_lights_radiance(worldPos: vec3f, N: vec3f, V: vec3f, baseColor: vec3f, roughness: f32,
                                metallic: f32, pixel: vec2f) -> vec3f {
+    return kansei_spot_lights_radiance_specular(worldPos, N, V, baseColor, roughness, metallic, 1.0, pixel);
+}
+
+// kansei_spot_lights_radiance with a specular factor (kansei_brdf_specular's).
+fn kansei_spot_lights_radiance_specular(worldPos: vec3f, N: vec3f, V: vec3f, baseColor: vec3f, roughness: f32,
+                                        metallic: f32, specular: f32, pixel: vec2f) -> vec3f {
     var radiance = vec3f(0.0);
     // only the lights of this fragment's cluster (every light in views without clusters)
     let cluster = kansei_light_cluster(worldPos, pixel);
@@ -140,7 +155,7 @@ fn kansei_spot_lights_radiance(worldPos: vec3f, N: vec3f, V: vec3f, baseColor: v
         let light = kansei_spot_lights.lights[kansei_cluster_light(cluster, k)];
         let s = kansei_spot_sample(light, worldPos);
         if (max(s.illuminance.r, max(s.illuminance.g, s.illuminance.b)) <= 0.0) { continue; }
-        let brdf = kansei_brdf(N, V, s.toLight, baseColor, roughness, metallic);
+        let brdf = kansei_brdf_specular(N, V, s.toLight, baseColor, roughness, metallic, specular);
         if (max(brdf.r, max(brdf.g, brdf.b)) <= 0.0) { continue; }
         radiance += brdf * s.illuminance * kansei_spot_shadow(light, worldPos, N, pixel);
     }

@@ -239,6 +239,14 @@
               <a class="run-rust" href="/examples/spot-lights/" data-rust title="Rust / WASM">WASM</a>
             </span>
           </li>
+          <li hidden>
+            <span class="demo-name">Specular factor</span>
+            <span class="demo-desc">The same wooden pieces twice under a low sun: the stock material's default specular on the left, a specular factor of 0 (glTF's KHR_materials_specular) on the right, matte with no highlight or sheen at any angle</span>
+            <span class="run">
+              <a class="run-rust" href="/examples/specular/" data-rust title="Rust / WASM">WASM</a>
+              <a class="run-rust run-variant" href="/examples/specular/?lighting=rt" data-rust title="Lit by RtShadowsEffect from the GBuffer, with ray-traced shadows (Rust / WASM)">RT shadows</a>
+            </span>
+          </li>
         </ul>
       </section>
 

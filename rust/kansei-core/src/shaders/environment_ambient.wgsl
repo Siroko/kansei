@@ -14,13 +14,17 @@ fn kansei_environment_reflection(r: vec3f, roughness: f32) -> vec3f {
 }
 
 // The light the environment leaves a surface of normal n, seen along v (toward the eye), with
-// `traced` the standard material's (0 untraced, 1 reflective, 2 glass).
-fn kansei_environment_ambient(n: vec3f, v: vec3f, base: vec3f, roughness: f32, metallic: f32, traced: f32) -> vec3f {
+// `traced` the standard material's (0 untraced, 1 reflective, 2 glass) and `specular` its specular
+// factor (spot_lights.wgsl's kansei_brdf_specular: a dielectric's F0 and grazing Fresnel scaled).
+fn kansei_environment_ambient(n: vec3f, v: vec3f, base: vec3f, roughness: f32, metallic: f32, traced: f32, specular: f32) -> vec3f {
     var c = base * (1.0 - metallic) * skyIrradiance(kansei_sky, n) * 0.31830989;
     if (traced < 0.5) {
-        let f0 = mix(vec3f(0.04), base, metallic);
+        let f0 = mix(vec3f(0.04 * specular), base, metallic);
+        let f90 = 1.0 - (1.0 - specular) * (1.0 - metallic);
         let nv = clamp(dot(n, v), 1e-4, 1.0);
-        c += kansei_environment_reflection(reflect(-v, n), roughness) * skyEnvironmentBrdf(f0, roughness, nv);
+        // the split sum's f0 x A + B, its B (the grazing Fresnel's) by f90
+        let brdf = skyEnvironmentBrdf(f0, roughness, nv) - (1.0 - f90) * skyEnvironmentBrdf(vec3f(0.0), roughness, nv);
+        c += kansei_environment_reflection(reflect(-v, n), roughness) * brdf;
     }
     return c;
 }

@@ -8,7 +8,7 @@
 // the Rust side fills the KANSEI_* placeholders.
 
 struct KanseiStandardSurface {
-    baseColor : vec4f,   // rgb albedo (linear)
+    baseColor : vec4f,   // rgb albedo (linear), a the specular factor (kansei_brdf_specular's)
     emissive  : vec4f,   // rgb emitted radiance (cd/m²)
     skyUp     : vec4f,   // rgb sky radiance from straight up (cd/m²)
     skyDown   : vec4f,   // rgb radiance from straight down (the ground's bounce)
@@ -66,6 +66,7 @@ fn fragment_main(in: KanseiStandardVaryings) -> KanseiStandardOut {
     let base = kansei_surface.baseColor.rgb;
     let roughness = kansei_surface.params.x;
     let metallic = kansei_surface.params.y;
+    let specular = kansei_surface.baseColor.a;
 
     // the sun's shadow: the cascades when they are on, else the single map (first directional light)
     let cascades = kansei_cascades.count > 0u;
@@ -75,15 +76,15 @@ fn fragment_main(in: KanseiStandardVaryings) -> KanseiStandardOut {
         let light = kansei_lights.directional[i];
         let L = -normalize(light.direction);
         let isSun = select(i == 0u, dot(normalize(light.direction), normalize(kansei_cascades.lightDirection)) > 0.9999, cascades);
-        radiance += kansei_brdf(N, V, L, base, roughness, metallic) * light.color * select(1.0, sunShadow, isSun);
+        radiance += kansei_brdf_specular(N, V, L, base, roughness, metallic, specular) * light.color * select(1.0, sunShadow, isSun);
     }
     for (var i = 0u; i < kansei_lights.num_point; i++) {
         let light = kansei_lights.point[i];
         let L = normalize(light.position - in.world);
         let shadow = select(1.0, kansei_point_shadow(in.world), kansei_is_point_shadow_light(light.position));
-        radiance += kansei_brdf(N, V, L, base, roughness, metallic) * light.color * kansei_point_falloff(light, in.world) * shadow;
+        radiance += kansei_brdf_specular(N, V, L, base, roughness, metallic, specular) * light.color * kansei_point_falloff(light, in.world) * shadow;
     }
-    radiance += kansei_spot_lights_radiance(in.world, N, V, base, roughness, metallic, in.clip.xy);
+    radiance += kansei_spot_lights_radiance_specular(in.world, N, V, base, roughness, metallic, specular, in.clip.xy);
     let sky = mix(kansei_surface.skyDown.rgb, kansei_surface.skyUp.rgb, N.y * 0.5 + 0.5);
     let emissive = kansei_surface.emissive.rgb;
     radiance += base * (1.0 - metallic) * sky + emissive;
@@ -93,7 +94,9 @@ fn fragment_main(in: KanseiStandardVaryings) -> KanseiStandardOut {
     out.color = vec4f(radiance, 1.0);
     // alpha 0: FluidMask::EmissiveAlpha takes an alpha of 0.5 and over for the fluid's surface
     out.emissive = vec4f(emissive, 0.0);
-    out.normal = vec4f(N * 0.5 + 0.5, 1.0);
+    // the specular factor as gbuffer_out.wgsl's kansei_gbuffer_with_specular writes it (1 at the
+    // default)
+    out.normal = vec4f(N * 0.5 + 0.5, 2.0 - specular);
     out.albedo = vec4f(base, 1.0);
     // traced by rt::RtReflectionsEffect, as gbuffer_out.wgsl's kansei_gbuffer_out_specular and
     // kansei_gbuffer_out_glass write them
@@ -104,9 +107,10 @@ fn fragment_main(in: KanseiStandardVaryings) -> KanseiStandardOut {
         out.normal.w = 1.0 / max(kansei_surface.params.w, 1.0);
         out.albedo = vec4f(clamp(base, vec3f(0.0), vec3f(1.0)), 0.45 - 0.4 * clamp(roughness, 0.0, 1.0));
     } else if (traced > 0.5) {
-        // reflective: F0 (a metal's brightest channel) and roughness; the diffuse albedo alone
-        let f0 = mix(0.04, max(base.r, max(base.g, base.b)), metallic);
-        out.normal.w = 1.0 - clamp(f0, 0.0, 1.0);
+        // reflective: F0 (a metal's brightest channel, a dielectric's by its specular factor) and
+        // roughness; the diffuse albedo alone. An F0 of 0 reflects nothing: matte.
+        let f0 = mix(0.04 * specular, max(base.r, max(base.g, base.b)), metallic);
+        out.normal.w = select(1.0 - clamp(f0, 0.0, 1.0), 2.0, f0 <= 0.0);
         out.albedo = vec4f(base * (1.0 - metallic), 1.0 - 0.5 * clamp(roughness, 0.0, 1.0));
     }
     KANSEI_VELOCITY_FRAGMENT

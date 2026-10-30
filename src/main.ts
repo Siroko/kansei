@@ -50,7 +50,7 @@ export { ShaderChunks } from "./materials/shaders/ShaderChunks";
 export { SHADOW_MAP_WGSL, LIGHTS_WGSL, TONEMAP_WGSL, TAA_RESOLVE_WGSL, LOCAL_EXPOSURE_WGSL, GBUFFER_OUT_WGSL, MOTION_VECTORS_WGSL, SPOT_LIGHT_TYPES_WGSL, SPOT_LIGHTS_WGSL, CASCADED_SHADOWS_WGSL, BASIC_LIT_WGSL, BASIC_INSTANCED_WGSL, PARTICLE_BILLBOARD_WGSL } from "./materials/shaders/SharedWGSL";
 export { INSTANCE_PLACEMENT_WGSL } from "./materials/Stock";
 export type { StandardLitOptions, StandardInstancing, GradientSkyOptions } from "./materials/StandardLit";
-export { mirrorOptions, glassOptions } from "./materials/StandardLit";
+export { mirrorOptions, glassOptions, matteOptions } from "./materials/StandardLit";
 export { assemble } from "./materials/shaders/ShaderUtils";
 export { MouseVectors } from "./controls/MouseVectors";
 export { TextGeometry } from "./geometries/TextGeometry";

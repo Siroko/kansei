@@ -28,6 +28,7 @@ exclude = [
     "kansei-wasm/examples/impostors",
     "kansei-wasm/examples/cluster-lod",
     "kansei-wasm/examples/ktx2-texture",
+    "kansei-wasm/examples/specular",
     "kansei-wasm/demos/fluid_clock",
     "kansei-wasm/demos/glass-particles",
     "kansei-wasm/demos/joydivision",
@@ -45,7 +46,7 @@ log = "0.4"
 env_logger = "0.11"
 pollster = "0.4"
 image = "0.25"
-gltf = { version = "1", features = ["utils", "extensions", "allow_empty_texture"] }
+gltf = { version = "1", features = ["utils", "extensions", "allow_empty_texture", "KHR_materials_specular"] }
 # vendored with the targets Kansei never requests removed (vendor/basisu/PATCHES.md)
 basisu = { path = "vendor/basisu" }
 optimesh = "1.1"

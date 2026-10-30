@@ -32,6 +32,14 @@ export interface StandardLitOptions {
     roughness?: number;
     /** 0 (dielectric) to 1 (metal). Default 0. */
     metallic?: number;
+    /**
+     * The specular factor, 0 to 1 (glTF's `KHR_materials_specular` `specularFactor`): it scales a
+     * dielectric's Fresnel, its F0 of 0.04 and its rise to 1 at grazing angles alike, so 1 is the
+     * usual dielectric and 0 is matte, Lambert alone with no highlight or sheen at any angle. A
+     * metal's Fresnel is its own; a reflective (`traced`) surface's F0 is scaled by it. Default 1.
+     * Rust: `StandardLitOptions::specular`.
+     */
+    specular?: number;
     /** Radiance the surface emits (cd/m²), also written to the GBuffer's emissive target. Default none. */
     emissive?: [number, number, number];
     /**
@@ -65,6 +73,14 @@ export interface StandardLitOptions {
  */
 export function mirrorOptions(color: [number, number, number], roughness: number): StandardLitOptions {
     return { baseColor: color, roughness, metallic: 1, traced: 'reflective' };
+}
+
+/**
+ * A matte surface of this albedo and roughness (`specular` 0): Lambert alone. Rust:
+ * `StandardLitOptions::matte`.
+ */
+export function matteOptions(color: [number, number, number], roughness: number): StandardLitOptions {
+    return { baseColor: color, roughness, specular: 0 };
 }
 
 /**
@@ -126,8 +142,11 @@ export function standardLitUniform(options: StandardLitOptions = {}): Float32Arr
     const [dr, dg, db] = options.skyDown ?? [0, 0, 0];
     const traced = options.traced;
     const [mode, ior] = traced === undefined ? [0, 1] : traced === 'reflective' ? [1, 1] : [2, Math.max(traced.glass.ior, 1)];
+    // the specular factor in the base colour's alpha, clamped: over 1 would read as a reflective
+    // surface's F0 in the GBuffer
+    const specular = Math.min(Math.max(options.specular ?? 1, 0), 1);
     return new Float32Array([
-        r, g, b, 1,
+        r, g, b, specular,
         er, eg, eb, 0,
         ur, ug, ub, 0,
         dr, dg, db, 0,

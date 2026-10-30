@@ -142,6 +142,7 @@ const SOLID_REPELLER: StandardLitOptions = StandardLitOptions {
     base_color: [0.55, 0.57, 0.6],
     roughness: 0.18,
     metallic: 0.0,
+    specular: 1.0,
     emissive: [0.0; 3],
     sky_up: [0.0; 3],
     sky_down: [0.0; 3],

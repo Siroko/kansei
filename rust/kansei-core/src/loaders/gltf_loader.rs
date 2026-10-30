@@ -10,6 +10,10 @@ pub struct GLTFMaterialInfo {
     pub base_color: [f32; 4],
     pub metallic: f32,
     pub roughness: f32,
+    /// `KHR_materials_specular`'s `specularFactor` (1 without the extension): the
+    /// `StandardLitOptions::specular` to draw it with, 0 for a matte surface. Its
+    /// `specularColorFactor` and textures are not read.
+    pub specular: f32,
     pub double_sided: bool,
     /// sRGB colour (x base colour factor).
     pub base_color_texture: Option<GLTFTextureRef>,
@@ -229,6 +233,7 @@ impl GLTFLoader {
                     base_color: pbr.base_color_factor(),
                     metallic: pbr.metallic_factor(),
                     roughness: pbr.roughness_factor(),
+                    specular: mat.specular().map_or(1.0, |s| s.specular_factor()),
                     double_sided: mat.double_sided(),
                     base_color_texture: pbr.base_color_texture().and_then(|t| Self::texture_ref(t.texture(), t.tex_coord(), true)),
                     metallic_roughness_texture: pbr.metallic_roughness_texture().and_then(|t| Self::texture_ref(t.texture(), t.tex_coord(), false)),
