@@ -5,11 +5,11 @@
 // rt_types.wgsl and rt_hit.wgsl. (rt_query.wgsl is the same function over hardware ray queries.)
 //
 // `kansei_rt_trace(origin, dir, tMin, tMax, flags)` walks each of the grid's layers (rt_types.wgsl:
-// the moving one first, a small box most rays miss, then the static one, which the moving one's
-// hit shortens): it tests the layer's big triangles, then walks the cells the ray crosses within
-// the layer's box (Amanatides & Woo's 3D DDA, leaving empty 4^3 macro cells in one step), testing
-// the triangles listed in each (Moller & Trumbore, both sides), and stops at the first cell whose
-// exit lies past the closest hit; with KANSEI_RT_ANY_HIT at the first hit.
+// the static one, then the moving one, a small box most rays miss or reach only past the static
+// hit, leaving it at its slab test): it tests the layer's big triangles, then walks the cells the
+// ray crosses within the layer's box (Amanatides & Woo's 3D DDA, leaving empty 4^3 macro cells in
+// one step), testing the triangles listed in each (Moller & Trumbore, both sides), and stops at
+// the first cell whose exit lies past the closest hit; with KANSEI_RT_ANY_HIT at the first hit.
 
 // Moller-Trumbore, both sides: (t, u, v), t < 0 for a miss.
 fn kansei_rt_intersect(o: vec3f, d: vec3f, v0: vec3f, e1: vec3f, e2: vec3f, tMin: f32, tMax: f32) -> vec3f {
@@ -152,11 +152,9 @@ fn kansei_rt_trace(o: vec3f, d: vec3f, tMin: f32, tMax: f32, flags: u32) -> Kans
     hit.t = tMax;
     hit.found = false;
     let invD = kansei_rt_inv_dir(d);
-    if (kansei_rt_grid.moving.cellCount > 0u && kansei_rt_walk(&hit, o, d, invD, tMin, flags, kansei_rt_grid.moving)) {
-        kansei_rt_finish(&hit, d);
-        return hit;
+    if (!kansei_rt_walk(&hit, o, d, invD, tMin, flags, kansei_rt_static_layer(kansei_rt_grid)) && kansei_rt_grid.moving.cellCount > 0u) {
+        kansei_rt_walk(&hit, o, d, invD, tMin, flags, kansei_rt_grid.moving);
     }
-    kansei_rt_walk(&hit, o, d, invD, tMin, flags, kansei_rt_static_layer(kansei_rt_grid));
     kansei_rt_finish(&hit, d);
     return hit;
 }
