@@ -234,12 +234,14 @@ pub struct RtShadowsEffect {
     last_camera_frame: Option<u32>,
     visibility: RtShadowVisibility,
     gpu: Option<Gpu>,
+    /// the bind groups its passes make from the frame's resources, kept
+    bind_groups: crate::renderers::BindGroupCache,
 }
 
 impl RtShadowsEffect {
     /// Shadows traced through `grid` (`SceneRtGrid::handle`).
     pub fn new(grid: RtGridHandle) -> Self {
-        Self {
+        Self { bind_groups: Default::default(),
             enabled: true,
             view: RtShadowsView::Lit,
             debug_light: 0,
@@ -476,7 +478,7 @@ impl PostProcessingEffect for RtShadowsEffect {
         let prev = 1 - cur;
         let t = gpu.targets.as_ref().unwrap();
         let p0 = gpu.params[0].as_entire_binding();
-        let trace_group = crate::renderers::cached_bind_group(device, &wgpu::BindGroupDescriptor {
+        let trace_group = self.bind_groups.get(device, &wgpu::BindGroupDescriptor {
             label: Some("RtShadows/Trace"),
             layout: &gpu.trace_bgl,
             entries: &[
@@ -491,7 +493,7 @@ impl PostProcessingEffect for RtShadowsEffect {
                 b(8, tex(&gbuffer.albedo_view)),
             ],
         });
-        let temporal_group = crate::renderers::cached_bind_group(device, &wgpu::BindGroupDescriptor {
+        let temporal_group = self.bind_groups.get(device, &wgpu::BindGroupDescriptor {
             label: Some("RtShadows/Temporal"),
             layout: &gpu.temporal_bgl,
             entries: &[
@@ -526,7 +528,7 @@ impl PostProcessingEffect for RtShadowsEffect {
         const LABELS: [&str; ITERATIONS] = ["RtShadows/Atrous1", "RtShadows/Atrous2", "RtShadows/Atrous3"];
         for (i, label) in LABELS.iter().enumerate().take(iterations) {
             let dst = &t.filtered[i % 2];
-            let group = crate::renderers::cached_bind_group(device, &wgpu::BindGroupDescriptor {
+            let group = self.bind_groups.get(device, &wgpu::BindGroupDescriptor {
                 label: Some("RtShadows/Atrous"),
                 layout: &gpu.atrous_bgl,
                 entries: &[b(0, gpu.params[i + 1].as_entire_binding()), b(13, tex(source[0])), b(14, tex(source[1])), b(15, tex(&t.history[cur][2])), b(16, tex(&dst[0])), b(17, tex(&dst[1]))],
@@ -534,7 +536,7 @@ impl PostProcessingEffect for RtShadowsEffect {
             pass(encoder, label, &gpu.atrous, &[&group], (gx, gy));
             source = [&dst[0], &dst[1]];
         }
-        let composite_group = crate::renderers::cached_bind_group(device, &wgpu::BindGroupDescriptor {
+        let composite_group = self.bind_groups.get(device, &wgpu::BindGroupDescriptor {
             label: Some("RtShadows/Composite"),
             layout: &gpu.composite_bgl,
             entries: &[

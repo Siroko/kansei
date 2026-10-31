@@ -432,11 +432,13 @@ pub struct VolumetricFogEffect {
     reflection_plane: Option<(glam::Vec3, f32)>,
     bindings_dirty: bool,
     gpu: Option<Gpu>,
+    /// the bind groups its passes make from the frame's resources, kept
+    bind_groups: crate::renderers::BindGroupCache,
 }
 
 impl VolumetricFogEffect {
     pub fn new(options: VolumetricFogOptions) -> Self {
-        Self {
+        Self { bind_groups: Default::default(),
             base_density: options.base_density,
             height_falloff: options.height_falloff,
             fog_height: options.fog_height,
@@ -1115,7 +1117,7 @@ impl PostProcessingEffect for VolumetricFogEffect {
             let spot = self.shadows.spot_entries();
             let group = |label: &str, layout: &wgpu::BindGroupLayout, entries: &[(u32, wgpu::BindingResource)], extra: &[wgpu::BindGroupEntry]| {
                 let entries: Vec<_> = entries.iter().map(|(binding, resource)| wgpu::BindGroupEntry { binding: *binding, resource: resource.clone() }).chain(extra.iter().cloned()).collect();
-                crate::renderers::cached_bind_group(device, &wgpu::BindGroupDescriptor { label: Some(label), layout, entries: &entries })
+                self.bind_groups.get(device, &wgpu::BindGroupDescriptor { label: Some(label), layout, entries: &entries })
             };
             let trace_bg = group(
                 "VolumetricFog/ShaftsBG",
@@ -1157,7 +1159,7 @@ impl PostProcessingEffect for VolumetricFogEffect {
         }
 
         // 5. composite over the scene
-        let bind_group = crate::renderers::cached_bind_group(device, &wgpu::BindGroupDescriptor {
+        let bind_group = self.bind_groups.get(device, &wgpu::BindGroupDescriptor {
             label: Some("VolumetricFog/CompositeBG"),
             layout: &gpu.composite_bgl,
             entries: &[

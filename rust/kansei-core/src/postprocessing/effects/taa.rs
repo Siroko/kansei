@@ -76,11 +76,13 @@ pub struct TemporalAAEffect {
     pub options: TemporalAAOptions,
     has_history: bool,
     gpu: Option<Gpu>,
+    /// the bind groups its passes make from the frame's resources, kept
+    bind_groups: crate::renderers::BindGroupCache,
 }
 
 impl TemporalAAEffect {
     pub fn new(options: TemporalAAOptions) -> Self {
-        Self { options, has_history: false, gpu: None }
+        Self { bind_groups: Default::default(), options, has_history: false, gpu: None }
     }
 
     /// Start over from the current frame (camera cuts, teleports).
@@ -228,7 +230,7 @@ impl PostProcessingEffect for TemporalAAEffect {
         queue.write_buffer(&gpu.params, 0, bytemuck::bytes_of(&params));
         let velocity = &gbuffer.velocity_view;
         let (read, write) = (gpu.read, 1 - gpu.read);
-        let bind_group = crate::renderers::cached_bind_group(device, &wgpu::BindGroupDescriptor {
+        let bind_group = self.bind_groups.get(device, &wgpu::BindGroupDescriptor {
             label: Some("TAA/BG"),
             layout: &gpu.bgl,
             entries: &[

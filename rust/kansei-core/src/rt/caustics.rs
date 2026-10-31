@@ -553,6 +553,8 @@ pub struct RtCausticsEffect {
     lookup: wgpu::Buffer,
     sampler: wgpu::Sampler,
     gpu: Option<Gpu>,
+    /// the bind groups its passes make from the frame's resources, kept
+    bind_groups: crate::renderers::BindGroupCache,
 }
 
 impl RtCausticsEffect {
@@ -563,7 +565,7 @@ impl RtCausticsEffect {
         let (map, map_view) = Self::make_map(device, texels, 1);
         let lookup = device.create_buffer(&wgpu::BufferDescriptor { label: Some("RtCaustics/Lookup"), size: std::mem::size_of::<LookupGpu>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor { label: Some("RtCaustics/Sampler"), mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default() });
-        Self {
+        Self { bind_groups: Default::default(),
             enabled: true,
             view: RtCausticsView::Lit,
             receivers: RtCausticReceivers::RtLit,
@@ -1234,7 +1236,7 @@ impl PostProcessingEffect for RtCausticsEffect {
                 );
             }
         }
-        let composite_group = crate::renderers::cached_bind_group(device, &wgpu::BindGroupDescriptor {
+        let composite_group = self.bind_groups.get(device, &wgpu::BindGroupDescriptor {
             label: Some("RtCaustics/Composite"),
             layout: &gpu.composite_bgl,
             entries: &[

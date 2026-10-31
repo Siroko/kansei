@@ -9,5 +9,5 @@ pub use renderer::{surface_texture, Renderer, RendererConfig, RequiredLimits, Sp
 pub use gbuffer::GBuffer;
 pub use compute_batch::ComputeBatch;
 pub use readback::BufferReadback;
-pub use bind_group_cache::{cached_bind_group, cached_bind_group_stats};
+pub use bind_group_cache::BindGroupCache;
 pub use shared_layouts::{SharedLayouts, BindGroupSlot, MaterialProgram, MaterialPrograms};
