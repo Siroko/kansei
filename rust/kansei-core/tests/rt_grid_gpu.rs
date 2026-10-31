@@ -6,11 +6,13 @@
 //! after the buffers grew from a readback; instanced triangles take their albedo and emission from
 //! their instance records when their surface says so. The hardware backend (ray queries over the
 //! same triangles) finds the same hits: against the reference, and ray for ray against the grid.
+//! A scene split between the static layer and the moving layer (`RtGrid::begin_moving`) finds, ray
+//! for ray, the hits it finds in one layer, through either backend.
 //! Skipped (passes) when no adapter is available, the hardware tests when it has no ray queries.
 
 use glam::{DMat4, DVec3, Mat4, Quat, Vec3};
 use kansei_core::geometries::{BoxGeometry, Geometry, IcosphereGeometry, Vertex};
-use kansei_core::rt::{hoist_wgsl_enables, pack_emission, unpack_emission, RtBackend, RtGrid, RtGridOptions, RtInstance, RtMesh, RtPlacement, RtScene, RtSource, RtSurface};
+use kansei_core::rt::{hoist_wgsl_enables, pack_emission, transform_box, unpack_emission, RtBackend, RtGrid, RtGridOptions, RtInstance, RtMesh, RtPlacement, RtScene, RtSource, RtSurface};
 
 fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
     let instance = wgpu::Instance::default();
@@ -886,3 +888,116 @@ fn instances_carry_their_records_albedo_and_emission() {
         }
     }
 }
+
+/// `scene`'s instances split in two scenes: those `moving` picks, and the rest.
+fn split(scene: &RtScene, moving: impl Fn(usize) -> bool) -> (RtScene, RtScene) {
+    let (mut still, mut moved) = (RtScene::new(), RtScene::new());
+    for m in 0..scene.mesh_count() {
+        still.add_mesh(scene.mesh(m).clone());
+        moved.add_mesh(scene.mesh(m).clone());
+    }
+    for (k, i) in scene.instances.iter().enumerate() {
+        if moving(k) { &mut moved } else { &mut still }.add_instance(*i);
+    }
+    (still, moved)
+}
+
+/// Build the static layer from `still` and the moving layer from `moved` round `bounds`.
+fn build_layers(device: &wgpu::Device, queue: &wgpu::Queue, grid: &mut RtGrid, still: &mut RtScene, moved: &mut RtScene, bounds: Option<(Vec3, Vec3)>) {
+    let mut encoder = device.create_command_encoder(&Default::default());
+    grid.begin(device, queue, &mut encoder);
+    still.gather(device, queue, &mut encoder, grid);
+    grid.finish(&mut encoder);
+    grid.begin_moving(device, queue, &mut encoder, bounds);
+    moved.gather(device, queue, &mut encoder, grid);
+    grid.finish(&mut encoder);
+    queue.submit(Some(encoder.finish()));
+    grid.read_back(device, queue);
+    grid.wait_readback(device);
+    grid.prepare_trace(device, queue);
+}
+
+/// The scene with some of its instances in the moving layer (a turned soup, the sphere half out
+/// of the box, the alpha-tested quad and a glass sphere): every ray finds the hit it finds with
+/// one layer, closest and any, solid, through glass or not, with the moving layer round them, round
+/// the whole box in coarser cells, and after its buffers grew mid-build (the static layer copied
+/// along); in software and, where the device has them, with hardware ray queries.
+#[test]
+fn a_moving_layer_finds_the_same_hits() {
+    let (device, queue, backends) = match ray_query_device() {
+        Some((d, q)) => (d, q, vec![RtBackend::Software, RtBackend::Hardware]),
+        None => match device() {
+            Some((d, q)) => (d, q, vec![RtBackend::Software]),
+            None => return eprintln!("no GPU adapter: skipped"),
+        },
+    };
+    let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+    let mut scene = scene(&mut rng);
+    // (the reference without the glass, which the traces without KANSEI_RT_GLASS_HITS pass through)
+    let tris = world_triangles(&scene);
+    let glass = scene.add_mesh(RtMesh::from_geometry(&IcosphereGeometry::new(0.6, 3)));
+    scene.add_instance(RtInstance { mesh: glass, transform: Mat4::from_translation(Vec3::new(-2.0, 1.0, 1.5)), surface: RtSurface::glass([0.9, 0.95, 1.0]) });
+    let picked = |k: usize| matches!(k, 6 | 7 | 9 | 11);
+    let (mut still, mut moved) = split(&scene, picked);
+    let bounds = moved.instances.iter().map(|i| transform_box(&i.transform, moved.mesh(i.mesh).min, moved.mesh(i.mesh).max)).reduce(|(a, b), (c, d)| (a.min(c), b.max(d)));
+    for backend in backends {
+        let mut one = RtGrid::new(&device, RtGridOptions { backend, ..options() });
+        build(&device, &queue, &mut one, &mut scene);
+        let (lo, hi) = one.bounds();
+        let rays = rays(&mut rng, &tris, lo.as_dvec3(), hi.as_dvec3());
+        let one_records = read_words(&device, &queue, one.triangles_buffer());
+        for (what, o, b) in [
+            ("round them", RtGridOptions { backend, ..options() }, bounds),
+            ("the whole box, coarser", RtGridOptions { backend, moving_cells: 4096, ..options() }, None),
+            ("grown mid-build", RtGridOptions { backend, moving_triangle_capacity: 64, moving_reference_capacity: 1024, ..options() }, bounds),
+        ] {
+            let what = format!("{backend:?}, {what}");
+            let mut two = RtGrid::new(&device, o);
+            build_layers(&device, &queue, &mut two, &mut still, &mut moved, b);
+            let stats = two.stats();
+            assert!(stats.moving_cells > 0 && stats.moving_triangles > 1000 && stats.triangles + stats.moving_triangles == one.stats().triangles, "{what}: {stats:?} against {:?}", one.stats());
+            if what.ends_with("mid-build") {
+                // the triangles grew as they were gathered (`reserve_triangles`), the references
+                // (in software) overflowed: the next build grows them from the readback, copying
+                // the static layer's cell words along
+                let software = backend == RtBackend::Software;
+                assert!(stats.moving_triangle_capacity >= stats.moving_triangles && (!software || stats.moving_references > 1024), "{what}: {stats:?}");
+                build_layers(&device, &queue, &mut two, &mut still, &mut moved, b);
+                let grown = two.stats();
+                assert!(grown.moving_reference_capacity >= stats.moving_references && grown.reference_capacity == stats.reference_capacity, "{what}: {grown:?}");
+            }
+            check_rays(&device, &queue, &two, &tris, &rays, &what);
+            let two_records = read_words(&device, &queue, two.triangles_buffer());
+            // a triangle's record but for the flag the build sets on big ones
+            let record = |words: &[u32], id: u32| {
+                let mut r = words[id as usize * 16..][..16].to_vec();
+                r[3] &= 0x7fff_ffff;
+                r
+            };
+            let (mut differ, mut identical, mut ties) = (Vec::new(), 0, 0);
+            for (name, flags) in [("closest", 0), ("any", 1), ("solid", 2), ("glass hits", 4), ("any, glass hits", 5)] {
+                let a = trace(&device, &queue, &one, &rays, flags);
+                let c = trace(&device, &queue, &two, &rays, flags);
+                for (k, (x, y)) in a.iter().zip(&c).enumerate() {
+                    // any hit: whether, not which; closest: the same distance (to the bit in
+                    // software; within a last bit or two of the hardware's, whose BLASes differ),
+                    // and the same triangle but where two lie at that distance (a ray through
+                    // their edge)
+                    let close = if backend == RtBackend::Software { x[0].to_bits() == y[0].to_bits() } else { (x[0] - y[0]).abs() <= 1e-6 * (1.0 + x[0]) };
+                    let same = x[1] == y[1] && (flags & 1 != 0 || x[1] == 0.0 || close);
+                    if !same {
+                        differ.push(format!("{name}, ray {k}: one layer found {} t {}, two found {} t {}", x[1], x[0], y[1], y[0]));
+                    } else if flags & 1 == 0 && x[1] == 1.0 && record(&one_records, x[7].to_bits()) != record(&two_records, y[7].to_bits()) {
+                        ties += 1;
+                    } else {
+                        identical += 1;
+                    }
+                }
+            }
+            eprintln!("{what}: {identical} traces identical, {ties} at the same distance on a neighbouring triangle, {} differ", differ.len());
+            assert!(differ.is_empty(), "{what}: {} differ:\n{}", differ.len(), differ.iter().take(12).cloned().collect::<Vec<_>>().join("\n"));
+            assert!(ties * 1000 <= identical, "{what}: {ties} ties");
+        }
+    }
+}
+

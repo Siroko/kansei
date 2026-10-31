@@ -16,8 +16,8 @@ pub struct SceneRtGridOptions {
     /// cells: 1 keeps every error within a cell (the scout traced the 871k-triangle dragon as
     /// its 29k-triangle cut at one 4.75 cm cell, looking the same).
     pub cluster_error_cells: f32,
-    /// Rebuild every frame, not only when the box moved or what it holds changed (`dynamic`
-    /// renderables in it rebuild it every frame anyway).
+    /// Rebuild the static layer every frame, not only when the box moved or what it holds
+    /// changed (the `dynamic` renderables' moving layer is rebuilt every frame anyway).
     pub rebuild_every_frame: bool,
 }
 
@@ -31,11 +31,15 @@ impl Default for SceneRtGridOptions {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct SceneRtGridStats {
     pub grid: RtGridStats,
-    /// Sources gathered at the last rebuild (a renderable's mesh or cut each).
+    /// Sources gathered at the last rebuild of the static layer (a renderable's mesh or cut each),
+    /// and of the moving layer.
     pub sources: u32,
-    /// Whether this frame rebuilt it, and how many frames have.
+    pub moving_sources: u32,
+    /// Whether this frame rebuilt the static layer, and how many frames have.
     pub rebuilt: bool,
     pub rebuilds: u64,
+    /// Whether this frame rebuilt the moving layer (a dynamic renderable has `rt`).
+    pub moving_rebuilt: bool,
     /// CPU time of the last rebuild's recording, ms.
     pub cpu_ms: f64,
 }
@@ -64,30 +68,51 @@ const SETTLE_FRAMES: u32 = 30;
 /// renderables there (orthographic, `cluster_error_cells` cells of error). The gather then reads
 /// on the GPU each clustered renderable's draw list, each instanced one's culled records (times
 /// its mesh, placed by `Renderable::rt_placement`), and each single mesh whose world box meets the
-/// grid's (one box test per renderable on the CPU). It rebuilds when the box moves, when the
-/// static renderables in it change (transform, visibility, surface, `Geometry::revision`: a mesh
-/// whose CPU vertices were moved, such as a skinned proxy posed on the CPU, or whose
-/// `Renderable::rt_mesh` the GPU rewrote), when a cut it gathered grew, on `invalidate`, and every
-/// frame while a `dynamic` one is in it. The hardware backend (`RtGridOptions::backend`) builds its
-/// BLAS fast while the box moves or a dynamic renderable rebuilds it, and once more to trace fast
-/// when it has rested `SETTLE_FRAMES` frames.
+/// grid's (one box test per renderable on the CPU). The renderables that aren't `dynamic` go into
+/// the grid's static layer, which rebuilds when the box moves, when they change (transform,
+/// visibility, surface, `Geometry::revision`: a mesh whose CPU vertices were moved, such as a
+/// skinned proxy posed on the CPU, or whose `Renderable::rt_mesh` the GPU rewrote; a renderable
+/// turning `dynamic` or back), when a cut it gathered grew, and on `invalidate`. The `dynamic` ones
+/// go into its moving layer (`RtGrid::begin_moving`), fitted round their world boxes and rebuilt
+/// every frame, so what moves costs a frame its own triangles, not the scene's (`set_moving_layer`
+/// turns that off: the dynamic ones then rebuild the static layer every frame). The hardware
+/// backend (`RtGridOptions::backend`) builds the static BLAS fast while the box moves, and once
+/// more to trace fast when it has rested `SETTLE_FRAMES` frames; the moving BLAS always fast.
 pub struct SceneRtGrid {
     options: SceneRtGridOptions,
     grid: RtGrid,
     meshes: HashMap<usize, SceneMesh>,
     key: Option<Vec<u32>>,
     force: bool,
+    /// this frame: rebuild the static layer, rebuild the moving layer, empty the moving layer
     rebuild: bool,
+    moving: bool,
+    clear_moving: bool,
     stats: SceneRtGridStats,
     /// renderables left out (no CPU geometry, or instances with no placement), warned once
     warned: HashSet<usize>,
     /// frames since a hardware BLAS was built fast, while it stands (None: built to trace fast)
     fast_built: Option<u32>,
+    /// the dynamic renderables go into the moving layer (else into the static one)
+    moving_layer: bool,
 }
 
 impl SceneRtGrid {
     pub(crate) fn new(device: &wgpu::Device, options: SceneRtGridOptions) -> Self {
-        Self { grid: RtGrid::new(device, options.grid), options, meshes: HashMap::new(), key: None, force: true, rebuild: false, stats: SceneRtGridStats::default(), warned: HashSet::new(), fast_built: None }
+        Self {
+            grid: RtGrid::new(device, options.grid),
+            options,
+            meshes: HashMap::new(),
+            key: None,
+            force: true,
+            rebuild: false,
+            moving: false,
+            clear_moving: false,
+            stats: SceneRtGridStats::default(),
+            warned: HashSet::new(),
+            fast_built: None,
+            moving_layer: true,
+        }
     }
 
     pub fn options(&self) -> &SceneRtGridOptions {
@@ -97,6 +122,20 @@ impl SceneRtGrid {
     /// Rebuild every frame or only when needed (see `SceneRtGridOptions::rebuild_every_frame`).
     pub fn set_rebuild_every_frame(&mut self, on: bool) {
         self.options.rebuild_every_frame = on;
+    }
+
+    /// Whether the dynamic renderables go into the grid's moving layer (the default), or, off,
+    /// into its static layer with the rest, which they then rebuild every frame while one is in
+    /// it (the grid before it had layers: for comparisons).
+    pub fn set_moving_layer(&mut self, on: bool) {
+        if on != self.moving_layer {
+            self.moving_layer = on;
+            self.force = true;
+        }
+    }
+
+    pub fn moving_layer(&self) -> bool {
+        self.moving_layer
     }
 
     /// The grid, for the passes that trace it.
@@ -125,17 +164,20 @@ impl SceneRtGrid {
         self.grid.memory_bytes() + self.meshes.values().map(|m| m.buffer.size()).sum::<u64>()
     }
 
-    /// Plan the frame, before the culling: follow `eye`, and rebuild if the box moved, `key`
-    /// (what the static renderables in the grid are made of) changed, a dynamic one is in it,
-    /// the buffers grew, or it was forced.
+    /// Plan the frame, before the culling: follow `eye`; rebuild the static layer if the box
+    /// moved, `key` (what the static renderables in the grid are made of) changed, its buffers
+    /// grew, or it was forced; and the moving layer while a dynamic renderable has `rt`.
     pub(crate) fn plan(&mut self, device: &wgpu::Device, eye: Vec3, key: Vec<u32>, any_dynamic: bool) {
         self.grid.poll_readback(device);
         let moved = self.grid.follow(eye);
         let changed = self.key.as_ref() != Some(&key);
         self.key = Some(key);
         let overflowed = self.grid.overflowed();
-        let moving = moved || any_dynamic || self.options.rebuild_every_frame;
+        // (without the moving layer, a dynamic renderable rebuilds the static layer every frame)
+        let moving = moved || self.options.rebuild_every_frame || (any_dynamic && !self.moving_layer);
         self.rebuild = moving || changed || overflowed || std::mem::take(&mut self.force);
+        self.moving = any_dynamic && self.moving_layer;
+        self.clear_moving = !self.moving && self.grid.stats().moving_cells > 0;
         if self.grid.backend() == super::RtBackend::Hardware {
             // a BLAS built fast while moving, rebuilt once to trace fast when it has rested
             let settle = self.fast_built.is_some_and(|f| f >= SETTLE_FRAMES);
@@ -148,10 +190,11 @@ impl SceneRtGrid {
             };
         }
         self.stats.rebuilt = self.rebuild;
+        self.stats.moving_rebuilt = self.moving;
     }
 
     pub(crate) fn rebuilding(&self) -> bool {
-        self.rebuild
+        self.rebuild || self.moving || self.clear_moving
     }
 
     /// The cull view of the box: an orthographic view along -z whose frustum is the box.
@@ -185,18 +228,37 @@ impl SceneRtGrid {
         r.geometry.instance_buffers.is_empty().then_some(RtPlacement::None)
     }
 
-    /// Rebuild the grid from `scene`'s renderables with `rt`, as culled and cut for cull view
-    /// `slot` (the box), into one submit, and read back what it needed.
+    /// Rebuild the grid's layers this frame's plan asked for from `scene`'s renderables with `rt`,
+    /// as culled and cut for cull view `slot` (the box), into one submit, and read back what they
+    /// needed.
     pub(crate) fn build(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, scene: &Scene, slot: usize) {
         let t0 = crate::profiling::now_ms();
-        self.stats.rebuilds += 1;
+        if self.rebuild {
+            self.stats.rebuilds += 1;
+        }
         let (lo, hi) = self.grid.bounds();
         let eps = Vec3::splat(self.options.grid.effective_epsilon());
-        // the meshes of what isn't cut by cluster LOD (single meshes only where they meet the box)
-        let mut chosen: Vec<(usize, bool)> = Vec::new();
+        // the meshes of what isn't cut by cluster LOD (single meshes only where they meet the box),
+        // whether each is clustered and dynamic, and the dynamic ones' world box (None: not known
+        // on the CPU, a cut or instances)
+        let mut chosen: Vec<(usize, bool, bool)> = Vec::new();
+        let mut moving_box: Option<(Vec3, Vec3)> = None;
+        let mut moving_unbounded = false;
+        let mut grow = |dynamic: bool, b: Option<(Vec3, Vec3)>| {
+            if dynamic {
+                match b {
+                    Some((a, b)) => moving_box = Some(moving_box.map_or((a, b), |(lo, hi)| (lo.min(a), hi.max(b)))),
+                    None => moving_unbounded = true,
+                }
+            }
+        };
         for idx in scene.ordered_indices() {
             let Some(r) = scene.get_renderable(idx) else { continue };
             if r.rt.is_none() || !r.visible || !r.geometry.initialized {
+                continue;
+            }
+            let dynamic = r.dynamic && self.moving_layer;
+            if !(if dynamic { self.moving } else { self.rebuild }) {
                 continue;
             }
             let cut = r.clusters.as_ref().and_then(|c| c.gpu.as_ref()).is_some_and(|g| g.cut(slot as u32).is_some());
@@ -207,14 +269,16 @@ impl SceneRtGrid {
                 continue;
             }
             if cut {
-                chosen.push((idx, true));
+                chosen.push((idx, true, dynamic));
+                grow(dynamic, None);
                 continue;
             }
             if let Some(m) = &r.rt_mesh {
                 // written on the GPU: its own buffer and bounds
                 let (a, b) = transform_box(&r.world_matrix.to_glam(), m.min, m.max);
                 if a.cmple(hi + eps).all() && b.cmpge(lo - eps).all() {
-                    chosen.push((idx, false));
+                    chosen.push((idx, false, dynamic));
+                    grow(dynamic, Some((a, b)));
                 }
                 continue;
             }
@@ -237,11 +301,16 @@ impl SceneRtGrid {
                 if !(a.cmple(hi + eps).all() && b.cmpge(lo - eps).all()) {
                     continue;
                 }
+                grow(dynamic, Some((a, b)));
+            } else {
+                grow(dynamic, None);
             }
-            chosen.push((idx, false));
+            chosen.push((idx, false, dynamic));
         }
-        let mut sources = Vec::new();
-        for &(idx, clustered) in &chosen {
+        let moving_box = if moving_unbounded { None } else { moving_box };
+        // the static layer's sources, then the moving layer's
+        let mut sources = [Vec::new(), Vec::new()];
+        for &(idx, clustered, dynamic) in &chosen {
             let r = scene.get_renderable(idx).unwrap();
             let first = r.geometry.instance_buffers.first();
             let stride = first.and_then(|cb| cb.vertex_layout()).map_or(0, |l| l.stride as u32);
@@ -270,7 +339,7 @@ impl SceneRtGrid {
                 let m = &self.meshes[&idx];
                 (GatherMesh::Mesh { buffer: &m.buffer, triangles: m.triangles }, count)
             };
-            sources.push(GatherSource {
+            sources[dynamic as usize].push(GatherSource {
                 mesh,
                 records,
                 first_record,
@@ -281,13 +350,43 @@ impl SceneRtGrid {
                 id: idx as u32,
             });
         }
+        let [static_sources, moving_sources] = sources;
+        if self.clear_moving || (self.moving && moving_sources.is_empty()) {
+            // (no dynamic renderable in the box)
+            self.moving = false;
+            self.grid.clear_moving(queue);
+        }
+        if !self.rebuild && !self.moving {
+            return;
+        }
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Renderer/RtGrid") });
-        self.grid.begin(device, queue, &mut encoder);
-        self.grid.gather_sources(device, queue, &mut encoder, &sources);
-        self.grid.finish(&mut encoder);
+        if self.rebuild {
+            self.grid.begin(device, queue, &mut encoder);
+            self.grid.gather_sources(device, queue, &mut encoder, &static_sources);
+            self.grid.finish(&mut encoder);
+            self.stats.sources = static_sources.len() as u32;
+        }
+        if self.moving {
+            self.grid.begin_moving(device, queue, &mut encoder, moving_box);
+            // room for every triangle the meshes may place, so none is lost while a readback is
+            // in flight (cuts: what the readback says)
+            let most: Option<u64> = moving_sources
+                .iter()
+                .map(|s| match (&s.mesh, &s.count) {
+                    (GatherMesh::Mesh { triangles, .. }, GatherCount::Fixed(n)) => Some(*triangles as u64 * *n as u64),
+                    (GatherMesh::Mesh { triangles, .. }, GatherCount::Word { at_most, .. }) => Some(*triangles as u64 * *at_most as u64),
+                    (GatherMesh::Clusters { .. }, _) => None,
+                })
+                .sum();
+            if let Some(n) = most {
+                self.grid.reserve_triangles(device, queue, &mut encoder, n.min(u32::MAX as u64) as u32);
+            }
+            self.grid.gather_sources(device, queue, &mut encoder, &moving_sources);
+            self.grid.finish(&mut encoder);
+            self.stats.moving_sources = moving_sources.len() as u32;
+        }
         queue.submit(Some(encoder.finish()));
         self.grid.read_back(device, queue);
-        self.stats.sources = sources.len() as u32;
         self.stats.cpu_ms = crate::profiling::now_ms() - t0;
     }
 
