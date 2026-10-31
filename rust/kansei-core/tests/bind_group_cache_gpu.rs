@@ -60,3 +60,19 @@ fn the_same_resources_give_back_the_same_bind_group() {
     assert!(group(&resized) != a && group(&resized) != b);
     assert_eq!(cached_bind_group_stats().0 - made, 3);
 }
+
+/// Another device empties the cache: its bind groups would keep the old device alive.
+#[test]
+fn another_device_empties_the_cache() {
+    let Some((first, _q)) = device() else { return eprintln!("no GPU adapter: skipped") };
+    let layout = |d: &wgpu::Device| d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &[wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None }] });
+    let group = |d: &wgpu::Device, l: &wgpu::BindGroupLayout, b: &wgpu::Buffer| cached_bind_group(d, &wgpu::BindGroupDescriptor { label: None, layout: l, entries: &[wgpu::BindGroupEntry { binding: 0, resource: b.as_entire_binding() }] });
+    let buffer = |d: &wgpu::Device| d.create_buffer(&wgpu::BufferDescriptor { label: None, size: 16, usage: wgpu::BufferUsages::UNIFORM, mapped_at_creation: false });
+    let (l1, b1) = (layout(&first), buffer(&first));
+    group(&first, &l1, &b1);
+    assert!(cached_bind_group_stats().1 >= 1);
+    let (second, _q2) = device().unwrap();
+    let (l2, b2) = (layout(&second), buffer(&second));
+    group(&second, &l2, &b2);
+    assert_eq!(cached_bind_group_stats().1, 1, "only the second device's");
+}

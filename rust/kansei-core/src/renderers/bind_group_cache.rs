@@ -59,6 +59,9 @@ const UNUSED_LOOKUPS: u64 = 2048;
 
 #[derive(Default)]
 struct Cache {
+    /// the device the groups are of: another device's call empties the cache (its groups would
+    /// keep the old device alive)
+    device: Option<wgpu::Device>,
     groups: HashMap<Key, (wgpu::BindGroup, u64)>,
     clock: u64,
     made: u64,
@@ -72,11 +75,16 @@ thread_local! {
 /// the same buffers (and ranges), views, samplers and acceleration structures. For bind groups
 /// made from the frame's resources each frame: the same few then cost a hash lookup instead of a
 /// bind group a frame (a WebGPU call, and garbage on the web). A view of a texture made anew is
-/// another view, so a stale bind group is never returned; unused ones are dropped after a while.
+/// another view, so a stale bind group is never returned; unused ones are dropped after a while,
+/// and all of them when a call comes for another device.
 pub fn cached_bind_group(device: &wgpu::Device, descriptor: &wgpu::BindGroupDescriptor) -> wgpu::BindGroup {
     let Some(key) = Key::of(descriptor) else { return device.create_bind_group(descriptor) };
     CACHE.with(|cache| {
         let mut c = cache.borrow_mut();
+        if c.device.as_ref() != Some(device) {
+            c.groups.clear();
+            c.device = Some(device.clone());
+        }
         c.clock += 1;
         let now = c.clock;
         if now % SWEEP_EVERY == 0 {
