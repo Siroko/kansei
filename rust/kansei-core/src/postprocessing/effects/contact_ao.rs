@@ -98,11 +98,13 @@ pub struct ContactAoEffect {
     pub debug_white: f32,
     frame: u32,
     gpu: Option<Gpu>,
+    /// the bind groups its passes make from the frame's resources, kept
+    bind_groups: crate::renderers::BindGroupCache,
 }
 
 impl ContactAoEffect {
     pub fn new(options: ContactAoOptions) -> Self {
-        Self { options, show_occlusion: false, debug_white: 1.0, frame: 0, gpu: None }
+        Self { bind_groups: Default::default(), options, show_occlusion: false, debug_white: 1.0, frame: 0, gpu: None }
     }
 
     #[cfg(test)]
@@ -217,7 +219,7 @@ impl PostProcessingEffect for ContactAoEffect {
         let tex = wgpu::BindingResource::TextureView;
         let resources = [gpu.params.as_entire_binding(), tex(depth), tex(&gbuffer.normal_view), tex(&gbuffer.albedo_view), tex(&gbuffer.emissive_view), tex(input), tex(output)];
         let entries: Vec<_> = resources.into_iter().enumerate().map(|(i, resource)| wgpu::BindGroupEntry { binding: i as u32, resource }).collect();
-        let group = crate::renderers::cached_bind_group(device, &wgpu::BindGroupDescriptor { label: Some("ContactAO/BindGroup"), layout: &gpu.bgl, entries: &entries });
+        let group = self.bind_groups.get(device, &wgpu::BindGroupDescriptor { label: Some("ContactAO/BindGroup"), layout: &gpu.bgl, entries: &entries });
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("ContactAO"),
             timestamp_writes: crate::profiling::gpu_pass("ContactAO").as_ref().map(crate::profiling::PassStamp::compute),

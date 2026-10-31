@@ -26,6 +26,8 @@ pub struct PostProcessingVolume {
     device: wgpu::Device,
     queue: wgpu::Queue,
     presentation_format: wgpu::TextureFormat,
+    /// the bind groups its passes make from the frame's resources, kept
+    bind_groups: crate::renderers::BindGroupCache,
 }
 
 struct DisplayTargets {
@@ -56,7 +58,7 @@ impl PostProcessingVolume {
         renderer: &crate::renderers::Renderer,
         effects: Vec<Box<dyn PostProcessingEffect>>,
     ) -> Self {
-        Self {
+        Self { bind_groups: Default::default(),
             effects,
             disabled: Vec::new(),
             gbuffer: None,
@@ -360,7 +362,7 @@ impl PostProcessingVolume {
         let sampler = self.blit_sampler.as_ref().unwrap();
         let pipeline = self.blit_pipeline.as_ref().unwrap();
 
-        let bind_group = crate::renderers::cached_bind_group(&self.device, &wgpu::BindGroupDescriptor {
+        let bind_group = self.bind_groups.get(&self.device, &wgpu::BindGroupDescriptor {
             label: Some("Blit BindGroup"),
             layout: bgl,
             entries: &[

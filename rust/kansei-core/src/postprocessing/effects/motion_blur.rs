@@ -103,6 +103,8 @@ pub struct MotionBlurEffect {
     skip_next: bool,
     frame: u32,
     gpu: Option<Gpu>,
+    /// the bind groups its passes make from the frame's resources, kept
+    bind_groups: crate::renderers::BindGroupCache,
 }
 
 fn source(pass: &str) -> String {
@@ -111,7 +113,7 @@ fn source(pass: &str) -> String {
 
 impl MotionBlurEffect {
     pub fn new(options: MotionBlurOptions) -> Self {
-        Self { options, frame_time: 0.0, skip_next: false, frame: 0, gpu: None }
+        Self { bind_groups: Default::default(), options, frame_time: 0.0, skip_next: false, frame: 0, gpu: None }
     }
 
     /// No blur next frame (camera cuts, teleports). `Camera::reset_motion` does this too.
@@ -289,7 +291,7 @@ impl PostProcessingEffect for MotionBlurEffect {
 
         let group = |layout: &wgpu::BindGroupLayout, resources: Vec<wgpu::BindingResource>| {
             let entries: Vec<_> = resources.into_iter().enumerate().map(|(i, resource)| wgpu::BindGroupEntry { binding: i as u32, resource }).collect();
-            crate::renderers::cached_bind_group(device, &wgpu::BindGroupDescriptor { label: Some("MotionBlur/BG"), layout, entries: &entries })
+            self.bind_groups.get(device, &wgpu::BindGroupDescriptor { label: Some("MotionBlur/BG"), layout, entries: &entries })
         };
         let view = wgpu::BindingResource::TextureView;
         let params_res = || gpu.params.as_entire_binding();

@@ -36,6 +36,8 @@ pub struct DistanceFogEffect {
     /// afar).
     pub from_point: Option<Vec3>,
     gpu: Option<Gpu>,
+    /// the bind groups its passes make from the frame's resources, kept
+    bind_groups: crate::renderers::BindGroupCache,
 }
 
 struct Gpu {
@@ -64,7 +66,7 @@ struct DistanceFogParamsGpu {
 
 impl DistanceFogEffect {
     pub fn new(start: f32, end: f32, color: DistanceFogColor) -> Self {
-        Self { start, end, color, max_opacity: 1.0, from_point: None, gpu: None }
+        Self { bind_groups: Default::default(), start, end, color, max_opacity: 1.0, from_point: None, gpu: None }
     }
 
     /// How much of the fog colour a surface at `point` takes, seen from `eye` (world space), as
@@ -194,7 +196,7 @@ impl PostProcessingEffect for DistanceFogEffect {
         let params = self.params(camera);
         let gpu = self.gpu.as_ref().unwrap();
         queue.write_buffer(&gpu.params, 0, bytemuck::bytes_of(&params));
-        let bind_group = crate::renderers::cached_bind_group(device, &wgpu::BindGroupDescriptor {
+        let bind_group = self.bind_groups.get(device, &wgpu::BindGroupDescriptor {
             label: Some("DistanceFog/BG"),
             layout: &gpu.bgl,
             entries: &[
