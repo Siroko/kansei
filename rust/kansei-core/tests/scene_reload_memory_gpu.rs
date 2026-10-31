@@ -94,7 +94,9 @@ fn reloading_scenes_holds_no_more_memory() {
     camera.look_at(&Vec3::new(0.0, 0.0, 0.0));
     camera.update_projection_matrix();
     let mut laps = Vec::new();
-    for lap in 0..16 {
+    // (`RELOAD_LAPS` laps, 16 by default)
+    let laps_wanted: u32 = std::env::var("RELOAD_LAPS").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
+    for lap in 0..laps_wanted {
         {
             let (mut scene, mover) = scene(lap);
             for f in 0..6 {
