@@ -28,11 +28,13 @@ pub struct ColorGradingEffect {
     bgl: Option<wgpu::BindGroupLayout>,
     params_buf: Option<wgpu::Buffer>,
     initialized: bool,
+    /// the bind groups its passes make from the frame's resources, kept
+    bind_groups: crate::renderers::BindGroupCache,
 }
 
 impl ColorGradingEffect {
     pub fn new(options: ColorGradingOptions) -> Self {
-        Self { options, pipeline: None, bgl: None, params_buf: None, initialized: false }
+        Self { bind_groups: Default::default(), options, pipeline: None, bgl: None, params_buf: None, initialized: false }
     }
 }
 
@@ -107,7 +109,7 @@ impl PostProcessingEffect for ColorGradingEffect {
         ];
         queue.write_buffer(self.params_buf.as_ref().unwrap(), 0, bytemuck::cast_slice(&data));
 
-        let bg = crate::renderers::cached_bind_group(device, &wgpu::BindGroupDescriptor {
+        let bg = self.bind_groups.get(device, &wgpu::BindGroupDescriptor {
             label: None, layout: self.bgl.as_ref().unwrap(),
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(input) },

@@ -145,11 +145,13 @@ pub struct ScreenSpaceGIEffect {
     last_camera_frame: Option<u32>,
     frame: u32,
     gpu: Option<Gpu>,
+    /// the bind groups its passes make from the frame's resources, kept
+    bind_groups: crate::renderers::BindGroupCache,
 }
 
 impl ScreenSpaceGIEffect {
     pub fn new(options: ScreenSpaceGIOptions) -> Self {
-        Self {
+        Self { bind_groups: Default::default(),
             enabled: true,
             quality: options.quality,
             radius_m: options.radius_m,
@@ -521,7 +523,7 @@ mod tests {
             multiview_mask: None,
             cache: None,
         });
-        let bg = crate::renderers::cached_bind_group(device, &wgpu::BindGroupDescriptor {
+        let bg = self.bind_groups.get(device, &wgpu::BindGroupDescriptor {
             label: None,
             layout: &pipeline.get_bind_group_layout(0),
             entries: &[

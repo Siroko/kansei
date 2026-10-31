@@ -476,11 +476,13 @@ pub struct ToneMapEffect {
     pub options: ToneMapOptions,
     frame: u32,
     gpu: Option<Gpu>,
+    /// the bind groups its passes make from the frame's resources, kept
+    bind_groups: crate::renderers::BindGroupCache,
 }
 
 impl ToneMapEffect {
     pub fn new(options: ToneMapOptions) -> Self {
-        Self { options, frame: 0, gpu: None }
+        Self { bind_groups: Default::default(), options, frame: 0, gpu: None }
     }
 
     /// The linear factor applied to scene light: exposure times 2^compensation. Pass it to
@@ -734,7 +736,7 @@ impl PostProcessingEffect for ToneMapEffect {
         }
         let gpu = self.gpu.as_ref().unwrap();
 
-        let bind_group = crate::renderers::cached_bind_group(device, &wgpu::BindGroupDescriptor {
+        let bind_group = self.bind_groups.get(device, &wgpu::BindGroupDescriptor {
             label: Some("ToneMap/BG"),
             layout: &gpu.bgl,
             entries: &[

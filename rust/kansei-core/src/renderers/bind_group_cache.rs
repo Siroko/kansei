@@ -1,8 +1,10 @@
-//! `cached_bind_group`: bind groups kept by what they bind, for the passes that make one from the
+//! `BindGroupCache`: bind groups kept by what they bind, for the passes that make one from the
 //! frame's textures every frame (ping-pong targets, histories swapped each frame), where the same
-//! few come round again: the cached one is returned instead of a new one.
+//! few come round again: the cached one is returned instead of a new one. An effect owns one
+//! (wgpu compares its objects by their ids, which another `wgpu::Instance` hands out again: a
+//! cache shared by every device in a thread could hand one device another's bind group).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 /// One resource of a bind group, as the cache compares it (by identity).
@@ -54,57 +56,49 @@ impl Key {
 
 /// Lookups between sweeps, and how many lookups a bind group may go unused before a sweep drops
 /// it (with its resources: a resized target's old views aren't kept alive for long).
-const SWEEP_EVERY: u64 = 1024;
-const UNUSED_LOOKUPS: u64 = 2048;
+const SWEEP_EVERY: u64 = 256;
+const UNUSED_LOOKUPS: u64 = 512;
 
+/// An owner's bind groups by what they bind (`get`): the owner's passes make the same few from
+/// the frame's resources each frame, which then cost a hash lookup instead of a bind group a
+/// frame (a WebGPU call, and garbage on the web). A view of a texture made anew is another view,
+/// so a stale bind group is never returned; unused ones are dropped after a while. One device's:
+/// the owner's (effects are made for one).
 #[derive(Default)]
-struct Cache {
-    /// the device the groups are of: another device's call empties the cache (its groups would
-    /// keep the old device alive)
-    device: Option<wgpu::Device>,
-    groups: HashMap<Key, (wgpu::BindGroup, u64)>,
-    clock: u64,
-    made: u64,
+pub struct BindGroupCache {
+    groups: RefCell<HashMap<Key, (wgpu::BindGroup, u64)>>,
+    clock: Cell<u64>,
+    made: Cell<u64>,
 }
 
-thread_local! {
-    static CACHE: RefCell<Cache> = RefCell::new(Cache::default());
-}
-
-/// `device.create_bind_group(descriptor)`, or the bind group made before for the same layout and
-/// the same buffers (and ranges), views, samplers and acceleration structures. For bind groups
-/// made from the frame's resources each frame: the same few then cost a hash lookup instead of a
-/// bind group a frame (a WebGPU call, and garbage on the web). A view of a texture made anew is
-/// another view, so a stale bind group is never returned; unused ones are dropped after a while,
-/// and all of them when a call comes for another device.
-pub fn cached_bind_group(device: &wgpu::Device, descriptor: &wgpu::BindGroupDescriptor) -> wgpu::BindGroup {
-    let Some(key) = Key::of(descriptor) else { return device.create_bind_group(descriptor) };
-    CACHE.with(|cache| {
-        let mut c = cache.borrow_mut();
-        if c.device.as_ref() != Some(device) {
-            c.groups.clear();
-            c.device = Some(device.clone());
-        }
-        c.clock += 1;
-        let now = c.clock;
+impl BindGroupCache {
+    /// `device.create_bind_group(descriptor)`, or the bind group made before for the same layout
+    /// and the same buffers (and ranges), views, samplers and acceleration structures.
+    pub fn get(&self, device: &wgpu::Device, descriptor: &wgpu::BindGroupDescriptor) -> wgpu::BindGroup {
+        let Some(key) = Key::of(descriptor) else { return device.create_bind_group(descriptor) };
+        let now = self.clock.get() + 1;
+        self.clock.set(now);
+        let mut groups = self.groups.borrow_mut();
         if now % SWEEP_EVERY == 0 {
-            c.groups.retain(|_, (_, used)| now - *used <= UNUSED_LOOKUPS);
+            groups.retain(|_, (_, used)| now - *used <= UNUSED_LOOKUPS);
         }
-        if let Some((group, used)) = c.groups.get_mut(&key) {
+        if let Some((group, used)) = groups.get_mut(&key) {
             *used = now;
             return group.clone();
         }
         let group = device.create_bind_group(descriptor);
-        c.made += 1;
-        c.groups.insert(key, (group.clone(), now));
+        self.made.set(self.made.get() + 1);
+        groups.insert(key, (group.clone(), now));
         group
-    })
-}
+    }
 
-/// Bind groups `cached_bind_group` has made on this thread, and holds now (for tests and stats).
-pub fn cached_bind_group_stats() -> (u64, usize) {
-    CACHE.with(|c| {
-        let c = c.borrow();
-        (c.made, c.groups.len())
-    })
+    /// Bind groups it has made, and holds now (for tests and stats).
+    pub fn stats(&self) -> (u64, usize) {
+        (self.made.get(), self.groups.borrow().len())
+    }
+
+    /// Drop them all (a device lost, the owner's resources made anew).
+    pub fn clear(&self) {
+        self.groups.borrow_mut().clear();
+    }
 }

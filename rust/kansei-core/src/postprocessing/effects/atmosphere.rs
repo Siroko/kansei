@@ -20,11 +20,13 @@ fn composite_source() -> String {
 pub struct AtmosphereEffect {
     sky: SkyAtmosphereBindings,
     gpu: Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
+    /// the bind groups its passes make from the frame's resources, kept
+    bind_groups: crate::renderers::BindGroupCache,
 }
 
 impl AtmosphereEffect {
     pub fn new(sky: &SkyAtmosphere) -> Self {
-        Self { sky: sky.bindings().clone(), gpu: None }
+        Self { bind_groups: Default::default(), sky: sky.bindings().clone(), gpu: None }
     }
 
     fn init_gpu(&mut self, device: &wgpu::Device) {
@@ -137,7 +139,7 @@ impl PostProcessingEffect for AtmosphereEffect {
             .enumerate()
             .map(|(i, resource)| wgpu::BindGroupEntry { binding: i as u32, resource })
             .collect();
-        let bind_group = crate::renderers::cached_bind_group(device, &wgpu::BindGroupDescriptor { label: Some("Atmosphere/CompositeBG"), layout: bgl, entries: &entries });
+        let bind_group = self.bind_groups.get(device, &wgpu::BindGroupDescriptor { label: Some("Atmosphere/CompositeBG"), layout: bgl, entries: &entries });
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("Atmosphere/Composite"), timestamp_writes: crate::profiling::gpu_pass("Atmosphere/Composite").as_ref().map(crate::profiling::PassStamp::compute) });
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
