@@ -30,7 +30,7 @@ fn renderer() -> Option<Renderer> {
     Some(renderer)
 }
 
-/// Lap `lap`'s scene: 60 blocks of sizes of its own (new meshes), one moving.
+/// Lap `lap`'s scene: 60 blocks and 8 dense meshes, new meshes of about the same sizes each lap, one moving.
 fn scene(lap: u32) -> (Scene, usize) {
     let lit = |c: [f32; 3]| Material::standard_lit("Lit", &StandardLitOptions { base_color: c, roughness: 0.6, ..Default::default() });
     let mut scene = Scene::new();
@@ -38,14 +38,14 @@ fn scene(lap: u32) -> (Scene, usize) {
     floor.object.set_position(0.0, -0.1, 0.0);
     scene.add(SceneNode::Renderable(floor));
     for k in 0..60 {
-        let s = 0.1 + 0.002 * (k as f32) + 0.01 * lap as f32;
+        let s = 0.1 + 0.002 * (k as f32) + 0.0001 * (lap % 7) as f32;
         let mut b = Renderable::new(BoxGeometry::new(s, s * 1.5, s), lit([0.7, 0.5, 0.3])).with_gi(GiSurface::new([0.7, 0.5, 0.3])).with_rt(RtSurface::new([0.7, 0.5, 0.3]));
         b.object.set_position(-2.5 + 0.6 * (k % 10) as f32, s * 0.75, -2.5 + 0.8 * (k / 10) as f32);
         scene.add(SceneNode::Renderable(b));
     }
     // dense meshes (a level's models): 8 of 20k triangles
     for k in 0..8 {
-        let mut d = Renderable::new(IcosphereGeometry::new(0.25 + 0.01 * lap as f32, 5), lit([0.5; 3])).with_gi(GiSurface::new([0.5; 3])).with_rt(RtSurface::new([0.5; 3]));
+        let mut d = Renderable::new(IcosphereGeometry::new(0.25 + 0.0001 * (lap % 7) as f32, 5), lit([0.5; 3])).with_gi(GiSurface::new([0.5; 3])).with_rt(RtSurface::new([0.5; 3]));
         d.object.set_position(-2.0 + 0.55 * k as f32, 1.2, 1.5);
         scene.add(SceneNode::Renderable(d));
     }
