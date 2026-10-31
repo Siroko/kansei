@@ -1323,6 +1323,8 @@ impl RtGrid {
         let keys: Vec<SourceKey> = sources.iter().map(source_key).collect();
         self.ensure_bind_groups(device, k);
         let (bgl, empty, layer) = (&self.gather_source_bgl, &self.empty, &mut self.layers[k]);
+        // (only this build's: a bind group holds its mesh's buffers, a scene unloaded since among them)
+        layer.source_groups.retain(|key, _| keys.contains(key));
         for (s, key) in sources.iter().zip(&keys) {
             let uniform = &layer.sources;
             layer.source_groups.entry(key.clone()).or_insert_with(|| {

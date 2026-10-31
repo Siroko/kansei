@@ -308,6 +308,8 @@ impl SceneRtGrid {
             chosen.push((idx, false, dynamic));
         }
         let moving_box = if moving_unbounded { None } else { moving_box };
+        // the meshes of renderables no longer in the scene (an unloaded level's)
+        self.meshes.retain(|idx, _| scene.get_renderable(*idx).is_some_and(|r| r.rt.is_some()));
         // the static layer's sources, then the moving layer's
         let mut sources = [Vec::new(), Vec::new()];
         for &(idx, clustered, dynamic) in &chosen {
