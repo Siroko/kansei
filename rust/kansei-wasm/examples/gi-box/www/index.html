@@ -128,7 +128,7 @@
         const rt = { ...s.rtgi };
         const rtFolder = pane.addFolder({ title: 'Hybrid RT GI', expanded: true });
         const rtgi = (key, value) => { set_rtgi(key, String(value)); sync(); };
-        rtFolder.addBinding(rt, 'res', { label: 'trace', options: { 'half (1 ray / 2x2)': 'half', 'full (1 ray / pixel)': 'full' } }).on('change', () => rtgi('res', rt.res));
+        rtFolder.addBinding(rt, 'res', { label: 'trace', options: { 'half (1 ray / 2x2)': 'half', 'full (1 ray / pixel)': 'full', 'quarter (1 ray / 4x4)': 'quarter' } }).on('change', () => rtgi('res', rt.res));
         rtFolder.addBinding(rt, 'denoise', { options: { SVGF: 'svgf', 'temporal only': 'temporal', 'off (1 spp)': 'off' } }).on('change', () => rtgi('denoise', rt.denoise));
         rtFolder.addBinding(rt, 'kernel', { label: 'wavelet', options: { '3x3': '3x3', '5x5': '5x5' } }).on('change', () => rtgi('kernel', rt.kernel));
         rtFolder.addBinding(rt, 'hit', { label: 'hits lit by', options: { 'direct light + voxel cone': 'direct', 'voxels only': 'voxels' } }).on('change', () => rtgi('hit', rt.hit));

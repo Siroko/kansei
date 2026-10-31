@@ -26,6 +26,14 @@
 // multisampled target gives, but every fragment once (some devices run a multisampled pass's
 // fragments once per sample) and its derivatives at pixel rate (per sample, they break at
 // triangle edges).
+//
+// In a multisampled pass a fragment's depth is the triangle's plane at the pixel's centre, which
+// may lie outside the triangle when only a sample is covered: for a triangle seen nearly edge on
+// (the side of a curved piece, along the axis it is almost parallel to) that is voxels in front
+// of or behind it, and the voxel written there is a surface that isn't (a spike off the piece,
+// a speck beside it). So a volume's passes skip the fragments of triangles that face their axis
+// less than `minFacing` (0.5: tilted past 60 degrees): every triangle faces some axis by 0.58 or
+// more, where its depth moves less than a voxel across a pixel, and that axis writes it.
 
 struct KanseiVoxelizeParams {
     clipToVoxel : mat4x4f,   // this axis' clip space to the region's voxel coordinates (voxel c spans [c, c + 1))
@@ -33,7 +41,7 @@ struct KanseiVoxelizeParams {
     words       : u32,       // u32 per voxel in the surfaces: 4, or 5 with the area (a clipmap's)
     viewport    : vec2f,     // pixels of this axis' viewport
     pixelArea   : f32,       // the share of a voxel face a pixel covers
-    _pad1       : f32,
+    minFacing   : f32,       // fragments of triangles facing this axis less (|n . viewDir|) write nothing
     dims        : vec3u,     // the volume's voxels (a clipmap level's window): voxels wrap around them
     _pad2       : u32,
     regionLo    : vec3i,     // the region's first voxel, in the volume's lattice (0 for a whole box)
@@ -110,10 +118,11 @@ fn kansei_voxel_write_coverage(fragPos: vec4f, front: bool, albedo: vec3f, emiss
     // front face is seen from outside)
     var n = cross(dpdx(v), dpdy(v));
     n = n * inverseSqrt(max(dot(n, n), 1e-20));
-    n = select(n, -n, dot(n, kansei_voxelize.viewDir) > 0.0);
+    let facing = dot(n, kansei_voxelize.viewDir);
+    n = select(n, -n, facing > 0.0);
     n = select(-n, n, front);
     let region = vec3f(kansei_voxelize.regionDims);
-    if (coverage <= 0.0 || any(v < vec3f(0.0)) || any(v >= region)) { return; }
+    if (coverage <= 0.0 || abs(facing) < kansei_voxelize.minFacing || any(v < vec3f(0.0)) || any(v >= region)) { return; }
     // the region's voxel, in the volume's lattice, stored in its texel (toroidally)
     let d = vec3i(kansei_voxelize.dims);
     let c = vec3u((((kansei_voxelize.regionLo + vec3i(min(floor(v), region - 1.0))) % d) + d) % d);

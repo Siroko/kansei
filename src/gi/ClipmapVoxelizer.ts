@@ -75,7 +75,7 @@ class RegionView {
             queue.writeBuffer(this.cameraBuffers[4 * a], 0, axis.view as Float32Array);
             queue.writeBuffer(this.cameraBuffers[4 * a + 1], 0, axis.projection as Float32Array);
             const viewport = axis.viewport.map((v) => v * PIXELS_PER_VOXEL) as [number, number];
-            queue.writeBuffer(this.params[a], 0, voxelizeParams({ ...axis, viewport }, layout.dims, region.lo, region.size, CLIP_SURFACE_WORDS, PIXELS_PER_VOXEL));
+            queue.writeBuffer(this.params[a], 0, voxelizeParams({ ...axis, viewport }, layout.dims, region.lo, region.size, CLIP_SURFACE_WORDS, PIXELS_PER_VOXEL, 0));
             this.viewports[a] = viewport;
             if (a === 0) mat4.multiply(this.viewProjection, axis.projection, axis.view);
         });
