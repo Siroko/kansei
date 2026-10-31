@@ -81,7 +81,10 @@
 //!   the vertical), `env_blur=0..1` (the HDRI background's softness), `env_spin=` (degrees a second:
 //!   the HDRI prepared again every frame, to time it);
 //! - `albedo=constant`, `rug=off` (the box without its rug), `ui=0` (no panel);
-//! - `stats=1`: triangles, frame interval and the GPU time of each pass (the renderer's profiling).
+//! - `stats=1`: triangles, frame interval and the GPU time of each pass (the renderer's profiling);
+//! - `record_pipelines=1`: every pipeline the page makes recorded (`window.kanseiPipelines.download()`
+//!   saves them as `pipelines.json`); `warm=1`: `www/pipelines.json`'s compiled before the device
+//!   comes, in parallel (`kansei_wasm::pipelines`).
 
 use wasm_bindgen::prelude::*;
 use std::cell::RefCell;
@@ -1584,6 +1587,13 @@ fn add_dragon(scene: &mut Scene, geometry: kansei_core::geometries::Geometry, re
 #[wasm_bindgen]
 pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let canvas = Canvas::find(canvas_id)?;
+    // `warm=1`: the pipelines `www/pipelines.json` recorded (`record_pipelines=1`) compiled before
+    // the device comes (kansei_wasm::pipelines)
+    if param("warm").as_deref() == Some("1") {
+        if let Ok(bytes) = kansei_wasm::fetch_bytes("pipelines.json").await {
+            kansei_wasm::pipelines::warm(std::str::from_utf8(&bytes).unwrap_or("{}")).await;
+        }
+    }
     let mut renderer = canvas.renderer(RendererConfig { sample_count: 1, clear_color: Vec4::new(0.0, 0.0, 0.0, 1.0), ..Default::default() }).await;
     renderer.enable_spot_shadows(2048, 1);
     let phone = is_phone();
