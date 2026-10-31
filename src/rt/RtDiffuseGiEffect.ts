@@ -18,9 +18,11 @@ import { RT_DEFAULT_COVERED_WGSL, RT_GI_COMPOSITE_WGSL, RT_GI_SVGF_WGSL, rtGiTra
 /**
  * What the rays are traced at: one ray for every pixel (`full`), or one for each 2 x 2 block
  * (`half`, a quarter of the rays), denoised there and upsampled by depth and normal: about a
- * quarter of the cost, what real-time scenes use. Rust: `rt::RtGiResolution`.
+ * quarter of the cost, what real-time scenes use; or one for each 4 x 4 block (`quarter`, a
+ * sixteenth), for a GPU that can't afford `half` at its resolution: the light keeps its shape,
+ * contacts finer than four pixels soften. Rust: `rt::RtGiResolution`.
  */
-export type RtGiResolution = 'full' | 'half';
+export type RtGiResolution = 'full' | 'half' | 'quarter';
 /**
  * What lights a ray's hit: the voxels' radiance there (`voxels`: the voxels as the surface cache,
  * no shadow rays, cheapest, but light leaks into contacts the voxels are too coarse for), or its
@@ -65,7 +67,7 @@ export type RtGiMode = 'hybrid' | 'reference';
 export type RtGiView = 'lit' | 'indirect' | 'signal' | 'variance' | 'history' | 'cost';
 
 /** The settings' names, in the order of the Rust enums' variants (what the WGSL and the accumulation key see). */
-export const RT_GI_RESOLUTIONS: readonly RtGiResolution[] = ['full', 'half'];
+export const RT_GI_RESOLUTIONS: readonly RtGiResolution[] = ['full', 'half', 'quarter'];
 export const RT_GI_HIT_LIGHTINGS: readonly RtGiHitLighting[] = ['voxels', 'direct'];
 export const RT_GI_SHADOWS: readonly RtGiShadows[] = ['rays', 'maps'];
 export const RT_GI_DENOISERS: readonly RtGiDenoise[] = ['off', 'temporal', 'svgf'];
@@ -433,7 +435,7 @@ export class RtDiffuseGiEffect extends PostProcessingEffect {
     }
 
     private downscale(): number {
-        return this._resolution === 'full' ? 1 : 2;
+        return this._resolution === 'full' ? 1 : this._resolution === 'half' ? 2 : 4;
     }
 
     public initialize(device: GPUDevice, _gbuffer: GBuffer, _camera: Camera): void {

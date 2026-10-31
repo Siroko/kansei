@@ -133,6 +133,10 @@ pub enum RtGiResolution {
     /// depth and normal. About a quarter of the cost; what real-time scenes use.
     #[default]
     Half,
+    /// One ray for each 4 x 4 block (a sixteenth of the rays), denoised and upsampled the same
+    /// way: for a GPU that can't afford `Half` at its resolution. The light keeps its shape;
+    /// contacts finer than four pixels soften.
+    Quarter,
 }
 
 impl RtGiResolution {
@@ -140,6 +144,7 @@ impl RtGiResolution {
         match self {
             Self::Full => 1,
             Self::Half => 2,
+            Self::Quarter => 4,
         }
     }
 }
@@ -245,7 +250,7 @@ macro_rules! named {
     };
 }
 
-named!(RtGiResolution { Full => "full", Half => "half" });
+named!(RtGiResolution { Full => "full", Half => "half", Quarter => "quarter" });
 named!(RtGiHitLighting { Voxels => "voxels", Direct => "direct" });
 named!(RtGiShadows { Rays => "rays", Maps => "maps" });
 named!(RtGiDenoise { Off => "off", Temporal => "temporal", Svgf => "svgf" });

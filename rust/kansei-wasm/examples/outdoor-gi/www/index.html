@@ -62,7 +62,7 @@
         const showRt = () => { rtFolder.hidden = p.gi !== 'rt' || !s.rtgi; };
         if (s.rtgi) {
             const rtgi = (key, value) => set_rtgi(key, String(value));
-            rtFolder.addBinding(rt, 'res', { label: 'trace', options: { 'half (1 ray / 2x2)': 'half', 'full (1 ray / pixel)': 'full' } }).on('change', () => rtgi('res', rt.res));
+            rtFolder.addBinding(rt, 'res', { label: 'trace', options: { 'half (1 ray / 2x2)': 'half', 'full (1 ray / pixel)': 'full', 'quarter (1 ray / 4x4)': 'quarter' } }).on('change', () => rtgi('res', rt.res));
             rtFolder.addBinding(rt, 'near', { label: 'near field (m)', min: 0, max: 32, step: 1 }).on('change', (e) => { if (e.last !== false) rtgi('near', rt.near); });
             rtFolder.addBinding(rt, 'denoise', { options: { SVGF: 'svgf', 'temporal only': 'temporal', 'off (1 spp)': 'off' } }).on('change', () => rtgi('denoise', rt.denoise));
             rtFolder.addBinding(rt, 'kernel', { label: 'wavelet', options: { '3x3': '3x3', '5x5': '5x5' } }).on('change', () => rtgi('kernel', rt.kernel));
