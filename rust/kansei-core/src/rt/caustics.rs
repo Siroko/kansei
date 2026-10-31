@@ -447,6 +447,8 @@ struct Gpu {
     photons: wgpu::ComputePipeline,
     resolve: wgpu::ComputePipeline,
     composite: wgpu::ComputePipeline,
+    /// its layout (the pipeline's `get_bind_group_layout` is another object each call)
+    composite_bgl: wgpu::BindGroupLayout,
     photon_group: wgpu::BindGroup,
     resolve_group: wgpu::BindGroup,
     /// the grid's group, with its generation
@@ -1067,6 +1069,7 @@ impl RtCausticsEffect {
             photons,
             resolve,
             composite,
+            composite_bgl,
             photon_group,
             resolve_group,
             grid_group: None,
@@ -1233,7 +1236,7 @@ impl PostProcessingEffect for RtCausticsEffect {
         }
         let composite_group = crate::renderers::cached_bind_group(device, &wgpu::BindGroupDescriptor {
             label: Some("RtCaustics/Composite"),
-            layout: &gpu.composite.get_bind_group_layout(0),
+            layout: &gpu.composite_bgl,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: gpu.composite_params.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(depth) },
