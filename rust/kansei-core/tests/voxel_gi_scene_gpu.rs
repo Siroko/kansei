@@ -1,11 +1,12 @@
 //! Voxel GI of a scene's meshes on a real GPU: a box voxelizes into its surface with outward
-//! normals, a material's voxel entry gives textured albedo, a spot light lights the voxels
-//! through its shadow map, and the screen-space cones see the sky through an empty volume.
+//! normals and a round piece onto its surface alone, a material's voxel entry gives textured
+//! albedo, a spot light lights the voxels through its shadow map, and the screen-space cones see
+//! the sky through an empty volume.
 //! Skipped (passes) when no adapter is available.
 
 use kansei_core::buffers::{Sampler, Texture};
 use kansei_core::cameras::Camera;
-use kansei_core::geometries::BoxGeometry;
+use kansei_core::geometries::{BoxGeometry, CylinderGeometry};
 use kansei_core::gi::{GiSurface, SceneVoxelGiOptions, VoxelGIEffect, VoxelGIOptions, VoxelGiQuality, VOXEL_WRITE_WGSL};
 use kansei_core::lights::{Light, SpotLight};
 use kansei_core::materials::{Binding, Material, MaterialOptions, ShaderStages};
@@ -219,6 +220,71 @@ fn a_voxelized_box_has_its_surface_and_its_normals() {
         assert!(*count > 50, "face {face}: {count} voxels");
         assert!(*outward as f32 >= 0.98 * *count as f32, "face {face}: {outward} of {count} face outward");
     }
+}
+
+/// Distance from `p` to the surface of the closed cylinder of `radius` round the y axis from
+/// y = 0 to `height` (positive outside and inside alike).
+fn cylinder_surface_distance(p: glam::Vec3, radius: f32, height: f32) -> f32 {
+    let (r, y) = (glam::Vec2::new(p.x, p.z).length(), p.y);
+    let (dr, dy) = (r - radius, (y - height * 0.5).abs() - height * 0.5);
+    if dr > 0.0 || dy > 0.0 {
+        glam::Vec2::new(dr.max(0.0), dy.max(0.0)).length()
+    } else {
+        -dr.max(dy)
+    }
+}
+
+/// A round piece voxelizes onto its surface alone: a 256-sided cylinder's sides, strips half a
+/// voxel wide, stand nearly edge on to the x and z passes where they turn away, and its caps are
+/// fans of slivers: triangles whose fragments a multisampled pass would write at their depth
+/// extrapolated to the pixel's centre, voxels off the piece (spikes off its sides, specks round it). Each pass draws only the triangles
+/// that face it by more than `MULTISAMPLED_MIN_FACING`; every triangle faces one, which covers it.
+#[test]
+fn a_round_piece_voxelizes_without_specks_off_its_surface() {
+    let Some(mut renderer) = renderer() else { return eprintln!("no GPU adapter: skipping") };
+    renderer.enable_voxel_gi(SceneVoxelGiOptions { quality: VoxelGiQuality::Low, bounds_min: [-1.0; 3], bounds_max: [1.0; 3], ..Default::default() });
+    let (radius, height, base) = (0.61, 0.57, glam::Vec3::new(0.03, -0.31, -0.02));
+    let albedo = [0.6, 0.4, 0.25];
+    let mut scene = Scene::new();
+    let mut round = Renderable::new(CylinderGeometry::new(radius, radius, height, 256, 1), surface_material(albedo)).with_gi(GiSurface::new(albedo));
+    round.object.set_position(base.x, base.y, base.z);
+    scene.add(SceneNode::Renderable(round));
+    let gbuffer = GBuffer::new(renderer.device(), W, H, 1);
+    let mut camera = camera();
+    renderer.render_scene_offscreen(&mut scene, &mut camera, &gbuffer);
+
+    let gi = renderer.voxel_gi().unwrap();
+    let layout = *gi.volume().layout();
+    let words = read_words(&renderer, gi.voxelizer().static_surfaces());
+    let vs = layout.voxel_size;
+    let [dx, dy, dz] = layout.dims;
+    let (mut shell, mut covered, mut stray, mut occupied, mut farthest) = (0, 0, 0, 0, 0.0f32);
+    for z in 0..dz {
+        for y in 0..dy {
+            for x in 0..dx {
+                let index = ((z * dy + y) * dx + x) as usize;
+                let centre = glam::Vec3::from(layout.origin) + (glam::UVec3::new(x, y, z).as_vec3() + 0.5) * vs - base;
+                let d = cylinder_surface_distance(centre, radius, height);
+                // the surface passes through the voxel (within its half diagonal of the centre)
+                if d < 0.5 * vs {
+                    shell += 1;
+                }
+                if surface_at(&words, index).is_none() {
+                    continue;
+                }
+                occupied += 1;
+                covered += (d < 0.5 * vs) as u32;
+                farthest = farthest.max(d / vs);
+                // a little past the surface: multisampled coverage reaches into the next voxel
+                if d > 1.5 * vs {
+                    stray += 1;
+                }
+            }
+        }
+    }
+    eprintln!("shell {shell} voxels, {covered} covered; {occupied} occupied, {stray} stray, the farthest {farthest:.2} voxels off");
+    assert!(covered as f32 >= 0.97 * shell as f32, "{covered} of {shell} surface voxels");
+    assert!(stray == 0, "{stray} voxels more than 1.5 voxels off the surface (the farthest {farthest:.2})");
 }
 
 /// A material's voxel entry puts its texture into the voxels: the box's top face, whose u runs

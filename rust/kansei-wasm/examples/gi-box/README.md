@@ -83,7 +83,7 @@ grid below; with `reflect=1`,
 |---|---|
 | `preset=<name>` | `hybrid`, `off`, `ssgi`, `voxel`, `best`, `indirect`, `voxels`, `phone`, `dragon`, `sdf`, `sdf-dragon`, `slice`, `probes`, `probe-view` or `probes-dragon` (`PRESETS` in `src/lib.rs`); applied first, the other parameters override it. Default `hybrid` (the hybrid path tracing, `gi=rt`) unless the URL has `gi=`; `best` is voxel + SSGI |
 | `gi=<mode>` | `off`; screen-space `low`, `medium`, `high` (or `ssgi`), `ultra`; `voxel`, `voxel+ssgi`, `probes`, `probes+ssgi`; `rt` (the hybrid; builds the grid of triangles, as `rt=1` does: the panel offers it only then, and reloads the page with `gi=rt` otherwise) |
-| `rtgi_res=half\|full` | the hybrid's rays: one for each 2 x 2 pixels (default) or one a pixel |
+| `rtgi_res=half\|full\|quarter` | the hybrid's rays: one for each 2 x 2 pixels (default), one a pixel, or one for each 4 x 4 |
 | `rtgi_denoise=svgf\|temporal\|off` | SVGF (default), its temporal accumulation alone, or the raw 1 spp signal |
 | `rtgi_kernel=3x3\|5x5` | SVGF's wavelet (default 3 x 3, half the cost) |
 | `rtgi_hit=direct\|voxels` | what lights the hits: their direct light plus a voxel cone (default), or the voxels alone |

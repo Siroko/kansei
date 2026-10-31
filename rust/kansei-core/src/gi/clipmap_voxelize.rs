@@ -86,7 +86,7 @@ impl RegionView {
             axis.apply(&mut self.cameras[a]);
             self.cameras[a].upload(queue);
             let viewport = axis.viewport.map(|v| v * PIXELS_PER_VOXEL);
-            let gpu = VoxelizeParamsGpu::new(axis.clip_to_voxel, axis.look, viewport, layout.dims, region.lo.to_array(), region.size.to_array(), CLIP_SURFACE_WORDS as u32, PIXELS_PER_VOXEL);
+            let gpu = VoxelizeParamsGpu::new(axis.clip_to_voxel, axis.look, viewport, layout.dims, region.lo.to_array(), region.size.to_array(), CLIP_SURFACE_WORDS as u32, PIXELS_PER_VOXEL, 0.0);
             queue.write_buffer(&self.params[a], 0, bytemuck::bytes_of(&gpu));
             self.viewports[a] = viewport;
         }

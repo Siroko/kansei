@@ -23,6 +23,13 @@ export interface GiSurface {
     opacity?: number;
 }
 
+/**
+ * How much a triangle must face an axis for a multisampled pass along it to write it
+ * (voxel_write.wgsl's `minFacing`): steeper, its fragments' depths are extrapolated off it. Rust:
+ * `gi::voxelize::MULTISAMPLED_MIN_FACING`.
+ */
+export const MULTISAMPLED_MIN_FACING = 0.5;
+
 /** Bytes of the WGSL `KanseiVoxelizeParams` (voxel_write.wgsl; Rust `VoxelizeParamsGpu`). */
 export const VOXELIZE_PARAMS_BYTES = 144;
 /** Bytes of the WGSL `KanseiVoxelDraw` (Rust `VoxelDrawGpu`). */
@@ -82,9 +89,10 @@ export function axisViews(lo: Vec3, voxelSize: number, dims: Vec3): AxisView[] {
 
 /**
  * The WGSL `KanseiVoxelizeParams` of an axis for region `[lo, lo + region)` of a volume of `dims`
- * voxels (stored toroidally, `words` u32 a voxel), drawn at `pixels` per voxel along each side.
+ * voxels (stored toroidally, `words` u32 a voxel), drawn at `pixels` per voxel along each side;
+ * triangles facing the axis less than `minFacing` write nothing (`MULTISAMPLED_MIN_FACING`).
  */
-export function voxelizeParams(axis: AxisView, dims: Vec3, lo: Vec3, region: Vec3, words: number, pixels: number): ArrayBuffer {
+export function voxelizeParams(axis: AxisView, dims: Vec3, lo: Vec3, region: Vec3, words: number, pixels: number, minFacing: number): ArrayBuffer {
     const data = new ArrayBuffer(VOXELIZE_PARAMS_BYTES);
     const f32 = new Float32Array(data);
     const u32 = new Uint32Array(data);
@@ -94,6 +102,7 @@ export function voxelizeParams(axis: AxisView, dims: Vec3, lo: Vec3, region: Vec
     u32[19] = words;
     f32.set(axis.viewport, 20);
     f32[22] = 1 / (pixels * pixels);
+    f32[23] = minFacing;
     u32.set(dims, 24);
     i32.set(lo, 28);
     u32.set(region, 32);
@@ -174,7 +183,7 @@ export class MeshVoxelizer {
             device.queue.writeBuffer(buffers[1], 0, axis.projection as Float32Array);
             this.cameraBuffers.push(...buffers);
             const params = uniform('VoxelGI/VoxelizeParams', VOXELIZE_PARAMS_BYTES);
-            device.queue.writeBuffer(params, 0, voxelizeParams(axis, layout.dims, [0, 0, 0], layout.dims, SURFACE_WORDS_PER_VOXEL, 1));
+            device.queue.writeBuffer(params, 0, voxelizeParams(axis, layout.dims, [0, 0, 0], layout.dims, SURFACE_WORDS_PER_VOXEL, 1, MULTISAMPLED_MIN_FACING));
             this.params.push(params);
             return device.createBindGroup({
                 label: 'VoxelGI/AxisCameraBG',

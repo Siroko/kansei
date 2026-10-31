@@ -33,7 +33,7 @@
 //!   voxel + SSGI at the device's tier);
 //! - `gi=off|low|medium|high|ultra|voxel|voxel+ssgi|probes|probes+ssgi|rt` (`rt`, or `rt=1`,
 //!   builds the grid of triangles at load; the panel reloads the page to switch to it without);
-//! - with `gi=rt`, the hybrid's settings (`RtGi`): `rtgi_res=half|full`,
+//! - with `gi=rt`, the hybrid's settings (`RtGi`): `rtgi_res=half|full|quarter`,
 //!   `rtgi_denoise=svgf|temporal|off`, `rtgi_kernel=3x3|5x5`, `rtgi_hit=direct|voxels`,
 //!   `rtgi_shadows=rays|maps`, `rtgi_mode=hybrid|reference` (a path tracer through the grid),
 //!   `rtgi_accum=1` (the running mean of the raw signal),
