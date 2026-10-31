@@ -5,8 +5,10 @@
 //! pixels and none to the shadowed ones; with the denoiser and contact rays on, the shadow is
 //! still where the CPU puts it. A slab of glass a little above the floor casts none: the grid's
 //! rays and the screen-space contact rays pass through it. Through the grid's cells and, where the adapter has ray queries,
-//! through hardware ray queries (`RtBackend::Hardware`). Skipped (passes) when no adapter is
-//! available.
+//! through hardware ray queries (`RtBackend::Hardware`). A box moving over the floor (`dynamic`,
+//! in the grid's moving layer) casts, frame after frame, through the denoiser, the shadow it casts
+//! from the static layer rebuilt every frame (`SceneRtGrid::set_moving_layer(false)`). Skipped
+//! (passes) when no adapter is available.
 
 use glam::{Vec3 as GVec3, Vec4Swizzles};
 use kansei_core::cameras::Camera;
@@ -315,4 +317,82 @@ fn shadows_through_the_grid_match_the_cpu() {
 #[test]
 fn shadows_through_hardware_ray_queries_match_the_cpu() {
     shadows_match_the_cpu(RtBackend::Hardware);
+}
+
+/// The lit view after `frames` frames of a box sliding and turning over the floor, the box
+/// `dynamic`, its triangles in the grid's moving layer or (`moving_layer` false) in its static
+/// layer, rebuilt every frame as the grid did before it had layers; and the frames that rebuilt the
+/// static layer.
+fn moving_box_frames(backend: RtBackend, moving_layer: bool, frames: usize) -> Option<(Vec<[f32; 4]>, usize)> {
+    let mut renderer = renderer()?;
+    renderer.enable_rt_grid(SceneRtGridOptions { grid: RtGridOptions { dims: [64, 32, 64], cell: 4.0 / 64.0, fixed_origin: Some(glam::Vec3::new(-2.0, -0.5, -2.0)), backend, ..Default::default() }, ..Default::default() });
+    renderer.rt_grid_mut().unwrap().set_moving_layer(moving_layer);
+    let mut scene = Scene::new();
+    let mut floor = Renderable::new(BoxGeometry::new(4.0, 0.2, 4.0), material()).with_rt(RtSurface::new([ALBEDO; 3]));
+    floor.object.set_position(0.0, -0.1, 0.0);
+    scene.add(SceneNode::Renderable(floor));
+    let mut still = Renderable::new(BoxGeometry::new(2.0 * BOX_HALF, 2.0 * BOX_HALF, 2.0 * BOX_HALF), material()).with_rt(RtSurface::new([ALBEDO; 3]));
+    still.object.set_position(BOX_CENTRE.x, BOX_CENTRE.y, BOX_CENTRE.z);
+    scene.add(SceneNode::Renderable(still));
+    let mut glass = Renderable::new(BoxGeometry::new(2.0 * GLASS_HALF.x, 2.0 * GLASS_HALF.y, 2.0 * GLASS_HALF.z), glass_material()).with_rt(RtSurface::glass([0.9; 3]));
+    glass.object.set_position(GLASS_CENTRE.x, GLASS_CENTRE.y, GLASS_CENTRE.z);
+    scene.add(SceneNode::Renderable(glass));
+    let mut mover = Renderable::new(BoxGeometry::new(0.3, 0.3, 0.3), material()).with_rt(RtSurface::new([ALBEDO; 3]));
+    mover.dynamic = true;
+    let mover = scene.add(SceneNode::Renderable(mover));
+    scene.add(SceneNode::Light(Light::Directional(DirectionalLight::new(Vec3::new(SUN_DIR.x, SUN_DIR.y, SUN_DIR.z), Vec3::new(1.0, 1.0, 1.0), SUN))));
+    let gbuffer = GBuffer::new(renderer.device(), W, H, 1);
+    let mut camera = camera();
+    let output = renderer.device().create_texture(&wgpu::TextureDescriptor {
+        label: None,
+        size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba16Float,
+        usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let output_view = output.create_view(&Default::default());
+    // the defaults: half resolution, accumulated, filtered, a soft sun, contact rays
+    let mut effect = RtShadowsEffect::new(renderer.rt_grid().unwrap().handle());
+    effect.view = RtShadowsView::Lit;
+    effect.update_lights(scene.lights());
+    let mut rebuilt = 0;
+    for f in 0..frames {
+        let t = f as f32 / 30.0;
+        let r = scene.get_renderable_mut(mover).unwrap();
+        r.object.set_position(0.5 + 0.6 * (t * 1.7).sin(), 0.35 + 0.1 * (t * 2.3).sin(), 0.3 * (t * 1.1).cos());
+        r.object.rotation.y = t * 0.9;
+        renderer.render_scene_offscreen(&mut scene, &mut camera, &gbuffer);
+        rebuilt += renderer.rt_grid().unwrap().stats().rebuilt as usize;
+        let mut encoder = renderer.device().create_command_encoder(&Default::default());
+        effect.render(renderer.device(), renderer.queue(), &mut encoder, &gbuffer, &gbuffer.color_view, &gbuffer.depth_view, &output_view, &camera, W, H);
+        renderer.queue().submit(Some(encoder.finish()));
+    }
+    Some((read_rgba16(&renderer, &output), rebuilt))
+}
+
+fn a_moving_box_casts_the_same_shadow_from_the_moving_layer(backend: RtBackend) {
+    const FRAMES: usize = 40;
+    let Some((layered, static_rebuilds)) = moving_box_frames(backend, true, FRAMES) else { return eprintln!("no GPU adapter: skipping") };
+    let (one, every) = moving_box_frames(backend, false, FRAMES).unwrap();
+    assert_eq!(every, FRAMES, "without the moving layer the box rebuilds the grid every frame");
+    assert!(static_rebuilds <= 2, "with it the static layer stands ({static_rebuilds} rebuilds)");
+    let differ = layered.iter().zip(&one).filter(|(a, b)| a != b).count();
+    let worst = layered.iter().zip(&one).map(|(a, b)| (0..3).map(|c| (a[c] - b[c]).abs()).fold(0.0, f32::max)).fold(0.0, f32::max);
+    let shadowed = one.iter().filter(|c| c[0] < 1e-3).count();
+    eprintln!("{backend:?}: {differ} of {} pixels differ (most by {worst}), {shadowed} in shadow", layered.len());
+    assert!(shadowed > 500, "the boxes cast shadows ({shadowed} pixels)");
+    assert_eq!(differ, 0, "the same image, pixel for pixel");
+}
+
+#[test]
+fn a_moving_box_casts_the_same_shadow_from_the_grid_moving_layer() {
+    a_moving_box_casts_the_same_shadow_from_the_moving_layer(RtBackend::Software);
+}
+
+#[test]
+fn a_moving_box_casts_the_same_shadow_through_hardware_ray_queries() {
+    a_moving_box_casts_the_same_shadow_from_the_moving_layer(RtBackend::Hardware);
 }

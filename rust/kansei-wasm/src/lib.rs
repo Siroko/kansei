@@ -67,6 +67,7 @@ mod frame_loop;
 mod input;
 mod page;
 pub mod perf;
+pub mod pipelines;
 mod worker;
 
 pub use canvas::Canvas;

@@ -1,7 +1,8 @@
 // Gathers a source's world triangles into the grid's (rt/grid.rs). A thread places a triangle
 // (`kansei_rt_place`, prepended, puts a mesh point where a record puts it, then `src.world`),
 // drops it when its box misses the grid's (widened by epsilon) or it has no area, and the
-// workgroup's survivors take their slots with one atomic. Included after rt_types.wgsl.
+// workgroup's survivors take their slots with one atomic, in the layer `grid` is (its box, its
+// triangles from `triangleBase`, its counters). Included after rt_types.wgsl.
 //
 // - `gather`: a mesh (`RtMesh` words: where its vertices and indices start, how many vertices and
 //   triangles it has, then the vertices, 4 words each, and the indices) placed once per record:
@@ -102,6 +103,10 @@ fn place(record: u32, a: vec3f, b: vec3f, c: vec3f) -> Placed {
     let gmax = grid.origin + vec3f(grid.dims) * grid.cell + grid.epsilon;
     let n = cross(p.v1 - p.v0, p.v2 - p.v0);
     p.keep = all(hi >= gmin) && all(lo <= gmax) && dot(n, n) > 1e-30;
+    if ((grid.flags & KANSEI_RT_CLIP) != 0u) {
+        let c = grid.moving;
+        p.keep = p.keep && all(hi >= c.origin - c.epsilon) && all(lo <= c.origin + vec3f(c.dims) * c.cell + c.epsilon);
+    }
     return p;
 }
 
@@ -130,10 +135,12 @@ fn recordWord(record: u32, word: u32, fallback: u32) -> u32 {
     return records[record * src.strideWords + word - 1u];
 }
 
-fn write(id: u32, p: Placed, uv: vec3u, record: u32) {
-    if (id >= grid.triangleCapacity) {
+// Write the layer's triangle `local` (at `grid.triangleBase + local`).
+fn write(local: u32, p: Placed, uv: vec3u, record: u32) {
+    if (local >= grid.triangleCapacity) {
         return;
     }
+    let id = grid.triangleBase + local;
     // a record's albedo is opaque (no F0); the source's keeps its own alpha (1 - its F0)
     let albedo = select(src.albedo, recordWord(record, src.albedoWord, src.albedo) | 0xff000000u, src.albedoWord != 0u && src.strideWords != 0u);
     let emission = recordWord(record, src.emissionWord, 0u);

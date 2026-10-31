@@ -11,6 +11,9 @@
 // axis, only the cells the plane crosses in each column, each confirmed by the separating axes of
 // a triangle and a box (Akenine-Moller 2001), every cell widened by `grid.epsilon` so a triangle
 // on a cell's face is listed on both sides of it.
+//
+// `grid` is the layer being built (rt_types.wgsl): its cells start at `cellsBase` in the cell
+// words, its triangles at `triangleBase` (the ids the cells list), and `counters` are its own.
 
 @group(0) @binding(0) var<uniform> grid : KanseiRtGrid;
 @group(0) @binding(1) var<storage, read_write> triangles : array<vec4f>;
@@ -63,7 +66,7 @@ fn triangleAt(id: u32) -> Tri {
 
 fn cellIndex(c: vec3i) -> u32 {
     let d = vec3i(grid.dims);
-    return u32((c.z * d.y + c.y) * d.x + c.x);
+    return grid.cellsBase + u32((c.z * d.y + c.y) * d.x + c.x);
 }
 
 fn macroIndex(c: vec3i) -> u32 {
@@ -186,10 +189,11 @@ const WIDE_COLUMNS : u32 = 32u;
 
 @compute @workgroup_size(64)
 fn count(@builtin(workgroup_id) wid: vec3u, @builtin(num_workgroups) groups: vec3u, @builtin(local_invocation_index) lane: u32) {
-    let id = threadTriangle(wid, groups, lane);
-    if (id >= triangleCount()) {
+    let local = threadTriangle(wid, groups, lane);
+    if (local >= triangleCount()) {
         return;
     }
+    let id = grid.triangleBase + local;
     let t = triangleAt(id);
     let r = cellRange(t);
     if (any(r.lo > r.hi)) {
@@ -214,8 +218,9 @@ fn count(@builtin(workgroup_id) wid: vec3u, @builtin(num_workgroups) groups: vec
 
 @compute @workgroup_size(64)
 fn fill(@builtin(workgroup_id) wid: vec3u, @builtin(num_workgroups) groups: vec3u, @builtin(local_invocation_index) lane: u32) {
-    let id = threadTriangle(wid, groups, lane);
-    if (id >= triangleCount() || (bitcast<u32>(triangles[id * 4u].w) & KANSEI_RT_BIG) != 0u) {
+    let local = threadTriangle(wid, groups, lane);
+    let id = grid.triangleBase + local;
+    if (local >= triangleCount() || (bitcast<u32>(triangles[id * 4u].w) & KANSEI_RT_BIG) != 0u) {
         return;
     }
     let t = triangleAt(id);
@@ -280,7 +285,7 @@ fn scan_blocks(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_inde
     for (var k = 0u; k < 4u; k++) {
         let i = base + k;
         if (i < total) {
-            v[k] = atomicLoad(&cells[i]);
+            v[k] = atomicLoad(&cells[grid.cellsBase + i]);
         }
         sum += v[k];
     }
@@ -289,7 +294,7 @@ fn scan_blocks(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_inde
     for (var k = 0u; k < 4u; k++) {
         let i = base + k;
         if (i < total) {
-            atomicStore(&cells[i], running);
+            atomicStore(&cells[grid.cellsBase + i], running);
         }
         running += v[k];
     }
@@ -331,5 +336,5 @@ fn scan_add(@builtin(global_invocation_id) gid: vec3u) {
     if (i >= grid.cellCount) {
         return;
     }
-    atomicAdd(&cells[i], atomicLoad(&counters[SUMS + i / 1024u]));
+    atomicAdd(&cells[grid.cellsBase + i], atomicLoad(&counters[SUMS + i / 1024u]));
 }
