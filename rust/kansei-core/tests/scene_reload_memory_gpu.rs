@@ -18,6 +18,26 @@ use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::renderers::{GBuffer, Renderer, RendererConfig};
 use kansei_core::rt::{RtGridOptions, RtSurface, SceneRtGridOptions};
 
+/// The Rust heap's live bytes (this test's allocator counts them).
+struct Counting;
+static LIVE: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+unsafe impl std::alloc::GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        LIVE.fetch_add(layout.size() as i64, std::sync::atomic::Ordering::Relaxed);
+        unsafe { std::alloc::System.alloc(layout) }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        LIVE.fetch_sub(layout.size() as i64, std::sync::atomic::Ordering::Relaxed);
+        unsafe { std::alloc::System.dealloc(ptr, layout) }
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        LIVE.fetch_add(new_size as i64 - layout.size() as i64, std::sync::atomic::Ordering::Relaxed);
+        unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
+    }
+}
+#[global_allocator]
+static ALLOCATOR: Counting = Counting;
+
 const W: u32 = 128;
 const H: u32 = 96;
 
@@ -115,9 +135,10 @@ fn reloading_scenes_holds_no_more_memory() {
         let Some(r) = report(&renderer) else { return eprintln!("no allocator report on this backend: skipped") };
         let h = renderer.device().get_internal_counters().hal;
         eprintln!(
-            "lap {lap}: allocator {:.1} MiB, process private {:.1} MiB; live buffers {} ({:.1} MiB), textures {} ({:.1} MiB), views {}, bind groups {}, layouts {}, render pipelines {}, compute pipelines {}, shader modules {}, samplers {}, query sets {}",
+            "lap {lap}: allocator {:.1} MiB, process private {:.1} MiB, Rust heap {:.1} MiB; live buffers {} ({:.1} MiB), textures {} ({:.1} MiB), views {}, bind groups {}, layouts {}, render pipelines {}, compute pipelines {}, shader modules {}, samplers {}, query sets {}",
             r.0 as f64 / (1 << 20) as f64,
             private_bytes() as f64 / (1 << 20) as f64,
+            LIVE.load(std::sync::atomic::Ordering::Relaxed) as f64 / (1 << 20) as f64,
             h.buffers.read(),
             h.buffer_memory.read() as f64 / (1 << 20) as f64,
             h.textures.read(),
