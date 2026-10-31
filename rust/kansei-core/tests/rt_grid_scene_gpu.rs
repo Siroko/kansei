@@ -254,12 +254,19 @@ fn the_grid_holds_exactly_what_the_renderables_place_in_its_box() {
     assert!(renderer.rt_grid().unwrap().stats().rebuilt);
     assert!(got.is_empty(), "nothing within 8 m of x = 30 ({} triangles)", got.len());
     // back, with the single box dynamic: it leaves the static layer (rebuilt once) for the moving
-    // layer, rebuilt every frame
-    renderer.render_scene_offscreen(&mut scene, &mut camera, &gbuffer);
+    // layer, rebuilt every frame. (Back first, until the grid rests: the hardware backend's BLAS,
+    // sized from the empty box's readback, outgrows it and rebuilds once more; and each frame's
+    // readback waited for, so its stats are that frame's.)
+    let device = renderer.device().clone();
+    for _ in 0..6 {
+        renderer.render_scene_offscreen(&mut scene, &mut camera, &gbuffer);
+        renderer.rt_grid_mut().unwrap().wait_readback(&device);
+    }
     scene.get_renderable_mut(single).unwrap().dynamic = true;
     let (mut rebuilt, mut moving) = (Vec::new(), Vec::new());
     for _ in 0..3 {
         renderer.render_scene_offscreen(&mut scene, &mut camera, &gbuffer);
+        renderer.rt_grid_mut().unwrap().wait_readback(&device);
         let s = renderer.rt_grid().unwrap().stats();
         rebuilt.push(s.rebuilt);
         moving.push((s.moving_rebuilt, s.moving_sources));
@@ -273,6 +280,7 @@ fn the_grid_holds_exactly_what_the_renderables_place_in_its_box() {
     assert_eq!((missing, extra), (0, 0));
     // it moves: the moving layer follows it, the static layer stands
     renderer.render_scene_offscreen(&mut scene, &mut camera, &gbuffer);
+    renderer.rt_grid_mut().unwrap().wait_readback(&device);
     scene.get_renderable_mut(single).unwrap().object.set_position(-2.0, 0.75, -4.5);
     renderer.render_scene_offscreen(&mut scene, &mut camera, &gbuffer);
     assert!(!renderer.rt_grid().unwrap().stats().rebuilt, "moving a dynamic renderable leaves the static layer");
