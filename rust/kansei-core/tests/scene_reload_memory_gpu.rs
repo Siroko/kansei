@@ -84,10 +84,18 @@ fn report(renderer: &Renderer) -> Option<(u64, BTreeMap<String, u64>)> {
 #[ignore]
 fn reloading_scenes_holds_no_more_memory() {
     let Some(mut renderer) = renderer() else { return eprintln!("no GPU adapter: skipped") };
-    renderer.enable_spot_shadows(512, 2);
-    renderer.enable_rt_grid(SceneRtGridOptions { grid: RtGridOptions { dims: [64, 32, 64], cell: 6.0 / 64.0, fixed_origin: Some(glam::Vec3::new(-3.0, -0.3, -3.0)), ..Default::default() }, ..Default::default() });
-    renderer.enable_voxel_gi(SceneVoxelGiOptions { quality: VoxelGiQuality::Low, bounds_min: [-3.0, -0.3, -3.0], bounds_max: [3.0, 2.7, 3.0], ..Default::default() });
-    renderer.voxel_gi_mut().unwrap().enable_sdf();
+    // (`RELOAD_FEATURES`: which of spot, rt, gi the renderer has; all by default)
+    let features = std::env::var("RELOAD_FEATURES").unwrap_or_else(|_| "spot,rt,gi".into());
+    if features.contains("spot") {
+        renderer.enable_spot_shadows(512, 2);
+    }
+    if features.contains("rt") {
+        renderer.enable_rt_grid(SceneRtGridOptions { grid: RtGridOptions { dims: [64, 32, 64], cell: 6.0 / 64.0, fixed_origin: Some(glam::Vec3::new(-3.0, -0.3, -3.0)), ..Default::default() }, ..Default::default() });
+    }
+    if features.contains("gi") {
+        renderer.enable_voxel_gi(SceneVoxelGiOptions { quality: VoxelGiQuality::Low, bounds_min: [-3.0, -0.3, -3.0], bounds_max: [3.0, 2.7, 3.0], ..Default::default() });
+        renderer.voxel_gi_mut().unwrap().enable_sdf();
+    }
     let gbuffer = GBuffer::new(renderer.device(), W, H, 1);
     let mut camera = Camera::new(50.0, 0.1, 50.0, W as f32 / H as f32);
     camera.set_position(0.0, 3.0, 5.0);
