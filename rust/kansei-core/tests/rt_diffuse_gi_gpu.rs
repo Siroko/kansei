@@ -1,8 +1,8 @@
 //! Ray-traced diffuse GI on a real GPU: a white floor beside a red wall, both lit by the sun.
 //! The floor's indirect light near the wall is red, and redder than far from it; the hybrid with
 //! its hit cone off converges to the one-bounce reference path tracer; the cone adds the voxels'
-//! further bounces; SVGF at half resolution keeps the converged signal's energy. Skipped (passes)
-//! when no adapter is available.
+//! further bounces; SVGF at half and at quarter resolution keeps the converged signal's energy.
+//! Skipped (passes) when no adapter is available.
 
 use kansei_core::cameras::Camera;
 use kansei_core::geometries::BoxGeometry;
@@ -209,6 +209,16 @@ fn the_floor_beside_a_red_wall_is_lit_red_and_the_hybrid_converges() {
     eprintln!("SVGF half resolution {ld} against converged {lc}");
     assert!((ld - lc).abs() <= 0.1 * lc, "SVGF keeps the energy within 10%: {ld} vs {lc}");
     assert!(svgf.memory_bytes() > 0 && svgf.memory_bytes() < (W as u64 * H as u64) * 40, "half resolution targets: {} bytes", svgf.memory_bytes());
+
+    // and at a quarter of the resolution (a ray for each 4 x 4 pixels), on a sixteenth of the
+    // rays: the floor near the wall still red, the energy kept, the targets a quarter of half's
+    let mut quarter = effect(RtDiffuseGiOptions { resolution: RtGiResolution::Quarter, ..Default::default() }, &renderer, &scene);
+    let sparse = run(&mut renderer, &mut scene, &mut quarter, 64);
+    let (lq, q_near) = (luminance(mean(&sparse, &surface)), mean(&sparse, &near));
+    eprintln!("SVGF quarter resolution {lq} against converged {lc}; near the wall {q_near:?}");
+    assert!((lq - lc).abs() <= 0.1 * lc, "SVGF at a quarter of the resolution keeps the energy within 10%: {lq} vs {lc}");
+    assert!(q_near[0] > 4.0 * q_near[1].max(q_near[2]), "the wall's light on the floor stays red: {q_near:?}");
+    assert!(quarter.memory_bytes() > 0 && quarter.memory_bytes() * 3 < svgf.memory_bytes(), "quarter resolution targets: {} bytes against {}", quarter.memory_bytes(), svgf.memory_bytes());
 
     // a sun 100 000 times brighter (an outdoor scene's luminance, thousands, with no
     // pre-exposure): SVGF denoises as it did. (Its luminance's second moment and variance in f16

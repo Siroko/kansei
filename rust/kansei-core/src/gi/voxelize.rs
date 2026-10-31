@@ -42,6 +42,10 @@ impl GiSurface {
     }
 }
 
+/// How much a triangle must face an axis for a multisampled pass along it to write it
+/// (voxel_write.wgsl's `minFacing`): steeper, its fragments' depths are extrapolated off it.
+pub(crate) const MULTISAMPLED_MIN_FACING: f32 = 0.5;
+
 /// The WGSL `KanseiVoxelizeParams` (voxel_write.wgsl).
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -51,7 +55,7 @@ pub(crate) struct VoxelizeParamsGpu {
     words: u32,
     viewport: [f32; 2],
     pixel_area: f32,
-    _pad1: f32,
+    min_facing: f32,
     dims: [u32; 3],
     _pad2: u32,
     region_lo: [i32; 3],
@@ -64,15 +68,16 @@ impl VoxelizeParamsGpu {
     /// An axis' parameters for region `[lo, lo + region)` of a volume of `dims` voxels (stored
     /// toroidally, `words` u32 a voxel), drawn at `pixels` per voxel along each side into a
     /// `viewport`: `clip_to_voxel` maps the axis' clip space to the region's voxel coordinates.
+    /// Triangles facing the axis less than `min_facing` write nothing (`MULTISAMPLED_MIN_FACING`).
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(clip_to_voxel: glam::Mat4, view_dir: glam::Vec3, viewport: [u32; 2], dims: [u32; 3], lo: [i32; 3], region: [u32; 3], words: u32, pixels: u32) -> Self {
+    pub(crate) fn new(clip_to_voxel: glam::Mat4, view_dir: glam::Vec3, viewport: [u32; 2], dims: [u32; 3], lo: [i32; 3], region: [u32; 3], words: u32, pixels: u32, min_facing: f32) -> Self {
         Self {
             clip_to_voxel: clip_to_voxel.to_cols_array(),
             view_dir: view_dir.to_array(),
             words,
             viewport: [viewport[0] as f32, viewport[1] as f32],
             pixel_area: 1.0 / (pixels * pixels) as f32,
-            _pad1: 0.0,
+            min_facing,
             dims,
             _pad2: 0,
             region_lo: lo,
@@ -259,7 +264,7 @@ impl MeshVoxelizer {
             camera.gpu_initialize(device, &shared.camera_bgl, light_buf);
             axis.apply(camera);
             camera.upload(queue);
-            let gpu = VoxelizeParamsGpu::new(axis.clip_to_voxel, axis.look, axis.viewport, layout.dims, [0; 3], layout.dims, SURFACE_WORDS_PER_VOXEL as u32, 1);
+            let gpu = VoxelizeParamsGpu::new(axis.clip_to_voxel, axis.look, axis.viewport, layout.dims, [0; 3], layout.dims, SURFACE_WORDS_PER_VOXEL as u32, 1, MULTISAMPLED_MIN_FACING);
             queue.write_buffer(&params[a], 0, bytemuck::bytes_of(&gpu));
         }
 
