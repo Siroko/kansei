@@ -289,7 +289,7 @@ impl PostProcessingEffect for MotionBlurEffect {
 
         let group = |layout: &wgpu::BindGroupLayout, resources: Vec<wgpu::BindingResource>| {
             let entries: Vec<_> = resources.into_iter().enumerate().map(|(i, resource)| wgpu::BindGroupEntry { binding: i as u32, resource }).collect();
-            device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("MotionBlur/BG"), layout, entries: &entries })
+            crate::renderers::cached_bind_group(device, &wgpu::BindGroupDescriptor { label: Some("MotionBlur/BG"), layout, entries: &entries })
         };
         let view = wgpu::BindingResource::TextureView;
         let params_res = || gpu.params.as_entire_binding();

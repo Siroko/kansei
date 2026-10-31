@@ -518,7 +518,7 @@ impl PostProcessingEffect for CinematicDepthOfFieldEffect {
 
         let group = |layout: &wgpu::BindGroupLayout, resources: Vec<(u32, wgpu::BindingResource)>| {
             let entries: Vec<_> = resources.into_iter().map(|(binding, resource)| wgpu::BindGroupEntry { binding, resource }).collect();
-            device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("CinematicDoF/BG"), layout, entries: &entries })
+            crate::renderers::cached_bind_group(device, &wgpu::BindGroupDescriptor { label: Some("CinematicDoF/BG"), layout, entries: &entries })
         };
         let view = wgpu::BindingResource::TextureView;
         let params_res = || gpu.params.as_entire_binding();

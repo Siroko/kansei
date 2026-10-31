@@ -1017,7 +1017,7 @@ impl PostProcessingEffect for RtDiffuseGiEffect {
                 entries.extend(anisotropic.iter().enumerate().map(|(i, v)| b(40 + i as u32, tex(v))));
             }
         }
-        let trace_group = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("RtGi/Trace"), layout: &gpu.trace_bgl, entries: &entries });
+        let trace_group = crate::renderers::cached_bind_group(device, &wgpu::BindGroupDescriptor { label: Some("RtGi/Trace"), layout: &gpu.trace_bgl, entries: &entries });
         // the grid's group, made anew when the grid's buffers or the alpha texture change
         let (bindings, generation) = self.grid.bindings();
         if gpu.grid_group.as_ref().is_none_or(|(g, alpha, _)| *g != generation || *alpha != self.alpha_texture) {
@@ -1030,7 +1030,7 @@ impl PostProcessingEffect for RtDiffuseGiEffect {
             });
             gpu.grid_group = Some((generation, self.alpha_texture.clone(), group));
         }
-        let temporal_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let temporal_group = crate::renderers::cached_bind_group(device, &wgpu::BindGroupDescriptor {
             label: Some("RtGi/Temporal"),
             layout: &gpu.temporal_bgl,
             entries: &[
@@ -1056,7 +1056,7 @@ impl PostProcessingEffect for RtDiffuseGiEffect {
             (_, RtGiDenoise::Svgf) if iterations == 0 => &t.integrated_view,
             (_, RtGiDenoise::Svgf) => &t.denoised,
         };
-        let composite_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let composite_group = crate::renderers::cached_bind_group(device, &wgpu::BindGroupDescriptor {
             label: Some("RtGi/Composite"),
             layout: &gpu.composite_bgl,
             entries: &[
@@ -1100,7 +1100,7 @@ impl PostProcessingEffect for RtDiffuseGiEffect {
         }
         if svgf {
             // the variance pass writes the second ping buffer; iteration i reads the other
-            let variance_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            let variance_group = crate::renderers::cached_bind_group(device, &wgpu::BindGroupDescriptor {
                 label: Some("RtGi/Variance"),
                 layout: &gpu.variance_bgl,
                 entries: &[b(20, buf(&gpu.params)), b(31, tex(&t.integrated_view)), b(32, tex(&t.moments[cur])), b(33, tex(&t.guide[cur])), b(34, buf(&t.ping[1]))],
@@ -1114,7 +1114,7 @@ impl PostProcessingEffect for RtDiffuseGiEffect {
             }
             const LABELS: [&str; MAX_ATROUS] = ["RtGi/Atrous1", "RtGi/Atrous2", "RtGi/Atrous3", "RtGi/Atrous4", "RtGi/Atrous5", "RtGi/Atrous6", "RtGi/Atrous7", "RtGi/Atrous8"];
             for (i, label) in LABELS.iter().enumerate().take(iterations) {
-                let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                let group = crate::renderers::cached_bind_group(device, &wgpu::BindGroupDescriptor {
                     label: Some("RtGi/Atrous"),
                     layout: &gpu.atrous_bgl,
                     entries: &[

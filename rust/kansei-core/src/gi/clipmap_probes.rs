@@ -315,7 +315,7 @@ impl ClipmapProbes {
                 wgpu::BindGroupEntry { binding: 3, resource: sky.as_entire_binding() },
             ];
             entries.extend(clipmap_entries(clipmap));
-            let group = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("VoxelClipmap/ProbesBG"), layout: &self.bgl, entries: &entries });
+            let group = crate::renderers::cached_bind_group(device, &wgpu::BindGroupDescriptor { label: Some("VoxelClipmap/ProbesBG"), layout: &self.bgl, entries: &entries });
             self.group = Some((group, sky.clone()));
         }
         let stamp = crate::profiling::gpu_pass("VoxelClipmap/Probes");

@@ -101,7 +101,7 @@ impl ScreenSpaceProjection {
         params: &ScreenSpaceParamsGpu,
     ) {
         queue.write_buffer(&self.params, 0, bytemuck::bytes_of(params));
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let bind_group = crate::renderers::cached_bind_group(device, &wgpu::BindGroupDescriptor {
             label: Some("PlanarReflection/ScreenSpaceBG"),
             layout: &self.bgl,
             entries: &[

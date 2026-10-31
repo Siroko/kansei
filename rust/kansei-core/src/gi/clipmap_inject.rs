@@ -233,7 +233,7 @@ impl ClipmapInjection {
                 ];
                 entries.extend(self.shadows.entries());
                 entries.extend(clipmap_entries(clipmap));
-                let group = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("VoxelClipmap/InjectBG"), layout: &self.bgl, entries: &entries });
+                let group = crate::renderers::cached_bind_group(device, &wgpu::BindGroupDescriptor { label: Some("VoxelClipmap/InjectBG"), layout: &self.bgl, entries: &entries });
                 self.groups[level as usize] = Some((group, dynamic.is_some()));
             }
             {

@@ -107,7 +107,7 @@ impl PostProcessingEffect for ColorGradingEffect {
         ];
         queue.write_buffer(self.params_buf.as_ref().unwrap(), 0, bytemuck::cast_slice(&data));
 
-        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let bg = crate::renderers::cached_bind_group(device, &wgpu::BindGroupDescriptor {
             label: None, layout: self.bgl.as_ref().unwrap(),
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(input) },

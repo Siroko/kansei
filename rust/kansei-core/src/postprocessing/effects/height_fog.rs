@@ -268,7 +268,7 @@ impl PostProcessingEffect for HeightFogEffect {
         };
         queue.write_buffer(&gpu.params, 0, bytemuck::bytes_of(&params));
         let sky = self.sky_lighting.as_ref().unwrap_or(&gpu.no_sky);
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let bind_group = crate::renderers::cached_bind_group(device, &wgpu::BindGroupDescriptor {
             label: Some("HeightFog/BG"),
             layout: &gpu.bgl,
             entries: &[

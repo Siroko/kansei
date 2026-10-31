@@ -1231,7 +1231,7 @@ impl PostProcessingEffect for RtCausticsEffect {
                 );
             }
         }
-        let composite_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let composite_group = crate::renderers::cached_bind_group(device, &wgpu::BindGroupDescriptor {
             label: Some("RtCaustics/Composite"),
             layout: &gpu.composite.get_bind_group_layout(0),
             entries: &[
