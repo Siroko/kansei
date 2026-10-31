@@ -402,7 +402,7 @@ impl SdfProbes {
             let aniso = volume.anisotropic_views().expect("SdfProbes read a volume with anisotropic mips");
             entries.extend(aniso.iter().enumerate().map(|(i, v)| wgpu::BindGroupEntry { binding: 40 + i as u32, resource: tex(v) }));
             entries.push(wgpu::BindGroupEntry { binding: 46, resource: tex(sdf.view()) });
-            device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("VoxelGI/ProbesBG"), layout: &self.bgl, entries: &entries })
+            crate::renderers::cached_bind_group(device, &wgpu::BindGroupDescriptor { label: Some("VoxelGI/ProbesBG"), layout: &self.bgl, entries: &entries })
         });
         self.bound = (has_dynamic, Some(sky.clone()));
 

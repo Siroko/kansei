@@ -360,7 +360,7 @@ impl PostProcessingVolume {
         let sampler = self.blit_sampler.as_ref().unwrap();
         let pipeline = self.blit_pipeline.as_ref().unwrap();
 
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let bind_group = crate::renderers::cached_bind_group(&self.device, &wgpu::BindGroupDescriptor {
             label: Some("Blit BindGroup"),
             layout: bgl,
             entries: &[

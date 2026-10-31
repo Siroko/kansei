@@ -734,7 +734,7 @@ impl PostProcessingEffect for ToneMapEffect {
         }
         let gpu = self.gpu.as_ref().unwrap();
 
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let bind_group = crate::renderers::cached_bind_group(device, &wgpu::BindGroupDescriptor {
             label: Some("ToneMap/BG"),
             layout: &gpu.bgl,
             entries: &[

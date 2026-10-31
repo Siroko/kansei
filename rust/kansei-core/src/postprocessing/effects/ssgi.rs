@@ -521,7 +521,7 @@ mod tests {
             multiview_mask: None,
             cache: None,
         });
-        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let bg = crate::renderers::cached_bind_group(device, &wgpu::BindGroupDescriptor {
             label: None,
             layout: &pipeline.get_bind_group_layout(0),
             entries: &[

@@ -228,7 +228,7 @@ impl PostProcessingEffect for TemporalAAEffect {
         queue.write_buffer(&gpu.params, 0, bytemuck::bytes_of(&params));
         let velocity = &gbuffer.velocity_view;
         let (read, write) = (gpu.read, 1 - gpu.read);
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let bind_group = crate::renderers::cached_bind_group(device, &wgpu::BindGroupDescriptor {
             label: Some("TAA/BG"),
             layout: &gpu.bgl,
             entries: &[

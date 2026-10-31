@@ -6,9 +6,9 @@
 // Included after rt_types.wgsl and rt_hit.wgsl; the module's `enable` goes first
 // (`rt::hoist_wgsl_enables`).
 //
-// The BLAS holds triangle `id` as primitive `id` (of its opaque geometry, or of its second,
-// non-opaque one when alpha-tested or glass), so a hit names the same triangle as the grid's
-// would. Only non-opaque candidates come back to the shader, for `kansei_rt_covered` and glass.
+// Each layer's BLAS holds its triangle `triangleBase + id` as primitive `id` (of its opaque
+// geometry, or of its second, non-opaque one when alpha-tested or glass), and its TLAS instance
+// carries `triangleBase` as its custom data, so a hit names the same triangle as the grid's would. Only non-opaque candidates come back to the shader, for `kansei_rt_covered` and glass.
 // `cells` is 0 and `tests` counts those candidates.
 
 enable wgpu_ray_query;
@@ -43,7 +43,7 @@ fn kansei_rt_trace(o: vec3f, d: vec3f, tMin: f32, tMax: f32, flags: u32) -> Kans
     while (rayQueryProceed(&rq)) {
         let c = rayQueryGetCandidateIntersection(&rq);
         hit.tests += 1u;
-        let id = c.primitive_index;
+        let id = c.instance_custom_data + c.primitive_index;
         let surface = kansei_rt_surface(id);
         if ((surface & KANSEI_RT_GLASS) != 0u && !glassHits) {
             continue;
@@ -62,7 +62,7 @@ fn kansei_rt_trace(o: vec3f, d: vec3f, tMin: f32, tMax: f32, flags: u32) -> Kans
     if (h.kind != RAY_QUERY_INTERSECTION_NONE) {
         hit.t = h.t;
         hit.found = true;
-        hit.triangle = h.primitive_index;
+        hit.triangle = h.instance_custom_data + h.primitive_index;
         hit.bary = h.barycentrics;
     }
     kansei_rt_finish(&hit, d);

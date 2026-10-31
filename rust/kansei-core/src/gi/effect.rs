@@ -625,7 +625,7 @@ impl PostProcessingEffect for VoxelGIEffect {
         let tex = wgpu::BindingResource::TextureView;
         let group = |label: &str, layout: &wgpu::BindGroupLayout, resources: Vec<wgpu::BindingResource>| {
             let entries: Vec<_> = resources.into_iter().enumerate().map(|(i, resource)| wgpu::BindGroupEntry { binding: i as u32, resource }).collect();
-            device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some(label), layout, entries: &entries })
+            crate::renderers::cached_bind_group(device, &wgpu::BindGroupDescriptor { label: Some(label), layout, entries: &entries })
         };
         let p = || gpu.params.as_entire_binding();
         let sky = self.sky_lighting.as_ref().unwrap_or(&gpu.gradient_sky);
@@ -641,7 +641,7 @@ impl PostProcessingEffect for VoxelGIEffect {
                     .collect();
                 trace_entries.extend(anisotropic.iter().enumerate().map(|(i, view)| wgpu::BindGroupEntry { binding: 40 + i as u32, resource: tex(view) }));
                 trace_entries.push(wgpu::BindGroupEntry { binding: 46, resource: tex(sdf_view) });
-                let trace = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("VoxelGI/TraceBG"), layout: &gpu.trace_bgl, entries: &trace_entries });
+                let trace = crate::renderers::cached_bind_group(device, &wgpu::BindGroupDescriptor { label: Some("VoxelGI/TraceBG"), layout: &gpu.trace_bgl, entries: &trace_entries });
                 (trace, (uniform, view, sampler))
             }
             Source::Clipmap { uniform, levels, sampler } => {
@@ -653,7 +653,7 @@ impl PostProcessingEffect for VoxelGIEffect {
                         .map(|(binding, resource)| wgpu::BindGroupEntry { binding, resource })
                         .collect();
                     entries.extend(levels.iter().enumerate().map(|(k, level)| wgpu::BindGroupEntry { binding: 51 + k as u32, resource: view(level) }));
-                    device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("VoxelGI/ClipmapTraceBG"), layout: &clipmap.bgl, entries: &entries })
+                    crate::renderers::cached_bind_group(device, &wgpu::BindGroupDescriptor { label: Some("VoxelGI/ClipmapTraceBG"), layout: &clipmap.bgl, entries: &entries })
                 };
                 if self.show_voxels {
                     // the clipmap's voxels in place of the lit image
@@ -670,7 +670,7 @@ impl PostProcessingEffect for VoxelGIEffect {
                         let view = wgpu::BindingResource::TextureView;
                         let resources = [(0, p()), (1, view(depth)), (2, view(&gbuffer.normal_view)), (6, sky.as_entire_binding()), (7, view(&t.trace)), (60, grid.as_entire_binding()), (61, probes.as_entire_binding())];
                         let entries: Vec<_> = resources.into_iter().map(|(binding, resource)| wgpu::BindGroupEntry { binding, resource }).collect();
-                        device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("VoxelGI/ClipmapProbeTraceBG"), layout: &clipmap.probe_trace_bgl, entries: &entries })
+                        crate::renderers::cached_bind_group(device, &wgpu::BindGroupDescriptor { label: Some("VoxelGI/ClipmapProbeTraceBG"), layout: &clipmap.probe_trace_bgl, entries: &entries })
                     }
                     None => entries(&t.trace),
                 };

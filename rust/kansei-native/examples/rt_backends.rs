@@ -10,6 +10,9 @@
 //!   blocks, the camera driving through it, so the grid rebuilds as its box steps along.
 //! - `particles`: glass-particles' room (96 × 64 × 96 cells) with a few hundred glass beads that
 //!   move every frame, rebuilt every frame, reflections and their glass pass.
+//! - `rolling`: the room with its glass ball moving (`dynamic`): the grid's moving layer holds it,
+//!   rebuilt every frame, the static layer built once (`--moving-layer off|both` also measures the
+//!   grid without the moving layer, rebuilt whole every frame, `SceneRtGrid::set_moving_layer`).
 //!
 //! Each backend renders in turn, blocks of frames alternating (other work on the GPU then weighs
 //! on both alike), and the profiler's pass times and the frame's wall time (the CPU waiting for
@@ -18,7 +21,7 @@
 //! builds have no pass for the profiler to time; `Rt/BlasInput` is the BLAS's vertices).
 //!
 //! ```text
-//! cargo run --release -p kansei-native --example rt_backends -- [room|room-static|room-rebuilt|drive|particles|all] [--backend both|software|hardware] [--dense N] [--size WxH] [--rounds N] [--frames N]
+//! cargo run --release -p kansei-native --example rt_backends -- [room|room-static|room-rebuilt|drive|particles|rolling|all] [--backend both|software|hardware] [--moving-layer on|off|both] [--dense N] [--size WxH] [--rounds N] [--frames N]
 //! ```
 
 use std::time::Instant;
@@ -35,11 +38,15 @@ use kansei_core::renderers::{GBuffer, Renderer, RendererConfig};
 use kansei_core::rt::{RtBackend, RtDiffuseGiEffect, RtDiffuseGiOptions, RtGlass, RtGridOptions, RtReflectionsEffect, RtReflectionsOptions, RtSurface, SceneRtGridOptions};
 
 /// The passes reported, in frame order.
-const PASSES: [&str; 12] = [
+const PASSES: [&str; 16] = [
     "Rt/Gather",
     "Rt/GridCount",
     "Rt/GridScan",
     "Rt/GridFill",
+    "Rt/GatherMoving",
+    "Rt/MovingCount",
+    "Rt/MovingScan",
+    "Rt/MovingFill",
     "Rt/BlasInput",
     "RtGi/Trace",
     "RtGi/Temporal",
@@ -57,11 +64,15 @@ enum Kind {
     RoomRebuilt,
     Drive,
     Particles,
+    /// the room, its glass ball moving
+    Rolling,
 }
 
 struct Args {
     scenes: Vec<Kind>,
     backends: Vec<RtBackend>,
+    /// with the grid's moving layer, without, or both
+    layers: Vec<bool>,
     dense: u32,
     size: (u32, u32),
     rounds: usize,
@@ -69,7 +80,7 @@ struct Args {
 }
 
 fn args() -> Args {
-    let mut a = Args { scenes: vec![Kind::Room, Kind::RoomRebuilt, Kind::Drive, Kind::Particles], backends: vec![RtBackend::Software, RtBackend::Hardware], dense: 5, size: (1920, 1080), rounds: 4, frames: 24 };
+    let mut a = Args { scenes: vec![Kind::Room, Kind::RoomRebuilt, Kind::Drive, Kind::Particles], backends: vec![RtBackend::Software, RtBackend::Hardware], layers: vec![true], dense: 5, size: (1920, 1080), rounds: 4, frames: 24 };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -78,6 +89,14 @@ fn args() -> Args {
             "room-rebuilt" => a.scenes = vec![Kind::RoomRebuilt],
             "drive" => a.scenes = vec![Kind::Drive],
             "particles" => a.scenes = vec![Kind::Particles],
+            "rolling" => a.scenes = vec![Kind::Rolling],
+            "--moving-layer" => {
+                a.layers = match it.next().as_deref() {
+                    Some("off") => vec![false],
+                    Some("both") => vec![true, false],
+                    _ => vec![true],
+                }
+            }
             "all" => {}
             "--backend" => {
                 a.backends = match it.next().as_deref() {
@@ -125,6 +144,8 @@ struct Setup {
     camera: Box<dyn Fn(usize) -> ([f32; 3], [f32; 3])>,
     /// beads that move each frame
     beads: Vec<(usize, [f32; 3])>,
+    /// the room's glass ball
+    ball: Option<usize>,
     glass: bool,
     gi: bool,
 }
@@ -151,13 +172,14 @@ fn room(renderer: &mut Renderer, dense: u32) -> Setup {
     scene.add(SceneNode::Renderable(chrome));
     let mut glass = glass_ball(0.3, 4);
     glass.object.set_position(-0.1, 0.33, -0.45);
-    scene.add(SceneNode::Renderable(glass));
+    let ball = scene.add(SceneNode::Renderable(glass));
     lamp(&mut scene);
     Setup {
         scene,
         grid: SceneRtGridOptions { grid: RtGridOptions { dims: [96, 96, 96], cell: 4.6 / 96.0, fixed_origin: Some(glam::Vec3::new(-2.3, -0.3, -4.3)), ..Default::default() }, ..Default::default() },
         camera: Box::new(|_| ([0.0, 2.0, 4.2], [0.0, 1.6, -2.0])),
         beads: Vec::new(),
+        ball: Some(ball),
         glass: true,
         gi: true,
     }
@@ -204,6 +226,7 @@ fn drive(renderer: &mut Renderer) -> Setup {
             ([0.0, 1.6, z], [0.0, 1.4, z - 10.0])
         }),
         beads: Vec::new(),
+        ball: None,
         glass: false,
         gi: true,
     }
@@ -229,6 +252,7 @@ fn particles(renderer: &mut Renderer) -> Setup {
         grid: SceneRtGridOptions { grid: RtGridOptions { dims: [96, 64, 96], cell: 6.0 / 96.0, fixed_origin: Some(glam::Vec3::new(-3.0, -0.2, -3.0)), ..Default::default() }, rebuild_every_frame: true, ..Default::default() },
         camera: Box::new(|_| ([0.0, 1.8, 4.5], [0.0, 1.2, 0.0])),
         beads,
+        ball: None,
         glass: true,
         gi: false,
     }
@@ -273,12 +297,22 @@ fn run(kind: Kind, args: &Args, adapter: &wgpu::Adapter) {
         }
         Kind::Drive => drive(&mut renderer),
         Kind::Particles => particles(&mut renderer),
+        Kind::Rolling => {
+            let mut s = room(&mut renderer, args.dense);
+            let ball = s.ball.unwrap();
+            let r = s.scene.get_renderable_mut(ball).unwrap();
+            r.dynamic = true;
+            let p = r.object.position;
+            s.beads.push((ball, [p.x, p.y, p.z]));
+            s
+        }
     };
     let name = match kind {
         Kind::Room => format!("room (dense mesh of {} triangles)", 20 * 4u64.pow(args.dense)),
         Kind::RoomRebuilt => format!("room, rebuilt every frame (dense mesh of {} triangles)", 20 * 4u64.pow(args.dense)),
         Kind::Drive => "drive (grid round a moving eye)".into(),
         Kind::Particles => "particles (400 glass beads, rebuilt every frame)".into(),
+        Kind::Rolling => format!("room, its glass ball moving (dense mesh of {} triangles)", 20 * 4u64.pow(args.dense)),
     };
     let gbuffer = GBuffer::new(renderer.device(), w, h, 1);
     let target = |label| {
@@ -299,11 +333,14 @@ fn run(kind: Kind, args: &Args, adapter: &wgpu::Adapter) {
     let ping = [target("Bench/A"), target("Bench/B")];
     let mut camera = Camera::new(50.0, 0.1, 300.0, w as f32 / h as f32);
     renderer.set_profiling(true);
-    let mut totals: Vec<Totals> = args.backends.iter().map(|_| Totals::default()).collect();
+    // each backend with and without the moving layer, as asked
+    let modes: Vec<(RtBackend, bool)> = args.backends.iter().flat_map(|&b| args.layers.iter().map(move |&l| (b, l))).collect();
+    let mut totals: Vec<Totals> = modes.iter().map(|_| Totals::default()).collect();
     let warmup = 12;
     for round in 0..args.rounds {
-        for (b, &backend) in args.backends.iter().enumerate() {
+        for (b, &(backend, layer)) in modes.iter().enumerate() {
             renderer.enable_rt_grid(SceneRtGridOptions { grid: RtGridOptions { backend, ..setup.grid.grid }, ..setup.grid });
+            renderer.rt_grid_mut().unwrap().set_moving_layer(layer);
             let mut fx = effects(&renderer, &setup);
             for k in 0..warmup + args.frames {
                 let measured = k >= warmup;
@@ -345,7 +382,8 @@ fn run(kind: Kind, args: &Args, adapter: &wgpu::Adapter) {
             }
             let t = &mut totals[b];
             let stats = renderer.rt_grid().unwrap().stats().grid;
-            (t.triangles, t.accel) = (stats.triangles, stats.accel_triangles);
+            let moving = if stats.moving_cells > 0 { stats.moving_triangles } else { 0 };
+            (t.triangles, t.accel) = (stats.triangles + moving, stats.accel_triangles);
             for p in &profile.gpu {
                 match t.passes.iter_mut().find(|(l, _, _)| *l == p.label) {
                     Some(e) => {
@@ -355,17 +393,19 @@ fn run(kind: Kind, args: &Args, adapter: &wgpu::Adapter) {
                     None => t.passes.push((p.label, p.busy_ms, 1)),
                 }
             }
-            eprintln!("  block {round} {backend:?}: wall {:.2} ms", median(&totals[b].wall[totals[b].wall.len() - args.frames..]));
+            eprintln!("  block {round} {backend:?} (moving layer {layer}): wall {:.2} ms", median(&totals[b].wall[totals[b].wall.len() - args.frames..]));
         }
     }
     let info = renderer.adapter_info();
     println!("\n## {name}\n{} ({:?}), {w}x{h}, {} rounds of {} frames a backend", info.name, info.backend, args.rounds, args.frames);
-    let header: Vec<String> = args.backends.iter().map(|b| format!("{b:?}")).collect();
+    let header: Vec<String> = modes.iter().map(|(b, l)| if args.layers.len() > 1 { format!("{b:?}, {}", if *l { "moving layer" } else { "one layer" }) } else { format!("{b:?}") }).collect();
     println!("| | {} |", header.join(" | "));
-    println!("|---|{}", "---|".repeat(args.backends.len()));
+    println!("|---|{}", "---|".repeat(modes.len()));
     println!("| grid triangles | {} |", totals.iter().map(|t| t.triangles.to_string()).collect::<Vec<_>>().join(" | "));
     println!("| frame, wall (median) | {} |", totals.iter().map(|t| format!("{:.2} ms", median(&t.wall))).collect::<Vec<_>>().join(" | "));
     println!("| BLAS triangles | {} |", totals.iter().map(|t| if t.accel > 0 { t.accel.to_string() } else { "—".into() }).collect::<Vec<_>>().join(" | "));
+    // every pass the profiler timed, a frame (Apple GPUs overlap passes: more than the span)
+    println!("| GPU, all passes | {} |", totals.iter().map(|t| format!("{:.2} ms", t.passes.iter().map(|(_, ms, n)| ms / *n as f64).sum::<f64>())).collect::<Vec<_>>().join(" | "));
     for label in PASSES {
         if totals.iter().all(|t| t.passes.iter().all(|(l, _, _)| *l != label)) {
             continue;

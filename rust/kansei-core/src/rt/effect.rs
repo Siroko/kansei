@@ -1006,7 +1006,7 @@ impl PostProcessingEffect for RtReflectionsEffect {
                     e.push(wgpu::BindGroupEntry { binding: 19, resource: tex(&gbuffer.background_depth_view) });
                 }
             }
-            device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some(label), layout: if glass { &gpu.glass_bgl } else { &gpu.trace_bgl }, entries: &e })
+            crate::renderers::cached_bind_group(device, &wgpu::BindGroupDescriptor { label: Some(label), layout: if glass { &gpu.glass_bgl } else { &gpu.trace_bgl }, entries: &e })
         };
         let trace_group = group("RtReflections/Trace", &t.trace, lit, false);
         // without the reflections the glass pass writes the output itself
@@ -1019,7 +1019,7 @@ impl PostProcessingEffect for RtReflectionsEffect {
             let albedo = self.albedo_texture.as_ref().unwrap_or(&gpu.white_array);
             let (caustics, caustics_uniform) = self.caustics.as_ref().map_or((&gpu.no_caustics.0, &gpu.no_caustics.1), |(v, b)| (v, b));
             let [e0, e1, e2] = bindings.entries(0);
-            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            let group = crate::renderers::cached_bind_group(device, &wgpu::BindGroupDescriptor {
                 label: Some("RtReflections/Grid"),
                 layout: &gpu.grid_bgl,
                 entries: &[
@@ -1036,7 +1036,7 @@ impl PostProcessingEffect for RtReflectionsEffect {
             });
             gpu.grid_group = Some((generation, textures, group));
         }
-        let resolve_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let resolve_group = crate::renderers::cached_bind_group(device, &wgpu::BindGroupDescriptor {
             label: Some("RtReflections/Resolve"),
             layout: &gpu.resolve_bgl,
             entries: &[

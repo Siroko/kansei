@@ -17,8 +17,11 @@ const MACRO = 4;
 const COUNTER_WORDS = 1056;
 /** Bytes between sources' parameters (WebGPU's dynamic uniform offset alignment, at most). */
 const SOURCE_STRIDE = 256;
-/** Bytes of the WGSL `KanseiRtGrid` (rt_types.wgsl; Rust `RtGridGpu`). */
-export const RT_GRID_UNIFORM_BYTES = 80;
+/**
+ * Bytes of the WGSL `KanseiRtGrid` (rt_types.wgsl; Rust `RtGridGpu`): the static layer, then the
+ * moving layer, which Rust's `RtGrid::begin_moving` builds and this port leaves empty (its words 0).
+ */
+export const RT_GRID_UNIFORM_BYTES = 192;
 /** Bytes of the WGSL `RtSource` (rt_gather.wgsl; Rust `RtSourceGpu`). */
 const RT_SOURCE_BYTES = 112;
 const NO_WORD = 0xffffffff;

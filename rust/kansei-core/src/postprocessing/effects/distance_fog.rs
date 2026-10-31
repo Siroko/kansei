@@ -194,7 +194,7 @@ impl PostProcessingEffect for DistanceFogEffect {
         let params = self.params(camera);
         let gpu = self.gpu.as_ref().unwrap();
         queue.write_buffer(&gpu.params, 0, bytemuck::bytes_of(&params));
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let bind_group = crate::renderers::cached_bind_group(device, &wgpu::BindGroupDescriptor {
             label: Some("DistanceFog/BG"),
             layout: &gpu.bgl,
             entries: &[

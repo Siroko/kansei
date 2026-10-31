@@ -178,7 +178,7 @@ impl PostProcessingEffect for ScreenSpaceGlassEffect {
         };
         queue.write_buffer(&gpu.params, 0, bytemuck::bytes_of(&params));
         let tex = wgpu::BindingResource::TextureView;
-        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let group = crate::renderers::cached_bind_group(device, &wgpu::BindGroupDescriptor {
             label: Some("SsGlass/BindGroup"),
             layout: &gpu.bgl,
             entries: &[

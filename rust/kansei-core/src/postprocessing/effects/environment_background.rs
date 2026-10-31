@@ -134,7 +134,7 @@ impl PostProcessingEffect for EnvironmentBackgroundEffect {
         queue.write_buffer(&gpu.uniform, 0, bytemuck::bytes_of(&params));
         let map = self.map.as_ref().unwrap_or(&gpu.no_map);
         let tex = wgpu::BindingResource::TextureView;
-        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let group = crate::renderers::cached_bind_group(device, &wgpu::BindGroupDescriptor {
             label: Some("EnvironmentBackground"),
             layout: &gpu.bgl,
             entries: &[
