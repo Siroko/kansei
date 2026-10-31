@@ -94,7 +94,7 @@ fn reloading_scenes_holds_no_more_memory() {
     camera.look_at(&Vec3::new(0.0, 0.0, 0.0));
     camera.update_projection_matrix();
     let mut laps = Vec::new();
-    for lap in 0..8 {
+    for lap in 0..16 {
         {
             let (mut scene, mover) = scene(lap);
             for f in 0..6 {
@@ -106,7 +106,7 @@ fn reloading_scenes_holds_no_more_memory() {
         eprintln!("lap {lap}: allocator {:.1} MiB, process private {:.1} MiB", r.0 as f64 / (1 << 20) as f64, private_bytes() as f64 / (1 << 20) as f64);
         laps.push(r);
     }
-    let (first, last) = (&laps[2], &laps[laps.len() - 1]);
+    let (first, last) = (&laps[4], &laps[laps.len() - 1]);
     let mut grew: Vec<(String, i64)> = last.1.iter().map(|(k, v)| (k.clone(), *v as i64 - *first.1.get(k).unwrap_or(&0) as i64)).filter(|(_, d)| *d != 0).collect();
     grew.sort_by_key(|(_, d)| -d.abs());
     for (k, d) in grew.iter().take(20) {
