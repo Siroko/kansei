@@ -126,6 +126,9 @@ pub struct SpotShadowCacheStats {
     pub live_draws: u32,
     /// Still casters the layers took from the cache without drawing them.
     pub kept: u32,
+    /// Texels the layers took back from their cache (where moving casters were drawn the frame
+    /// before, or all of a layer whose cache was drawn again).
+    pub restored_texels: u32,
 }
 
 pub struct Renderer {
@@ -2386,27 +2389,52 @@ impl Renderer {
                     (c.0, c.2).hash(&mut h);
                 }
                 let key = h.finish();
+                atlas.ensure_cache(device);
                 if atlas.cache_keys[layer as usize] != Some(key) {
-                    atlas.cache_view(device, layer);
-                    let mut pass = spot_shadow_pass(&mut encoder, atlas.cache_view(device, layer), wgpu::LoadOp::Clear(1.0), "Renderer/SpotShadowCache");
+                    let mut pass = spot_shadow_pass(&mut encoder, atlas.cache_view(layer), wgpu::LoadOp::Clear(1.0), "Renderer/SpotShadowCache");
                     pass.set_bind_group(1, atlas.camera(layer).bind_group().unwrap(), &[]);
                     for &&(idx, _, _) in &still {
                         stats.cached_draws += draw_spot_caster(&mut pass, scene, idx, layer, mesh_bg, alignment, cuts) as u32;
                     }
                     drop(pass);
                     atlas.cache_keys[layer as usize] = Some(key);
+                    atlas.dirty[layer as usize] = None;
                     stats.layers_recached += 1;
                 } else {
                     stats.kept += still.len() as u32;
                 }
-                atlas.copy_cache(&mut encoder, layer);
+                // the layer is its cache but where the moving casters were drawn last frame (all
+                // of it after the cache was drawn): put the cache back there, draw them again
+                let res = atlas.resolution;
+                let restore = atlas.dirty[layer as usize].unwrap_or(Some([0, 0, res, res]));
+                let live: Vec<usize> = casters.iter().filter(|c| !c.1).filter(in_view).map(|c| c.0).collect();
+                let mut drawn: Option<[u32; 4]> = None;
+                for &idx in &live {
+                    let r = scene.get_renderable(idx).unwrap();
+                    let rect = shadow_rect(r, view_proj, res).unwrap_or([0, 0, res, res]);
+                    drawn = Some(drawn.map_or(rect, |d| [d[0].min(rect[0]), d[1].min(rect[1]), d[2].max(rect[2]), d[3].max(rect[3])]));
+                }
+                if restore.is_some() || !live.is_empty() {
+                    let mut pass = spot_shadow_pass(&mut encoder, atlas.layer_view(layer), wgpu::LoadOp::Load, "Renderer/SpotShadowPass");
+                    if let Some(rect) = restore {
+                        atlas.restore(&mut pass, layer, rect);
+                        stats.restored_texels += (rect[2] - rect[0]) * (rect[3] - rect[1]);
+                    }
+                    pass.set_bind_group(1, atlas.camera(layer).bind_group().unwrap(), &[]);
+                    for &idx in &live {
+                        stats.live_draws += draw_spot_caster(&mut pass, scene, idx, layer, mesh_bg, alignment, cuts) as u32;
+                    }
+                }
+                atlas.dirty[layer as usize] = Some(drawn);
+                continue;
             }
-            let load = if cached { wgpu::LoadOp::Load } else { wgpu::LoadOp::Clear(1.0) };
-            let mut pass = spot_shadow_pass(&mut encoder, atlas.layer_view(layer), load, "Renderer/SpotShadowPass");
+            let mut pass = spot_shadow_pass(&mut encoder, atlas.layer_view(layer), wgpu::LoadOp::Clear(1.0), "Renderer/SpotShadowPass");
             pass.set_bind_group(1, atlas.camera(layer).bind_group().unwrap(), &[]);
-            for &(idx, _, _) in casters.iter().filter(|c| !(cached && c.1)).filter(in_view) {
+            for &(idx, _, _) in casters.iter().filter(in_view) {
                 stats.live_draws += draw_spot_caster(&mut pass, scene, idx, layer, mesh_bg, alignment, cuts) as u32;
             }
+            drop(pass);
+            atlas.dirty[layer as usize] = None;
         }
         self.spot_cache_stats = stats;
         queue.submit(std::iter::once(encoder.finish()));
@@ -4501,4 +4529,33 @@ fn caster_fingerprint(r: &crate::objects::Renderable, pipeline: Option<&wgpu::Re
     pipeline.hash(&mut h);
     r.material.bind_group().hash(&mut h);
     h.finish()
+}
+
+/// The texels (`[x0, y0, x1, y1)`) of a shadow map of `res`² for `view_proj` that a caster can
+/// cover: its bounding sphere's box projected, two texels wider. None when that isn't known (no
+/// sphere, instances, a cut) or the box reaches behind the light.
+fn shadow_rect(r: &crate::objects::Renderable, view_proj: glam::Mat4, res: u32) -> Option<[u32; 4]> {
+    if r.clusters.is_some() || r.geometry.is_instanced() || r.geometry.is_indirect() {
+        return None;
+    }
+    let (centre, radius) = caster(r).bounding_sphere()?;
+    let world = r.world_matrix.to_glam();
+    let scale = world.x_axis.truncate().length().max(world.y_axis.truncate().length()).max(world.z_axis.truncate().length());
+    let (c, radius) = (world.transform_point3(centre), radius * scale);
+    let (mut lo, mut hi) = (glam::Vec2::splat(f32::MAX), glam::Vec2::splat(f32::MIN));
+    for k in 0..8 {
+        let corner = c + glam::Vec3::new(if k & 1 == 0 { -radius } else { radius }, if k & 2 == 0 { -radius } else { radius }, if k & 4 == 0 { -radius } else { radius });
+        let p = view_proj * corner.extend(1.0);
+        if p.w <= 1e-6 {
+            return None;
+        }
+        let ndc = glam::Vec2::new(p.x, p.y) / p.w;
+        // texels: x right, y down
+        let t = glam::Vec2::new(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5) * res as f32;
+        lo = lo.min(t);
+        hi = hi.max(t);
+    }
+    let clamp = |v: f32| (v.max(0.0) as u32).min(res);
+    let rect = [clamp(lo.x.floor() - 2.0), clamp(lo.y.floor() - 2.0), clamp(hi.x.ceil() + 2.0), clamp(hi.y.ceil() + 2.0)];
+    Some(rect)
 }
