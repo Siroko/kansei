@@ -133,6 +133,8 @@ pub(crate) struct ClipmapInjection {
     params_stride: u64,
     sky: wgpu::Buffer,
     no_surfaces: wgpu::Buffer,
+    /// the bind groups its passes make from the frame's resources, kept
+    bind_groups: crate::renderers::BindGroupCache,
 }
 
 impl ClipmapInjection {
@@ -162,7 +164,7 @@ impl ClipmapInjection {
         });
         let levels = clipmap.layout().levels as u64;
         let params_stride = (std::mem::size_of::<ClipInjectParamsGpu>() as u64).next_multiple_of(device.limits().min_uniform_buffer_offset_alignment as u64);
-        Self {
+        Self { bind_groups: Default::default(),
             shadows: ComputeShadows::new(),
             pipeline,
             bgl,
@@ -233,7 +235,7 @@ impl ClipmapInjection {
                 ];
                 entries.extend(self.shadows.entries());
                 entries.extend(clipmap_entries(clipmap));
-                let group = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("VoxelClipmap/InjectBG"), layout: &self.bgl, entries: &entries });
+                let group = self.bind_groups.get(device, &wgpu::BindGroupDescriptor { label: Some("VoxelClipmap/InjectBG"), layout: &self.bgl, entries: &entries });
                 self.groups[level as usize] = Some((group, dynamic.is_some()));
             }
             {

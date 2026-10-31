@@ -260,6 +260,8 @@ pub struct CinematicDepthOfFieldEffect {
     pub debug_view: DofDebugView,
     frame: u32,
     gpu: Option<Gpu>,
+    /// the bind groups its passes make from the frame's resources, kept
+    bind_groups: crate::renderers::BindGroupCache,
 }
 
 fn source(pass: &str) -> String {
@@ -275,7 +277,7 @@ const LAYER_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
 
 impl CinematicDepthOfFieldEffect {
     pub fn new(options: CinematicDepthOfFieldOptions) -> Self {
-        Self {
+        Self { bind_groups: Default::default(),
             lens: options.lens,
             max_coc_fraction: options.max_coc_fraction,
             max_coc_px: options.max_coc_px,
@@ -518,7 +520,7 @@ impl PostProcessingEffect for CinematicDepthOfFieldEffect {
 
         let group = |layout: &wgpu::BindGroupLayout, resources: Vec<(u32, wgpu::BindingResource)>| {
             let entries: Vec<_> = resources.into_iter().map(|(binding, resource)| wgpu::BindGroupEntry { binding, resource }).collect();
-            device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("CinematicDoF/BG"), layout, entries: &entries })
+            self.bind_groups.get(device, &wgpu::BindGroupDescriptor { label: Some("CinematicDoF/BG"), layout, entries: &entries })
         };
         let view = wgpu::BindingResource::TextureView;
         let params_res = || gpu.params.as_entire_binding();

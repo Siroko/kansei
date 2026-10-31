@@ -66,11 +66,13 @@ pub struct ScreenSpaceGlassEffect {
     pub options: ScreenSpaceGlassOptions,
     sky: Option<wgpu::Buffer>,
     gpu: Option<Gpu>,
+    /// the bind groups its passes make from the frame's resources, kept
+    bind_groups: crate::renderers::BindGroupCache,
 }
 
 impl ScreenSpaceGlassEffect {
     pub fn new(options: ScreenSpaceGlassOptions) -> Self {
-        Self { options, sky: None, gpu: None }
+        Self { bind_groups: Default::default(), options, sky: None, gpu: None }
     }
 
     /// The sky the glass reflects (a `SkyLighting` uniform: `SkyAtmosphereBindings::sky_lighting`,
@@ -178,7 +180,7 @@ impl PostProcessingEffect for ScreenSpaceGlassEffect {
         };
         queue.write_buffer(&gpu.params, 0, bytemuck::bytes_of(&params));
         let tex = wgpu::BindingResource::TextureView;
-        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let group = self.bind_groups.get(device, &wgpu::BindGroupDescriptor {
             label: Some("SsGlass/BindGroup"),
             layout: &gpu.bgl,
             entries: &[

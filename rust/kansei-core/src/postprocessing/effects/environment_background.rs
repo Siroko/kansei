@@ -39,11 +39,13 @@ pub struct EnvironmentBackgroundEffect {
     pub intensity: f32,
     map: Option<EnvironmentMap>,
     gpu: Option<Gpu>,
+    /// the bind groups its passes make from the frame's resources, kept
+    bind_groups: crate::renderers::BindGroupCache,
 }
 
 impl EnvironmentBackgroundEffect {
     pub fn new(environment: &EnvironmentLighting) -> Self {
-        Self { enabled: true, blur: 0.0, intensity: 1.0, map: environment.environment.clone(), gpu: None }
+        Self { bind_groups: Default::default(), enabled: true, blur: 0.0, intensity: 1.0, map: environment.environment.clone(), gpu: None }
     }
 
     fn init_gpu(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
@@ -134,7 +136,7 @@ impl PostProcessingEffect for EnvironmentBackgroundEffect {
         queue.write_buffer(&gpu.uniform, 0, bytemuck::bytes_of(&params));
         let map = self.map.as_ref().unwrap_or(&gpu.no_map);
         let tex = wgpu::BindingResource::TextureView;
-        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let group = self.bind_groups.get(device, &wgpu::BindGroupDescriptor {
             label: Some("EnvironmentBackground"),
             layout: &gpu.bgl,
             entries: &[

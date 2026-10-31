@@ -80,6 +80,8 @@ pub struct HeightFogEffect {
     pub sky_distance: f32,
     sky_lighting: Option<wgpu::Buffer>,
     gpu: Option<Gpu>,
+    /// the bind groups its passes make from the frame's resources, kept
+    bind_groups: crate::renderers::BindGroupCache,
 }
 
 struct Gpu {
@@ -119,7 +121,7 @@ impl Default for HeightFogEffect {
 
 impl HeightFogEffect {
     pub fn new(layer: HeightFogLayer) -> Self {
-        Self {
+        Self { bind_groups: Default::default(),
             layers: [layer, HeightFogLayer::default()],
             inscattering: Vec3::ZERO,
             sky_ambient_scale: 1.0,
@@ -268,7 +270,7 @@ impl PostProcessingEffect for HeightFogEffect {
         };
         queue.write_buffer(&gpu.params, 0, bytemuck::bytes_of(&params));
         let sky = self.sky_lighting.as_ref().unwrap_or(&gpu.no_sky);
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let bind_group = self.bind_groups.get(device, &wgpu::BindGroupDescriptor {
             label: Some("HeightFog/BG"),
             layout: &gpu.bgl,
             entries: &[

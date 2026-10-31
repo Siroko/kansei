@@ -447,6 +447,8 @@ struct Gpu {
     photons: wgpu::ComputePipeline,
     resolve: wgpu::ComputePipeline,
     composite: wgpu::ComputePipeline,
+    /// its layout (the pipeline's `get_bind_group_layout` is another object each call)
+    composite_bgl: wgpu::BindGroupLayout,
     photon_group: wgpu::BindGroup,
     resolve_group: wgpu::BindGroup,
     /// the grid's group, with its generation
@@ -551,6 +553,8 @@ pub struct RtCausticsEffect {
     lookup: wgpu::Buffer,
     sampler: wgpu::Sampler,
     gpu: Option<Gpu>,
+    /// the bind groups its passes make from the frame's resources, kept
+    bind_groups: crate::renderers::BindGroupCache,
 }
 
 impl RtCausticsEffect {
@@ -561,7 +565,7 @@ impl RtCausticsEffect {
         let (map, map_view) = Self::make_map(device, texels, 1);
         let lookup = device.create_buffer(&wgpu::BufferDescriptor { label: Some("RtCaustics/Lookup"), size: std::mem::size_of::<LookupGpu>() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor { label: Some("RtCaustics/Sampler"), mag_filter: wgpu::FilterMode::Linear, min_filter: wgpu::FilterMode::Linear, ..Default::default() });
-        Self {
+        Self { bind_groups: Default::default(),
             enabled: true,
             view: RtCausticsView::Lit,
             receivers: RtCausticReceivers::RtLit,
@@ -1067,6 +1071,7 @@ impl RtCausticsEffect {
             photons,
             resolve,
             composite,
+            composite_bgl,
             photon_group,
             resolve_group,
             grid_group: None,
@@ -1231,9 +1236,9 @@ impl PostProcessingEffect for RtCausticsEffect {
                 );
             }
         }
-        let composite_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let composite_group = self.bind_groups.get(device, &wgpu::BindGroupDescriptor {
             label: Some("RtCaustics/Composite"),
-            layout: &gpu.composite.get_bind_group_layout(0),
+            layout: &gpu.composite_bgl,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: gpu.composite_params.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(depth) },

@@ -115,6 +115,8 @@ pub struct ClipmapProbes {
     group: Option<(wgpu::BindGroup, wgpu::Buffer)>,
     cursors: Vec<u32>,
     frame: u32,
+    /// the bind groups its passes make from the frame's resources, kept
+    bind_groups: crate::renderers::BindGroupCache,
 }
 
 impl ClipmapProbes {
@@ -155,7 +157,7 @@ impl ClipmapProbes {
             _pad: [0.0; 2],
             levels: [ClipLevelGpu::default(); MAX_CLIPMAP_LEVELS],
         };
-        Self {
+        Self { bind_groups: Default::default(),
             options,
             layout,
             // voxels half the spacing: level 0's for 2 voxels, level 1's for 4, ...
@@ -315,7 +317,7 @@ impl ClipmapProbes {
                 wgpu::BindGroupEntry { binding: 3, resource: sky.as_entire_binding() },
             ];
             entries.extend(clipmap_entries(clipmap));
-            let group = device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("VoxelClipmap/ProbesBG"), layout: &self.bgl, entries: &entries });
+            let group = self.bind_groups.get(device, &wgpu::BindGroupDescriptor { label: Some("VoxelClipmap/ProbesBG"), layout: &self.bgl, entries: &entries });
             self.group = Some((group, sky.clone()));
         }
         let stamp = crate::profiling::gpu_pass("VoxelClipmap/Probes");

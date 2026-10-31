@@ -59,11 +59,13 @@ pub struct BloomEffect {
     width: u32,
     height: u32,
     initialized: bool,
+    /// the bind groups its passes make from the frame's resources, kept
+    bind_groups: crate::renderers::BindGroupCache,
 }
 
 impl BloomEffect {
     pub fn new(options: BloomOptions) -> Self {
-        Self {
+        Self { bind_groups: Default::default(),
             options,
             exposure: 1.0,
             downsample_pipeline: None,
@@ -369,7 +371,7 @@ impl PostProcessingEffect for BloomEffect {
                 queue.write_buffer(&self.downsample_params[level], 0, bytemuck::cast_slice(&data));
 
                 let src_view = if level == 0 { source } else { &self.mip_views[level - 1] };
-                let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                let bg = self.bind_groups.get(device, &wgpu::BindGroupDescriptor {
                     label: None, layout: ds_bgl,
                     entries: &[
                         wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(src_view) },
@@ -421,7 +423,7 @@ impl PostProcessingEffect for BloomEffect {
                 ];
                 queue.write_buffer(&self.upsample_params[pass_idx], 0, bytemuck::cast_slice(&data));
 
-                let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                let bg = self.bind_groups.get(device, &wgpu::BindGroupDescriptor {
                     label: None, layout: us_bgl,
                     entries: &[
                         wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(smaller_view) },
@@ -451,7 +453,7 @@ impl PostProcessingEffect for BloomEffect {
             ];
             queue.write_buffer(self.composite_params.as_ref().unwrap(), 0, bytemuck::cast_slice(&data));
 
-            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            let bg = self.bind_groups.get(device, &wgpu::BindGroupDescriptor {
                 label: None, layout: comp_bgl,
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(input) },

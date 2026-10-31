@@ -32,6 +32,8 @@ pub(crate) struct ScreenSpaceProjection {
     heights: wgpu::Buffer,
     owners: wgpu::Buffer,
     params: wgpu::Buffer,
+    /// the bind groups its passes make from the frame's resources, kept
+    bind_groups: crate::renderers::BindGroupCache,
 }
 
 impl ScreenSpaceProjection {
@@ -73,7 +75,7 @@ impl ScreenSpaceProjection {
         };
         let buffer = |label, size, usage| device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage, mapped_at_creation: false });
         let texels = (width * height) as u64 * 4;
-        Self {
+        Self { bind_groups: Default::default(),
             clear: pipeline("clear"),
             project: pipeline("project"),
             own: pipeline("own"),
@@ -101,7 +103,7 @@ impl ScreenSpaceProjection {
         params: &ScreenSpaceParamsGpu,
     ) {
         queue.write_buffer(&self.params, 0, bytemuck::bytes_of(params));
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let bind_group = self.bind_groups.get(device, &wgpu::BindGroupDescriptor {
             label: Some("PlanarReflection/ScreenSpaceBG"),
             layout: &self.bgl,
             entries: &[
