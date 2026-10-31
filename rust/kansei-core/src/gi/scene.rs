@@ -48,6 +48,15 @@ pub struct SceneVoxelGi {
     /// many frames: for consumers that blend it over time anyway, such as the probes (`enable_probes`,
     /// whose irradiance settles over tens of frames), 2 to 4 halve or quarter its cost.
     pub lighting_interval: u32,
+    /// Leave the dynamic renderables' voxels and their distance field's flood as they are on a
+    /// frame none of them changed (transform, surface, geometry, visibility): the same voxels,
+    /// the same field, without voxelizing and flooding them again (off by default). Only for
+    /// dynamic renderables that move rigidly: one whose vertex stage moves its vertices without
+    /// the renderable changing (a skinned mesh, wind from a uniform) needs it off.
+    pub skip_still_dynamic: bool,
+    /// What the dynamic renderables were made of last frame (`skip_still_dynamic`).
+    dynamic_key: Option<Vec<u32>>,
+    dynamic_redone: bool,
     /// Frames since the volume was last lit.
     lighting_age: u32,
     quality: VoxelGiQuality,
@@ -80,7 +89,7 @@ impl SceneVoxelGi {
         });
         let injection = RadianceInjection::new(device, &volume, &sky);
         let settings = SceneGiSettings { bounce_steps: quality.cone_steps() / 2, ..Default::default() };
-        Self { settings, lighting_interval: 1, lighting_age: u32::MAX, quality, volume, voxelizer, injection, sky_source: sky.clone(), sky, sdf: None, probes: None, sdf_stale: false, device: device.clone() }
+        Self { settings, lighting_interval: 1, skip_still_dynamic: false, dynamic_key: None, dynamic_redone: true, lighting_age: u32::MAX, quality, volume, voxelizer, injection, sky_source: sky.clone(), sky, sdf: None, probes: None, sdf_stale: false, device: device.clone() }
     }
 
     /// The tier in use (the one asked for, or lower if the device could not hold it).
@@ -183,19 +192,37 @@ impl SceneVoxelGi {
         self.sdf.as_ref()
     }
 
+    /// Whether the dynamic surfaces must be voxelized again this frame: always, but with
+    /// `skip_still_dynamic` when `key` (what the dynamic renderables are made of) is last frame's.
+    pub(crate) fn dynamic_changed(&mut self, key: Vec<u32>) -> bool {
+        let changed = !self.skip_still_dynamic || self.dynamic_key.as_ref() != Some(&key);
+        self.dynamic_key = Some(key);
+        self.dynamic_redone = changed;
+        changed
+    }
+
+    /// Whether the last frame voxelized (and flooded) the dynamic renderables again: false on the
+    /// frames `skip_still_dynamic` left them as they were.
+    pub fn dynamic_redone(&self) -> bool {
+        self.dynamic_redone
+    }
+
     /// Record the distance field's update (after the voxelization): `static_changed` when the
-    /// static surfaces were voxelized again, `any_dynamic` when dynamic ones are this frame.
-    pub(crate) fn encode_sdf(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, static_changed: bool, any_dynamic: bool) {
+    /// static surfaces were voxelized again, `any_dynamic` when dynamic ones are this frame,
+    /// `dynamic_changed` when they were voxelized again (`dynamic_changed`).
+    pub(crate) fn encode_sdf(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, static_changed: bool, any_dynamic: bool, dynamic_changed: bool) {
         let Some(sdf) = &mut self.sdf else { return };
         let mut changed = static_changed || std::mem::take(&mut self.sdf_stale);
         if changed {
             sdf.encode_static(encoder);
         }
+        let mut flood = dynamic_changed;
         if any_dynamic != sdf.has_dynamic() {
             sdf.set_dynamic_surfaces(device, self.voxelizer.dynamic_surfaces().filter(|_| any_dynamic));
             changed = true;
+            flood = true;
         }
-        if any_dynamic {
+        if any_dynamic && flood {
             sdf.encode_dynamic(encoder);
             changed = true;
         }

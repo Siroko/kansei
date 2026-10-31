@@ -2085,6 +2085,16 @@ impl Renderer {
             key.extend(surface.albedo.iter().chain(&surface.emission).map(|f| f.to_bits()));
             key.extend([r.geometry.index_count(), r.geometry.instance_count]);
         }
+        // and the dynamic ones (`SceneVoxelGi::skip_still_dynamic`)
+        let mut dynamic_key = Vec::new();
+        for (idx, r, _) in draws.iter().filter(|d| d.1.dynamic) {
+            let surface = r.gi.unwrap();
+            dynamic_key.push(*idx as u32);
+            dynamic_key.extend(r.world_matrix.as_slice().iter().map(|f| f.to_bits()));
+            dynamic_key.extend(surface.albedo.iter().chain(&surface.emission).map(|f| f.to_bits()));
+            dynamic_key.extend([r.geometry.index_count(), r.geometry.instance_count, r.geometry.revision]);
+        }
+        let dynamic_changed = gi.dynamic_changed(dynamic_key);
         let surfaces: Vec<_> = draws.iter().map(|d| d.1.gi.unwrap()).collect();
         let voxelizer = gi.voxelizer_mut();
         voxelizer.write_draws(device, queue, &surfaces);
@@ -2096,7 +2106,7 @@ impl Renderer {
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Renderer/VoxelGI") });
         let voxelizer = gi.voxelizer();
-        let sets = [(crate::gi::SurfaceSet::Static, static_changed), (crate::gi::SurfaceSet::Dynamic, voxelizer.dynamic_surfaces().is_some())];
+        let sets = [(crate::gi::SurfaceSet::Static, static_changed), (crate::gi::SurfaceSet::Dynamic, voxelizer.dynamic_surfaces().is_some() && dynamic_changed)];
         for (set, redo) in sets {
             if !redo {
                 continue;
@@ -2124,7 +2134,7 @@ impl Renderer {
                 }
             }
         }
-        gi.encode_sdf(device, &mut encoder, static_changed, any_dynamic);
+        gi.encode_sdf(device, &mut encoder, static_changed, any_dynamic, dynamic_changed);
         gi.encode_lighting(device, queue, &mut encoder, static_changed);
         let eye = camera.inverse_view_matrix.to_glam().w_axis;
         gi.encode_probes(device, queue, &mut encoder, Some([eye.x, eye.y, eye.z]));
