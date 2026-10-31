@@ -82,6 +82,9 @@
 //!   the HDRI prepared again every frame, to time it);
 //! - `albedo=constant`, `rug=off` (the box without its rug), `ui=0` (no panel);
 //! - `stats=1`: triangles, frame interval and the GPU time of each pass (the renderer's profiling);
+//! - `rt_moving=0`: what moves (the rolling glass ball, the animated block or dragon) rebuilds the
+//!   whole grid every frame instead of the grid's moving layer alone (`SceneRtGrid::set_moving_layer`,
+//!   for comparisons; `set_rt_moving_layer` switches it live);
 //! - `record_pipelines=1`: every pipeline the page makes recorded (`window.kanseiPipelines.download()`
 //!   saves them as `pipelines.json`); `warm=1`: `www/pipelines.json`'s compiled before the device
 //!   comes, in parallel (`kansei_wasm::pipelines`).
@@ -1602,6 +1605,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     // (reflect=1: the floor polished)
     if config.grid {
         renderer.enable_rt_grid(rt_grid_options());
+        renderer.rt_grid_mut().unwrap().set_moving_layer(param("rt_moving").as_deref() != Some("0"));
     }
     let floor_specular = if config.reflect { floor_specular() } else { [0.0; 2] };
     let rt = |albedo: [f32; 3]| config.grid.then(|| RtSurface::new(albedo));
@@ -1918,6 +1922,16 @@ pub fn set_stats(on: bool) {
     with_state(|s| {
         s.renderer.set_profiling(on);
         s.stats = on.then(|| Stats { since: now() * 1000.0, ..Default::default() });
+    });
+}
+
+/// What moves into the grid's moving layer (on) or the whole grid rebuilt every frame (off).
+#[wasm_bindgen]
+pub fn set_rt_moving_layer(on: bool) {
+    with_state(|s| {
+        if let Some(grid) = s.renderer.rt_grid_mut() {
+            grid.set_moving_layer(on);
+        }
     });
 }
 

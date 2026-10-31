@@ -2,13 +2,16 @@
 //! hardware ray queries (wgpu's `EXPERIMENTAL_RAY_QUERY`, native only), traced by `RT_QUERY_WGSL`'s
 //! `kansei_rt_trace` in place of the grid's cells.
 //!
-//! One BLAS holds the triangles by id (the gather's own ids, so every `kansei_rt_*(id)` accessor
-//! reads them as it does the grid's): an opaque geometry, and when alpha-tested or glass sources
-//! were gathered a second, non-opaque one (only its candidates come back to the shader). Sizes are
-//! fixed on the CPU, so both hold the grid's triangle capacity, the slots nothing fills holding
-//! filler triangles outside the box (Metal's builds lost the real triangles among many inactive
-//! ones). One TLAS instance holds the BLAS. A rebuild builds the BLAS in the build's encoder, and
-//! the TLAS in a submit of its own before the first trace (`RtGridHandle::prepare_trace`).
+//! Each layer of the grid (its static and its moving triangles) has a BLAS holding its triangles by
+//! their index in the layer, and a TLAS instance of it whose custom data is the layer's first
+//! triangle, so a hit's id is the gather's own (every `kansei_rt_*(id)` accessor reads it as it
+//! does the grid's). A BLAS has an opaque geometry, and when alpha-tested or glass sources were
+//! gathered a second, non-opaque one (only its candidates come back to the shader). Sizes are fixed
+//! on the CPU, so both hold the layer's triangle capacity, the slots nothing fills holding filler
+//! triangles outside the box (Metal's builds lost the real triangles among many inactive ones). A
+//! layer's rebuild builds its BLAS in the build's encoder, and the TLAS in a submit of its own
+//! before the first trace (`RtGridHandle::prepare_trace`): the static layer's BLAS stands while
+//! only the moving one is rebuilt.
 //!
 //! Metal needs more: wgpu 30's Metal backend has no acceleration structure barrier (#9215, fix open
 //! as #9645), and Metal tracks no hazard through a TLAS's instances, so nothing orders a TLAS build
@@ -35,7 +38,8 @@ pub(crate) struct QueryParamsGpu {
     filler: [f32; 3],
     capacity: u32,
     split: u32,
-    _pad: [u32; 3],
+    base: u32,
+    _pad: [u32; 2],
 }
 
 /// The BLAS's shape: what it was made for.
@@ -47,6 +51,8 @@ struct Shape {
 }
 
 pub(crate) struct RtQuery {
+    /// its instance in the TLAS (the grid's layer)
+    slot: usize,
     params: wgpu::Buffer,
     /// the opaque and the non-opaque geometry's vertices (a placeholder without the split)
     positions: [wgpu::Buffer; 2],
@@ -59,7 +65,8 @@ pub(crate) struct RtQuery {
     layout: wgpu::BindGroupLayout,
     positions_pipeline: wgpu::ComputePipeline,
     mark: wgpu::ComputePipeline,
-    group: Option<wgpu::BindGroup>,
+    /// the positions pass's group, and the triangles and counters it was made with
+    group: Option<(wgpu::BindGroup, wgpu::Buffer, wgpu::Buffer)>,
     written: Option<QueryParamsGpu>,
 }
 
@@ -69,12 +76,30 @@ pub(crate) struct TlasState {
     tlas: wgpu::Tlas,
     /// the BLAS's submit (or a later one) when the TLAS is to be built over it
     pending: Option<wgpu::SubmissionIndex>,
+    /// an instance was taken out: build it again
+    dirty: bool,
     /// wait for that submit first (Metal, #9215)
     wait: bool,
 }
 
 impl RtQuery {
-    pub(crate) fn new(device: &wgpu::Device) -> Self {
+    /// The TLAS the layers' BLASes are instances of (one each).
+    pub(crate) fn new_tlas(device: &wgpu::Device) -> Arc<Mutex<TlasState>> {
+        Arc::new(Mutex::new(TlasState {
+            tlas: device.create_tlas(&wgpu::CreateTlasDescriptor {
+                label: Some("RtQuery/Tlas"),
+                flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
+                update_mode: wgpu::AccelerationStructureUpdateMode::Build,
+                max_instances: 2,
+            }),
+            pending: None,
+            dirty: false,
+            wait: device.adapter_info().backend == wgpu::Backend::Metal,
+        }))
+    }
+
+    /// The BLAS of one layer of the grid, instance `slot` of `tlas`.
+    pub(crate) fn new(device: &wgpu::Device, tlas: Arc<Mutex<TlasState>>, slot: usize) -> Self {
         let compute = wgpu::ShaderStages::COMPUTE;
         let buffer = |binding, ty| wgpu::BindGroupLayoutEntry { binding, visibility: compute, ty: wgpu::BindingType::Buffer { ty, has_dynamic_offset: false, min_binding_size: None }, count: None };
         let ro = wgpu::BufferBindingType::Storage { read_only: true };
@@ -98,6 +123,7 @@ impl RtQuery {
         let empty_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("RtQuery/Mark"), bind_group_layouts: &[], immediate_size: 0 });
         let metal = device.adapter_info().backend == wgpu::Backend::Metal;
         Self {
+            slot,
             params: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("RtQuery/Params"),
                 size: std::mem::size_of::<QueryParamsGpu>() as u64,
@@ -107,16 +133,7 @@ impl RtQuery {
             positions: [0, 1].map(|_| device.create_buffer(&wgpu::BufferDescriptor { label: Some("RtQuery/Positions"), size: 16, usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false })),
             blas: vec![None; if metal { 2 } else { 1 }],
             next: 0,
-            tlas: Arc::new(Mutex::new(TlasState {
-                tlas: device.create_tlas(&wgpu::CreateTlasDescriptor {
-                    label: Some("RtQuery/Tlas"),
-                    flags: wgpu::AccelerationStructureFlags::PREFER_FAST_TRACE,
-                    update_mode: wgpu::AccelerationStructureUpdateMode::Build,
-                    max_instances: 1,
-                }),
-                pending: None,
-                wait: metal,
-            })),
+            tlas,
             built: false,
             positions_pipeline: pipeline("positions_main", Some(&pipeline_layout)),
             mark: pipeline("mark_main", Some(&empty_layout)),
@@ -126,23 +143,18 @@ impl RtQuery {
         }
     }
 
-    /// The TLAS (the trace binds it), shared with the grid's handle.
-    pub(crate) fn tlas(&self) -> Arc<Mutex<TlasState>> {
-        self.tlas.clone()
-    }
-
     /// Bytes on the GPU (the vertex buffers; the acceleration structures' own sizes aren't exposed).
     pub(crate) fn memory_bytes(&self) -> u64 {
         self.positions.iter().map(wgpu::Buffer::size).sum()
     }
 
-    /// Ready the BLAS for a build of the grid's `triangles` (`capacity` of them; `counters`' first
-    /// word how many were gathered), between the grid's `begin` and `finish`: made anew when its
-    /// shape changed, its vertex buffers with it. `split`: alpha-tested or glass sources are
-    /// gathered; `fast_build`: the grid rebuilds every frame; `below`: a point under the grid's
-    /// box, where the filler goes.
+    /// Ready the BLAS for a build of the layer's triangles in the grid's `triangles` (`capacity`
+    /// of them from `base`; `counters`' first word how many were gathered), between the grid's
+    /// `begin` and `finish`: made anew when its shape changed, its vertex buffers with it.
+    /// `split`: alpha-tested or glass sources are gathered; `fast_build`: the layer rebuilds every
+    /// frame; `below`: a point under the grid's box, where the filler goes.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn prepare(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, triangles: &wgpu::Buffer, counters: &wgpu::Buffer, capacity: u32, split: bool, fast_build: bool, below: [f32; 3]) {
+    pub(crate) fn prepare(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, triangles: &wgpu::Buffer, counters: &wgpu::Buffer, base: u32, capacity: u32, split: bool, fast_build: bool, below: [f32; 3]) {
         let shape = Shape { capacity, split, fast_build };
         let slot = &mut self.blas[self.next];
         if slot.as_ref().is_none_or(|(s, _)| *s != shape) {
@@ -154,7 +166,7 @@ impl RtQuery {
             *slot = Some((shape, blas));
         }
         let blas = &slot.as_ref().unwrap().1;
-        self.tlas.lock().unwrap().tlas[0] = Some(wgpu::TlasInstance::new(blas, [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0], 0, 0xff));
+        self.tlas.lock().unwrap().tlas[self.slot] = Some(wgpu::TlasInstance::new(blas, [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0], base, 0xff));
         if self.written.is_none_or(|w| w.capacity != capacity || (w.split != 0) != split) {
             for k in 0..2 {
                 let bytes = if k == 0 || split { capacity as u64 * TRIANGLE_VERTEX_BYTES } else { 16 };
@@ -169,29 +181,37 @@ impl RtQuery {
             }
             self.group = None;
         }
-        let params = QueryParamsGpu { filler: below, capacity, split: split as u32, _pad: [0; 3] };
+        let params = QueryParamsGpu { filler: below, capacity, split: split as u32, base, _pad: [0; 2] };
         if self.written != Some(params) {
             queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&params));
             self.written = Some(params);
         }
-        // (the grid makes its triangles and counters anew only when its capacity changes, and the
-        // vertex buffers with them)
-        if self.group.is_none() {
+        // (the grid makes its triangles anew when either layer grows)
+        if self.group.as_ref().is_none_or(|(_, t, c)| t != triangles || c != counters) {
             fn entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
                 wgpu::BindGroupEntry { binding, resource: buffer.as_entire_binding() }
             }
-            self.group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("RtQuery/Positions"),
                 layout: &self.layout,
                 entries: &[entry(0, triangles), entry(1, counters), entry(2, &self.positions[0]), entry(3, &self.params), entry(4, &self.positions[1])],
-            }));
+            });
+            self.group = Some((group, triangles.clone(), counters.clone()));
+        }
+    }
+
+    /// Take the layer's instance out of the TLAS (a moving layer with nothing in it).
+    pub(crate) fn remove(&mut self) {
+        let mut tlas = self.tlas.lock().unwrap();
+        if tlas.tlas[self.slot].take().is_some() {
+            tlas.dirty = true;
         }
     }
 
     /// Record the BLAS's build after the gather, in its encoder: the vertices, then the BLAS. The
     /// TLAS waits for this encoder's submit (`submitted`), then for `build_tlas`.
     pub(crate) fn record_blas(&mut self, encoder: &mut wgpu::CommandEncoder) {
-        let (Some((shape, blas)), Some(group)) = (self.blas[self.next].as_ref(), self.group.as_ref()) else { panic!("RtQuery::prepare first") };
+        let (Some((shape, blas)), Some((group, _, _))) = (self.blas[self.next].as_ref(), self.group.as_ref()) else { panic!("RtQuery::prepare first") };
         let stamp = crate::profiling::gpu_pass("Rt/BlasInput");
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("Rt/BlasInput"), timestamp_writes: stamp.as_ref().map(crate::profiling::PassStamp::compute) });
@@ -254,8 +274,12 @@ impl TlasState {
     /// Build the TLAS over the BLAS built last, if one was, in a submit of its own after the
     /// BLAS's: on Metal once that has finished (#9215).
     pub(crate) fn build(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
-        let Some(blas_submit) = self.pending.take() else { return };
-        if self.wait {
+        let pending = self.pending.take();
+        if pending.is_none() && !std::mem::take(&mut self.dirty) {
+            return;
+        }
+        self.dirty = false;
+        if let (true, Some(blas_submit)) = (self.wait, pending) {
             let _t = crate::profiling::cpu_scope("rt/tlas wait");
             let _ = device.poll(wgpu::PollType::Wait { submission_index: Some(blas_submit), timeout: None });
         }

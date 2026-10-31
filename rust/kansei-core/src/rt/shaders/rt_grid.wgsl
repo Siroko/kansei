@@ -4,9 +4,11 @@
 // alpha-tested triangle's surface is there at `uv` (rt::RT_OPAQUE_WGSL: always). Included after
 // rt_types.wgsl and rt_hit.wgsl. (rt_query.wgsl is the same function over hardware ray queries.)
 //
-// `kansei_rt_trace(origin, dir, tMin, tMax, flags)` tests the big triangles, then walks the cells
-// the ray crosses within the grid's box (Amanatides & Woo's 3D DDA, leaving empty 4^3 macro cells
-// in one step), testing the triangles listed in each (Moller & Trumbore, both sides), and stops at
+// `kansei_rt_trace(origin, dir, tMin, tMax, flags)` walks each of the grid's layers (rt_types.wgsl:
+// the static one, then the moving one, a small box most rays miss or reach only past the static
+// hit, leaving it at its slab test): it tests the layer's big triangles, then walks the cells the
+// ray crosses within the layer's box (Amanatides & Woo's 3D DDA, leaving empty 4^3 macro cells in
+// one step), testing the triangles listed in each (Moller & Trumbore, both sides), and stops at
 // the first cell whose exit lies past the closest hit; with KANSEI_RT_ANY_HIT at the first hit.
 
 // Moller-Trumbore, both sides: (t, u, v), t < 0 for a miss.
@@ -54,41 +56,33 @@ fn kansei_rt_test(hit: ptr<function, KanseiRtHit>, o: vec3f, d: vec3f, tMin: f32
     return true;
 }
 
-fn kansei_rt_cell_index(c: vec3i) -> u32 {
-    let d = vec3i(kansei_rt_grid.dims);
+fn kansei_rt_cell_index(c: vec3i, dims: vec3u) -> u32 {
+    let d = vec3i(dims);
     return u32((c.z * d.y + c.y) * d.x + c.x);
 }
 
-fn kansei_rt_macro_index(c: vec3i) -> u32 {
+fn kansei_rt_macro_index(c: vec3i, macroDims: vec3u) -> u32 {
     let m = vec3u(c) >> vec3u(KANSEI_RT_MACRO_SHIFT);
-    let d = kansei_rt_grid.macroDims;
-    return (m.z * d.y + m.y) * d.x + m.x;
+    return (m.z * macroDims.y + m.y) * macroDims.x + m.x;
 }
 
-// The closest hit (or with KANSEI_RT_ANY_HIT any hit) of the ray between tMin and tMax, among the
-// grid's triangles (those within its box).
-fn kansei_rt_trace(o: vec3f, d: vec3f, tMin: f32, tMax: f32, flags: u32) -> KanseiRtHit {
-    var hit : KanseiRtHit;
-    hit.t = tMax;
-    hit.found = false;
-    let g = kansei_rt_grid;
+// Walk layer `g` for the ray, keeping in `hit` the closest hit (closer than it was); true when an
+// any-hit trace has its hit.
+fn kansei_rt_walk(hit: ptr<function, KanseiRtHit>, o: vec3f, d: vec3f, invD: vec3f, tMin: f32, flags: u32, g: KanseiRtLayer) -> bool {
     let anyHit = (flags & KANSEI_RT_ANY_HIT) != 0u;
     // the big triangles, every ray
     let big = min(kansei_rt_cells[g.bigBase], g.bigCapacity);
     for (var k = 0u; k < big; k++) {
-        if (kansei_rt_test(&hit, o, d, tMin, kansei_rt_cells[g.bigBase + 1u + k], flags) && anyHit) {
-            kansei_rt_finish(&hit, d);
-            return hit;
+        if (kansei_rt_test(hit, o, d, tMin, kansei_rt_cells[g.bigBase + 1u + k], flags) && anyHit) {
+            return true;
         }
     }
-    let invD = kansei_rt_inv_dir(d);
     let gmin = g.origin;
-    let box = kansei_rt_slab(o, invD, gmin, kansei_rt_bounds_max());
+    let box = kansei_rt_slab(o, invD, gmin, gmin + vec3f(g.dims) * g.cell);
     var t = max(box.x, tMin);
     let tEnd = box.y;
-    if (box.x > box.y || t >= min(tEnd, hit.t)) {
-        kansei_rt_finish(&hit, d);
-        return hit;
+    if (box.x > box.y || t >= min(tEnd, (*hit).t)) {
+        return false;
     }
     let dims = vec3i(g.dims);
     let stepI = select(vec3i(-1), vec3i(1), d >= vec3f(0.0));
@@ -105,32 +99,32 @@ fn kansei_rt_trace(o: vec3f, d: vec3f, tMin: f32, tMax: f32, flags: u32) -> Kans
             tNext = (vec3f(cell + max(stepI, vec3i(0))) * g.cell + gmin - o) * invD;
             restart = false;
         }
-        hit.cells += 1u;
-        if ((g.flags & KANSEI_RT_MACRO_SKIP) != 0u && kansei_rt_cells[g.macroBase + kansei_rt_macro_index(cell)] == 0u) {
+        (*hit).cells += 1u;
+        if ((g.flags & KANSEI_RT_MACRO_SKIP) != 0u && kansei_rt_cells[g.macroBase + kansei_rt_macro_index(cell, g.macroDims)] == 0u) {
             // leave the empty macro cell in one step
             let lo = gmin + vec3f(cell >> vec3u(KANSEI_RT_MACRO_SHIFT)) * block;
             let m = kansei_rt_slab(o, invD, lo, lo + vec3f(block));
             t = max(m.y, t) + 0.5 * g.epsilon;
-            if (t >= min(tEnd, hit.t)) {
+            if (t >= min(tEnd, (*hit).t)) {
                 break;
             }
             restart = true;
             continue;
         }
-        let c = kansei_rt_cell_index(cell);
+        let local = kansei_rt_cell_index(cell, g.dims);
+        let c = g.cellsBase + local;
         var start = 0u;
-        if (c > 0u) {
+        if (local > 0u) {
             start = kansei_rt_cells[c - 1u];
         }
         let end = min(kansei_rt_cells[c], g.refCapacity);
         for (var k = start; k < end; k++) {
-            if (kansei_rt_test(&hit, o, d, tMin, kansei_rt_cells[g.refsBase + k], flags) && anyHit) {
-                kansei_rt_finish(&hit, d);
-                return hit;
+            if (kansei_rt_test(hit, o, d, tMin, kansei_rt_cells[g.refsBase + k], flags) && anyHit) {
+                return true;
             }
         }
         let tCell = min(min(tNext.x, tNext.y), tNext.z);
-        if (tCell >= min(tEnd, hit.t)) {
+        if (tCell >= min(tEnd, (*hit).t)) {
             break;
         }
         t = tCell;
@@ -147,6 +141,19 @@ fn kansei_rt_trace(o: vec3f, d: vec3f, tMin: f32, tMax: f32, flags: u32) -> Kans
         if (any(cell < vec3i(0)) || any(cell >= dims)) {
             break;
         }
+    }
+    return false;
+}
+
+// The closest hit (or with KANSEI_RT_ANY_HIT any hit) of the ray between tMin and tMax, among the
+// grid's triangles (those within its box), in either layer.
+fn kansei_rt_trace(o: vec3f, d: vec3f, tMin: f32, tMax: f32, flags: u32) -> KanseiRtHit {
+    var hit : KanseiRtHit;
+    hit.t = tMax;
+    hit.found = false;
+    let invD = kansei_rt_inv_dir(d);
+    if (!kansei_rt_walk(&hit, o, d, invD, tMin, flags, kansei_rt_static_layer(kansei_rt_grid)) && kansei_rt_grid.moving.cellCount > 0u) {
+        kansei_rt_walk(&hit, o, d, invD, tMin, flags, kansei_rt_grid.moving);
     }
     kansei_rt_finish(&hit, d);
     return hit;

@@ -1,4 +1,5 @@
-// The hardware backend's BLAS input (rt/query.rs): each gathered triangle's three vertices from its
+// The hardware backend's BLAS input (rt/query.rs), for one layer of the grid (its triangles from
+// `base`, its counters): each gathered triangle's three vertices from its
 // world triangle (v0, v0 + e1, v0 + e2), as the BLAS's vertex buffers read them (three f32 a
 // vertex, nine a triangle). Opaque triangles fill the first geometry's slot of their id; with the
 // split (alpha-tested or glass sources gathered), the others fill the second geometry's. A slot
@@ -14,6 +15,8 @@ struct KanseiRtQueryParams {
     capacity : u32,
     // 1: a second, non-opaque geometry
     split    : u32,
+    // the layer's first triangle
+    base     : u32,
 }
 
 @group(0) @binding(0) var<storage, read> kansei_rt_triangles : array<vec4f>;
@@ -60,10 +63,11 @@ fn positions_main(@builtin(global_invocation_id) gid: vec3u, @builtin(num_workgr
         }
         return;
     }
-    let a = kansei_rt_triangles[id * 4u];
+    let at = qp.base + id;
+    let a = kansei_rt_triangles[at * 4u];
     let v0 = a.xyz;
-    let v1 = v0 + kansei_rt_triangles[id * 4u + 1u].xyz;
-    let v2 = v0 + kansei_rt_triangles[id * 4u + 2u].xyz;
+    let v1 = v0 + kansei_rt_triangles[at * 4u + 1u].xyz;
+    let v2 = v0 + kansei_rt_triangles[at * 4u + 2u].xyz;
     let other = split && (bitcast<u32>(a.w) & (KANSEI_RT_ALPHA | KANSEI_RT_GLASS)) != 0u;
     write_slot(other, id, v0, v1, v2);
     if (split) {

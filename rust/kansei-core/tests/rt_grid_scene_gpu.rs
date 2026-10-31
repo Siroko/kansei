@@ -2,8 +2,9 @@
 //! mesh, instances culled for the grid's box (with crossfades, so their compacted records carry
 //! a fade), and card crowns with cluster LOD by their cut at a cell of error. The grid holds
 //! exactly the triangles the CPU places (a box away from the grid, instances out of it and a LOD
-//! whose band leaves it out add none), rebuilds when the box moves and only then, and every
-//! frame while a dynamic renderable is in it. Skipped (passes) when no adapter is available.
+//! whose band leaves it out add none), rebuilds its static layer when the box moves and only then,
+//! and its moving layer, which holds the dynamic renderables, every frame while one is in it.
+//! Skipped (passes) when no adapter is available.
 
 use glam::Vec3 as GVec3;
 use kansei_core::buffers::{BufferType, ComputeBuffer, InstanceAttribute, VertexFormat};
@@ -127,15 +128,18 @@ fn camera_at(eye: [f32; 3], target: [f32; 3]) -> Camera {
     camera
 }
 
-/// The grid's triangles, as world vertices.
+/// The grid's triangles (its static layer's, then its moving layer's), as world vertices.
 fn grid_triangles(renderer: &mut Renderer) -> Vec<[GVec3; 3]> {
     let device = renderer.device().clone();
     renderer.rt_grid_mut().unwrap().wait_readback(&device);
     let rt = renderer.rt_grid().unwrap();
-    let count = rt.stats().grid.triangles as usize;
+    let stats = rt.stats().grid;
+    let moving = if stats.moving_cells > 0 { stats.moving_triangles as usize } else { 0 };
+    let base = stats.moving_triangle_base as usize;
     let buffer = rt.grid().triangles_buffer().clone();
     let words = renderer.read_back_buffer_sync::<u32>(&buffer, buffer.size());
-    (0..count)
+    (0..stats.triangles as usize)
+        .chain(base..base + moving)
         .map(|id| {
             let f = |k: usize| f32::from_bits(words[id * 16 + k]);
             let v0 = GVec3::new(f(0), f(1), f(2));
@@ -249,13 +253,38 @@ fn the_grid_holds_exactly_what_the_renderables_place_in_its_box() {
     let got = grid_triangles(&mut renderer);
     assert!(renderer.rt_grid().unwrap().stats().rebuilt);
     assert!(got.is_empty(), "nothing within 8 m of x = 30 ({} triangles)", got.len());
-    // back, with the single box dynamic: rebuilt every frame
+    // back, with the single box dynamic: it leaves the static layer (rebuilt once) for the moving
+    // layer, rebuilt every frame
+    renderer.render_scene_offscreen(&mut scene, &mut camera, &gbuffer);
     scene.get_renderable_mut(single).unwrap().dynamic = true;
+    let (mut rebuilt, mut moving) = (Vec::new(), Vec::new());
     for _ in 0..3 {
         renderer.render_scene_offscreen(&mut scene, &mut camera, &gbuffer);
-        assert!(renderer.rt_grid().unwrap().stats().rebuilt, "a dynamic renderable rebuilds the grid every frame");
+        let s = renderer.rt_grid().unwrap().stats();
+        rebuilt.push(s.rebuilt);
+        moving.push((s.moving_rebuilt, s.moving_sources));
     }
+    assert_eq!(rebuilt, [true, false, false], "the static layer is rebuilt once, when the box turns dynamic");
+    assert_eq!(moving, [(true, 1); 3], "the moving layer holds the dynamic box, rebuilt every frame");
+    let stats = renderer.rt_grid().unwrap().stats().grid;
+    assert!(stats.moving_cells > 0 && stats.moving_triangles == 12, "{stats:?}");
     let got = grid_triangles(&mut renderer);
     let (missing, extra) = match_triangles(&expected, &got);
     assert_eq!((missing, extra), (0, 0));
+    // it moves: the moving layer follows it, the static layer stands
+    renderer.render_scene_offscreen(&mut scene, &mut camera, &gbuffer);
+    scene.get_renderable_mut(single).unwrap().object.set_position(-2.0, 0.75, -4.5);
+    renderer.render_scene_offscreen(&mut scene, &mut camera, &gbuffer);
+    assert!(!renderer.rt_grid().unwrap().stats().rebuilt, "moving a dynamic renderable leaves the static layer");
+    let mut moved = corners(&glam::Mat4::from_translation(GVec3::new(-2.0, 0.75, -4.5)), &cube);
+    moved.extend_from_slice(&expected[cube.indices.len() / 3..]);
+    assert_eq!(match_triangles(&moved, &grid_triangles(&mut renderer)), (0, 0));
+    let (lo, hi) = renderer.rt_grid().unwrap().grid().moving_bounds();
+    assert!((hi - lo).max_element() <= 2.01, "the moving layer's box fits the box, in blocks of 4 cells: {lo} .. {hi}");
+    // static again: back in the static layer, the moving layer empty
+    scene.get_renderable_mut(single).unwrap().dynamic = false;
+    renderer.render_scene_offscreen(&mut scene, &mut camera, &gbuffer);
+    let s = renderer.rt_grid().unwrap().stats();
+    assert!(s.rebuilt && !s.moving_rebuilt && s.grid.moving_cells == 0, "{s:?}");
+    assert_eq!(match_triangles(&moved, &grid_triangles(&mut renderer)), (0, 0));
 }
