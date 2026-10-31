@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 
 use kansei_core::cameras::Camera;
-use kansei_core::geometries::BoxGeometry;
+use kansei_core::geometries::{BoxGeometry, IcosphereGeometry};
 use kansei_core::gi::{GiSurface, SceneVoxelGiOptions, VoxelGiQuality};
 use kansei_core::lights::{Light, SpotLight};
 use kansei_core::materials::{Material, StandardLitOptions};
@@ -43,6 +43,12 @@ fn scene(lap: u32) -> (Scene, usize) {
         b.object.set_position(-2.5 + 0.6 * (k % 10) as f32, s * 0.75, -2.5 + 0.8 * (k / 10) as f32);
         scene.add(SceneNode::Renderable(b));
     }
+    // dense meshes (a level's models): 8 of 20k triangles
+    for k in 0..8 {
+        let mut d = Renderable::new(IcosphereGeometry::new(0.25 + 0.01 * lap as f32, 5), lit([0.5; 3])).with_gi(GiSurface::new([0.5; 3])).with_rt(RtSurface::new([0.5; 3]));
+        d.object.set_position(-2.0 + 0.55 * k as f32, 1.2, 1.5);
+        scene.add(SceneNode::Renderable(d));
+    }
     let mut mover = Renderable::new(BoxGeometry::new(0.2, 0.2, 0.2), lit([0.9; 3])).with_gi(GiSurface::new([0.9; 3])).with_rt(RtSurface::new([0.9; 3]));
     mover.dynamic = true;
     let mover = scene.add(SceneNode::Renderable(mover));
@@ -52,6 +58,15 @@ fn scene(lap: u32) -> (Scene, usize) {
         scene.add(SceneNode::Light(Light::Spot(lamp)));
     }
     (scene, mover)
+}
+
+/// The process's private bytes (Windows; 0 elsewhere).
+fn private_bytes() -> u64 {
+    if !cfg!(windows) {
+        return 0;
+    }
+    let out = std::process::Command::new("powershell").args(["-NoProfile", "-Command", &format!("(Get-Process -Id {}).PrivateMemorySize64", std::process::id())]).output();
+    out.ok().and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok()).unwrap_or(0)
 }
 
 /// The allocator's bytes by label (allocations), and in all.
@@ -88,7 +103,7 @@ fn reloading_scenes_holds_no_more_memory() {
             }
         }
         let Some(r) = report(&renderer) else { return eprintln!("no allocator report on this backend: skipped") };
-        eprintln!("lap {lap}: {:.1} MiB", r.0 as f64 / (1 << 20) as f64);
+        eprintln!("lap {lap}: allocator {:.1} MiB, process private {:.1} MiB", r.0 as f64 / (1 << 20) as f64, private_bytes() as f64 / (1 << 20) as f64);
         laps.push(r);
     }
     let (first, last) = (&laps[2], &laps[laps.len() - 1]);
