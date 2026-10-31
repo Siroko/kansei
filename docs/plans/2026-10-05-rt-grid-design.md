@@ -75,8 +75,10 @@ default), and a cluster view cuts clustered renderables there, orthographic, at
 - a single mesh, when its world box meets the grid's (a CPU test of one box per renderable).
 
 It rebuilds when the box moves, when the static renderables in it change (their transform,
-visibility, surface), when a cut it gathered grew, on `invalidate`, and every frame while a
-`dynamic` one is in it. In outdoor-gi (`rt=1`, the road camera, 1080p, this Mac) the grid holds
+visibility, surface), when a cut it gathered grew, and on `invalidate`. The `dynamic` ones go
+into a second, moving layer of the grid (`RtGrid::begin_moving`, in the same buffers): its own
+box fitted round them and its own cells, rebuilt every frame one is in the box, which every trace
+also walks, keeping the nearer hit; the static layer then stands while they move. In outdoor-gi (`rt=1`, the road camera, 1080p, this Mac) the grid holds
 21k triangles from 14 sources; a rebuild records in 0.1 ms of CPU (the scout's CPU selection took
 2-2.5 ms) and costs 0.7-1.1 ms of GPU (gather 0.1-0.2, count 0.2-0.4, scan 0.1, fill 0.25-0.35).
 

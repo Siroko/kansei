@@ -10,6 +10,33 @@
 // The cell words: each cell's end in the references (its start the previous cell's end), the
 // 4^3 macro cells (non-zero when any of their cells lists a triangle), the big triangles (a
 // count, then their indices) and the references (triangle indices).
+//
+// The grid has two layers in the same buffers, each with its own box, cells and triangles: the
+// static one, rebuilt only when what it holds changes, and the moving one, rebuilt every frame
+// from what moves (`moving`, absent while its cellCount is 0). A trace tests both and keeps the
+// nearer hit. `KanseiRtGrid`'s own fields are the static layer's, laid out as a `KanseiRtLayer`.
+
+struct KanseiRtLayer {
+    origin           : vec3f,
+    cell             : f32,
+    dims             : vec3u,
+    flags            : u32,
+    macroDims        : vec3u,
+    epsilon          : f32,
+    cellCount        : u32,
+    macroBase        : u32,
+    bigBase          : u32,
+    refsBase         : u32,
+    refCapacity      : u32,
+    triangleCapacity : u32,
+    bigCapacity      : u32,
+    bigCells         : u32,
+    // where its cell words and its triangles start
+    cellsBase        : u32,
+    triangleBase     : u32,
+    pad0             : u32,
+    pad1             : u32,
+}
 
 struct KanseiRtGrid {
     origin           : vec3f,
@@ -28,6 +55,18 @@ struct KanseiRtGrid {
     bigCapacity      : u32,
     // a triangle whose footprint spans more columns than this goes to the big list
     bigCells         : u32,
+    // where the layer's cell words and its triangles start (0 for the static layer; the build's
+    // uniform of the moving layer holds the moving layer here)
+    cellsBase        : u32,
+    triangleBase     : u32,
+    pad0             : u32,
+    pad1             : u32,
+    moving           : KanseiRtLayer,
+}
+
+// The static layer, as a `KanseiRtLayer`.
+fn kansei_rt_static_layer(g: KanseiRtGrid) -> KanseiRtLayer {
+    return KanseiRtLayer(g.origin, g.cell, g.dims, g.flags, g.macroDims, g.epsilon, g.cellCount, g.macroBase, g.bigBase, g.refsBase, g.refCapacity, g.triangleCapacity, g.bigCapacity, g.bigCells, g.cellsBase, g.triangleBase, 0u, 0u);
 }
 
 // surface flags
@@ -68,4 +107,8 @@ fn kansei_rt_unpack_normal(w: u32) -> vec3f {
 const KANSEI_RT_BIG : u32 = 0x80000000u;
 // grid flags
 const KANSEI_RT_MACRO_SKIP : u32 = 1u;
+// the layer's build keeps only the triangles that also meet the second layer's box (the moving
+// layer's build, whose uniform holds the static layer second: the triangles the static layer
+// would keep)
+const KANSEI_RT_CLIP : u32 = 2u;
 const KANSEI_RT_MACRO_SHIFT : u32 = 2u;

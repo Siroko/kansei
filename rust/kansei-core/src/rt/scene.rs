@@ -62,10 +62,10 @@ impl RtScene {
         self.instances.len() - 1
     }
 
-    /// Gather the instances whose world box meets `grid`'s into it: between `RtGrid::begin` and
-    /// `RtGrid::finish`, as its one gather this build.
+    /// Gather the instances whose world box meets `grid`'s into it: between `RtGrid::begin` (or
+    /// `begin_moving`) and `RtGrid::finish`, as its one gather this build.
     pub fn gather(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, encoder: &mut wgpu::CommandEncoder, grid: &mut RtGrid) {
-        let (lo, hi) = grid.bounds();
+        let (lo, hi) = grid.gather_bounds();
         let eps = Vec3::splat(grid.options().effective_epsilon());
         // the instances in the box, by (mesh, surface): their matrices, a source's run each
         let mut chosen: Vec<(usize, u32, u32, usize)> = Vec::new();
@@ -99,7 +99,7 @@ impl RtScene {
                 m.buffer = Some(m.mesh.create_buffer(device));
             }
         }
-        grid.reserve_triangles(device, queue, self.in_box_triangles.min(u32::MAX as u64) as u32);
+        grid.reserve_triangles(device, queue, encoder, self.in_box_triangles.min(u32::MAX as u64) as u32);
         // a source per run of one mesh and surface
         let mut sources = Vec::new();
         let mut start = 0;

@@ -131,7 +131,7 @@ pub const RT_OPAQUE_WGSL: &str = "fn kansei_rt_covered(layer: u32, uv: vec2f) ->
 
 #[cfg(test)]
 mod tests {
-    use super::grid::{gather_wgsl, RtGridGpu, RtSourceGpu, BUILD_WGSL};
+    use super::grid::{gather_wgsl, RtGridGpu, RtLayerGpu, RtSourceGpu, BUILD_WGSL};
     use super::*;
 
     const BACKENDS: [RtBackend; 2] = [RtBackend::Software, RtBackend::Hardware];
@@ -172,6 +172,7 @@ mod tests {
     fn shaders_validate_rt() {
         let build = validate("build", BUILD_WGSL);
         assert_eq!(struct_span(&build, "KanseiRtGrid"), std::mem::size_of::<RtGridGpu>());
+        assert_eq!(struct_span(&build, "KanseiRtLayer"), std::mem::size_of::<RtLayerGpu>());
         let placements = [
             RtPlacement::None,
             RtPlacement::Instance(InstanceTransform::Matrix { offset: 16 }),

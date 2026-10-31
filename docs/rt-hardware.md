@@ -65,8 +65,10 @@ The gather is the grid's own: the same pass culls, cuts cluster LOD and writes t
 triangles every `kansei_rt_*(id)` accessor reads. The hardware backend then skips the grid's
 count, scan and fill, and builds instead:
 
-- **One BLAS of the gathered triangles**, primitive `id` being triangle `id`, so a hit names the
-  same triangle the grid would. Opaque triangles go into an `OPAQUE` geometry; when alpha-tested
+- **A BLAS of each layer's gathered triangles** (the grid's static layer and its moving layer,
+  `RtGrid::begin_moving`), primitive `id` being the layer's triangle `id`, and a TLAS instance of
+  it whose custom data is the layer's first triangle, so a hit names the same triangle the grid
+  would. Opaque triangles go into an `OPAQUE` geometry; when alpha-tested
   or glass sources were gathered, those go into a second, non-opaque one, the only candidates
   that come back to the shader (for `kansei_rt_covered` and glass pass-through). A small pass
   (`Rt/BlasInput` in the profiler) writes each triangle's vertices from its record.
@@ -77,10 +79,11 @@ count, scan and fill, and builds instead:
   triangles under the grid's box, where no ray goes (the trace keeps to the box). Inactive (NaN)
   or degenerate triangles would be cheaper, but Metal's builds lost the real triangles among
   tens of thousands of them.
-- **A TLAS of one instance**, rebuilt after each BLAS build.
-- **Rebuilt only when the grid would be** (the box moved, what it holds changed, a `dynamic`
-  renderable is in it), built for fast building while that happens every few frames and once
-  more for fast tracing when the grid has rested 30 frames. A static scene builds once.
+- **A TLAS of the two instances**, rebuilt after either BLAS build.
+- **Rebuilt only when the layer would be**: the static BLAS when the box moved or what it holds
+  changed, built for fast building while that happens every few frames and once more for fast
+  tracing when the grid has rested 30 frames (a static scene builds it once); the moving BLAS,
+  the `dynamic` renderables', every frame one is in the box, built for fast building.
 
 Metal needs two workarounds, both from wgpu 30's Metal backend having no acceleration structure
 barrier (gfx-rs/wgpu#9215, fix open as #9645) and Metal tracking no hazard through a TLAS's
