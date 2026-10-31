@@ -113,7 +113,24 @@ fn reloading_scenes_holds_no_more_memory() {
             }
         }
         let Some(r) = report(&renderer) else { return eprintln!("no allocator report on this backend: skipped") };
-        eprintln!("lap {lap}: allocator {:.1} MiB, process private {:.1} MiB", r.0 as f64 / (1 << 20) as f64, private_bytes() as f64 / (1 << 20) as f64);
+        let h = renderer.device().get_internal_counters().hal;
+        eprintln!(
+            "lap {lap}: allocator {:.1} MiB, process private {:.1} MiB; live buffers {} ({:.1} MiB), textures {} ({:.1} MiB), views {}, bind groups {}, layouts {}, render pipelines {}, compute pipelines {}, shader modules {}, samplers {}, query sets {}",
+            r.0 as f64 / (1 << 20) as f64,
+            private_bytes() as f64 / (1 << 20) as f64,
+            h.buffers.read(),
+            h.buffer_memory.read() as f64 / (1 << 20) as f64,
+            h.textures.read(),
+            h.texture_memory.read() as f64 / (1 << 20) as f64,
+            h.texture_views.read(),
+            h.bind_groups.read(),
+            h.bind_group_layouts.read(),
+            h.render_pipelines.read(),
+            h.compute_pipelines.read(),
+            h.shader_modules.read(),
+            h.samplers.read(),
+            h.query_sets.read()
+        );
         laps.push(r);
     }
     let (first, last) = (&laps[4], &laps[laps.len() - 1]);

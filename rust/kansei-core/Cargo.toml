@@ -34,6 +34,8 @@ wgpu = { workspace = true, features = ["static-dxc"] }
 naga = { version = "30", features = ["wgsl-in"] }
 # headless GPU tests (skipped when there is no adapter)
 pollster = { workspace = true }
+# wgpu's live objects counted (`Device::get_internal_counters`) in the memory tests
+wgpu = { workspace = true, features = ["counters"] }
 
 [features]
 default = []
