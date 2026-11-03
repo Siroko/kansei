@@ -43,6 +43,20 @@
 //! 16; [`SmaaOptions::reach`] takes up to 64), and there is no diagonal search (High has 8
 //! diagonal steps).
 //!
+//! # What the reach costs
+//!
+//! The default reach, 16 px, against iryoku High's 32 (the same passes with `reach: 32`), at
+//! 1920 x 1080:
+//!
+//! - On synthetic images (`tests/smaa_gpu.rs`, `reach_cost_on_synthetic_edges`): nothing differs on
+//!   flat colour, noise, straight edges, a square turned 20°, a 45° diagonal, a dense lattice or a
+//!   faint edge. On lines of slope 1/7 and 1/40, whose runs are longer than 16 px, 1,927 and
+//!   1,066 pixels differ by more than 2/255 (mean 0.00006 and 0.00003, at most 36.5/255).
+//! - On the `smaa` example's frame (`t=2`, no grain or dither): 1,300 pixels (0.06 %) differ by
+//!   more than 2/255 (mean 0.00003, at most 132/255), along the near tower's long, nearly
+//!   vertical members, where a run longer than 16 px gets the blend of a shorter one. SMAA itself
+//!   changes 152,955 pixels of that frame.
+//!
 //! # Three passes
 //!
 //! Edges (`SMAA/Edges`), blending weights (`SMAA/Weights`) and neighbourhood blending

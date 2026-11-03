@@ -14,9 +14,36 @@
     <canvas id="kansei"></canvas>
     <pre id="bench"></pre>
     <script type="module">
-        import init, { start } from '../pkg/kansei_wasm_smaa.js';
+        // URL parameters:
+        //   aa=off|smaa|taa    the starting anti-aliasing (default smaa)
+        //   threshold=<luma>   SMAA's edge threshold (default 0.1)
+        //   reach=<px>         SMAA's search reach (default 16)
+        //   grain=<amount>     film grain (default 0.3); dither=0 turns the dither off
+        //   pan=<deg/s>        the camera's top swing speed (default 90)
+        //   t=<seconds>        freeze the scene
+        //   size=<w>x<h>       the drawing buffer's size
+        //   bench=1            SMAA and TAA in turn at 1920 x 1080, their GPU times (no panel)
+        import init, { start, view, set } from '../pkg/kansei_wasm_smaa.js';
         await init();
         await start('kansei');
+
+        const params = new URLSearchParams(location.search);
+        const read = () => JSON.parse(view());
+        // for scripted captures: window.kansei.set('aa', 2)
+        window.kansei = { view: read, set };
+        if (params.get('bench') !== '1') {
+            const { Pane } = await import('https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js');
+            const p = read();
+            const pane = new Pane({ title: 'SMAA' });
+            const bind = (key, options) => pane.addBinding(p, key, options).on('change', (e) => set(key, typeof e.value === 'boolean' ? Number(e.value) : e.value));
+            bind('aa', { label: 'anti-aliasing', options: { Off: 0, SMAA: 1, TAA: 2 } });
+            bind('threshold', { min: 0.05, max: 0.2, step: 0.005, label: 'SMAA threshold' });
+            pane.addBinding({ reach: `${p.reach} px` }, 'reach', { readonly: true, label: 'SMAA reach' });
+            bind('pan', { label: 'pan' });
+            bind('panSpeed', { min: 0, max: 360, step: 5, label: 'pan speed (deg/s)' });
+            bind('grain', { min: 0, max: 1, step: 0.01, label: 'grain' });
+            if (window.innerWidth < 768) pane.expanded = false;
+        }
     </script>
 </body>
 </html>

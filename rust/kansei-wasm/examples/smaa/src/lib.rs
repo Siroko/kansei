@@ -7,9 +7,15 @@
 //! anti-aliasings (`PostProcessingVolume::set_enabled`) or neither. Every surface is the stock
 //! `Material::standard_lit` with `outputs_velocity` (the TAA's motion vectors).
 //!
+//! Film grain is on (0.3): under SMAA the tonemapper leaves its grain and dither to it
+//! (`ToneMapOptions::defer_film`), added after the blend so the grain isn't smoothed as edges;
+//! under TAA or no anti-aliasing the tonemapper adds them itself. The page's panel (Tweakpane)
+//! switches the mode and sets SMAA's threshold, the pan and the grain (`view` and `set`).
+//!
 //! URL parameters: `aa=off|smaa|taa` (the starting mode), `reach=<px>` (SMAA's search reach),
-//! `threshold=<luma>`, `t=<seconds>` (freeze the scene), `pan=<deg/s>`, `size=<w>x<h>` (the
-//! drawing buffer's size), `bench=1` (SMAA and TAA in turn, see `bench.rs`).
+//! `threshold=<luma>`, `grain=<amount>`, `dither=0`, `t=<seconds>` (freeze the scene),
+//! `pan=<deg/s>`, `size=<w>x<h>` (the drawing buffer's size), `bench=1` (SMAA and TAA in turn,
+//! see `bench.rs`).
 
 // natively only the bench's tests build (the page's entry points are wasm32's)
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code, unused_imports))]
@@ -30,7 +36,7 @@ use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::postprocessing::{
     PostProcessingEffect, PostProcessingVolume,
-    effects::{exposure_from_ev100, FilmGrain, SmaaEffect, SmaaOptions, TemporalAAEffect, TemporalAAOptions, ToneMapEffect, ToneMapOptions},
+    effects::{exposure_from_ev100, SmaaEffect, SmaaOptions, TemporalAAEffect, TemporalAAOptions, ToneMapEffect, ToneMapOptions},
 };
 use kansei_core::renderers::{Renderer, RendererConfig};
 use kansei_wasm::{flag, now, param, param_or, set_text, Canvas};
@@ -193,7 +199,12 @@ struct State {
     volume: PostProcessingVolume,
     rotor: usize,
     aa: Aa,
+    /// The camera's swing: on, its top speed (deg/s), and its own clock (it stops when off).
+    panning: bool,
     pan: f32,
+    pan_time: f32,
+    last_time: f32,
+    grain: f32,
     /// The scene's time, held (`t=`; the bench's).
     frozen_t: Option<f32>,
     bench: Option<Bench>,
@@ -203,14 +214,13 @@ thread_local! {
     static STATE: RefCell<Option<Rc<RefCell<State>>>> = const { RefCell::new(None) };
 }
 
-#[allow(dead_code)]
 fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
     let state = STATE.with(|s| s.borrow().clone())?;
     let mut st = state.borrow_mut();
     Some(f(&mut st))
 }
 
-/// Run `aa`: SMAA or TAA, or neither, and hand SMAA the tonemapper's signal.
+/// Run `aa`: SMAA or TAA, or neither.
 fn apply(st: &mut State, aa: Aa) {
     let taa = aa == Aa::Taa;
     if taa && !st.volume.is_enabled::<TemporalAAEffect>() {
@@ -220,10 +230,6 @@ fn apply(st: &mut State, aa: Aa) {
     }
     st.volume.set_enabled::<TemporalAAEffect>(taa);
     st.volume.set_enabled::<SmaaEffect>(aa == Aa::Smaa);
-    let encode_srgb = st.volume.effect::<ToneMapEffect>().is_some_and(|t| t.options.encode_srgb);
-    if let Some(smaa) = st.volume.effect_mut::<SmaaEffect>() {
-        smaa.set_film(FilmGrain { encode_srgb, ..Default::default() });
-    }
     st.aa = aa;
 }
 
@@ -241,12 +247,27 @@ impl State {
                 }
             }
         }
+        // the film: under SMAA the tonemapper leaves its grain and dither to it, else adds them
+        if let Some(tonemap) = self.volume.effect_mut::<ToneMapEffect>() {
+            tonemap.options.defer_film = self.aa == Aa::Smaa;
+            tonemap.options.grain = self.grain;
+        }
+        let film = self.volume.effect::<ToneMapEffect>().map(ToneMapEffect::later_film);
+        if let (Some(film), Some(smaa)) = (film, self.volume.effect_mut::<SmaaEffect>()) {
+            smaa.set_film(film);
+        }
+
         let t = self.frozen_t.unwrap_or(time);
         if let Some(r) = self.scene.get_renderable_mut(self.rotor) {
             r.object.rotation.z = -(t * ROTOR_SPEED).fract() * std::f32::consts::TAU;
         }
-        // swinging left and right at up to `pan` degrees a second
-        let yaw = self.pan.to_radians() / SWING * (SWING * t).sin();
+        // swinging left and right at up to `pan` degrees a second, on its own clock
+        if self.panning {
+            self.pan_time += (time - self.last_time).clamp(0.0, 0.1);
+        }
+        self.last_time = time;
+        let swing_t = self.frozen_t.unwrap_or(self.pan_time);
+        let yaw = self.pan.to_radians() / SWING * (SWING * swing_t).sin();
         let eye = V3::new(0.0, 1.5, 4.5);
         let target = eye + V3::new(26.0 * yaw.sin(), 3.2, -26.0 * yaw.cos());
         self.camera.set_position(eye.x, eye.y, eye.z);
@@ -257,6 +278,47 @@ impl State {
             kansei_wasm::perf::profile(&mut self.renderer);
         }
     }
+}
+
+impl State {
+    /// The panel's values: `{aa, threshold, reach, pan, panSpeed, grain}` (`aa` 0 off, 1 SMAA,
+    /// 2 TAA).
+    fn view_json(&self) -> String {
+        let aa = match self.aa {
+            Aa::Off => 0,
+            Aa::Smaa => 1,
+            Aa::Taa => 2,
+        };
+        let (threshold, reach) = self.volume.effect::<SmaaEffect>().map_or((0.0, 0), |s| (s.options.threshold, s.options.reach));
+        format!(r#"{{"aa":{aa},"threshold":{threshold},"reach":{reach},"pan":{},"panSpeed":{},"grain":{}}}"#, self.panning, self.pan, self.grain)
+    }
+
+    fn set(&mut self, key: &str, value: f32) {
+        match key {
+            "aa" => apply(self, [Aa::Off, Aa::Smaa, Aa::Taa][(value.round() as usize).min(2)]),
+            "threshold" => {
+                if let Some(smaa) = self.volume.effect_mut::<SmaaEffect>() {
+                    smaa.options.threshold = value.clamp(0.01, 0.5);
+                }
+            }
+            "pan" => self.panning = value != 0.0,
+            "panSpeed" => self.pan = value.max(0.0),
+            "grain" => self.grain = value.clamp(0.0, 1.0),
+            _ => log::warn!("set: no value {key}"),
+        }
+    }
+}
+
+/// The panel's values as JSON: `{aa, threshold, reach, pan, panSpeed, grain}`.
+#[wasm_bindgen]
+pub fn view() -> String {
+    with_state(|s| s.view_json()).unwrap_or_default()
+}
+
+/// Set one of the panel's values by its `view` key (`aa` 0 off, 1 SMAA, 2 TAA; `pan` 0 or 1).
+#[wasm_bindgen]
+pub fn set(key: &str, value: f32) {
+    with_state(|s| s.set(key, value));
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -305,6 +367,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     let tonemap = {
         let mut options = ToneMapOptions::for_surface(renderer.presentation_format());
         options.exposure = exposure_from_ev100(11.0);
+        options.dither = flag("dither", true);
         ToneMapEffect::new(options)
     };
     let smaa = SmaaEffect::new(SmaaOptions {
@@ -328,7 +391,21 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     });
     log::info!("Kansei — SMAA (WASM) ready: {width}x{height}, aa={}, {:?}", aa.name(), renderer.presentation_format());
 
-    let mut st = State { renderer, scene, camera, volume, rotor, aa, pan: param_or("pan", 90.0), frozen_t, bench };
+    let mut st = State {
+        renderer,
+        scene,
+        camera,
+        volume,
+        rotor,
+        aa,
+        panning: true,
+        pan: param_or("pan", 90.0),
+        pan_time: 0.0,
+        last_time: 0.0,
+        grain: param_or("grain", 0.3),
+        frozen_t,
+        bench,
+    };
     apply(&mut st, aa);
     let state = Rc::new(RefCell::new(st));
     STATE.with(|s| *s.borrow_mut() = Some(state.clone()));
