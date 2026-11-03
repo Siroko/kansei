@@ -119,7 +119,7 @@ const THREE_PASS_WGSL: &str = concat!(include_str!("../../shaders/smaa_common.wg
 /// With `KANSEI_SMAA_REACH` for [`SmaaEffect::REACH`] (`single_pass_wgsl`).
 const SINGLE_PASS_WGSL: &str = concat!(include_str!("../../shaders/smaa_common.wgsl"), include_str!("../../shaders/smaa_single.wgsl"));
 /// The single pass's tile (smaa_single.wgsl's SMAA_TILE): one workgroup's output pixels a side.
-const TILE: u32 = 16;
+const TILE: u32 = 32;
 /// SMAA's area texture, its 1x subtexture (see the module docs).
 const AREA: &[u8] = include_bytes!("smaa_area.bin");
 const AREA_SIZE: (u32, u32) = (160, 80);

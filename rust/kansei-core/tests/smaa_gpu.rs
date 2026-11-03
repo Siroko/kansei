@@ -137,7 +137,7 @@ fn difference(a: &[[u16; 4]], b: &[[u16; 4]]) -> (f32, f32, usize) {
     (max, (sum / a.len() as f64) as f32, over)
 }
 
-const KINDS: [Kind; 8] = [Kind::Flat, Kind::Noise, Kind::StraightVertical, Kind::StraightHorizontal, Kind::RotatedSquare, Kind::NearHorizontal, Kind::NearVertical, Kind::Diagonal];
+const KINDS: [Kind; 9] = [Kind::Flat, Kind::Noise, Kind::StraightVertical, Kind::StraightHorizontal, Kind::RotatedSquare, Kind::NearHorizontal, Kind::NearVertical, Kind::Diagonal, Kind::Lattice];
 
 #[derive(Debug, Clone, Copy)]
 enum Kind {
@@ -149,6 +149,9 @@ enum Kind {
     NearHorizontal,
     NearVertical,
     Diagonal,
+    /// Thin dark lines on a bright ground, a shallow set and a steep one: edges in most tiles,
+    /// as a fence fills a frame.
+    Lattice,
 }
 
 /// A grey image of `kind` in the encoded signal, each pixel point-sampled at its centre.
@@ -178,6 +181,10 @@ fn image(kind: Kind, w: u32, h: u32) -> Vec<[f32; 3]> {
             Kind::NearHorizontal => two(py - 0.3 * hf > px / 7.0 && py - 0.7 * hf < px / 40.0),
             Kind::NearVertical => two(px - 0.3 * wf > py / 7.0 && px - 0.7 * wf < py / 40.0),
             Kind::Diagonal => two(px > py),
+            Kind::Lattice => {
+                let line = (px - 3.0 * py).rem_euclid(14.0) < 1.6 || (0.35 * px + py).rem_euclid(11.0) < 1.4;
+                if line { 0.1 } else { 0.85 }
+            }
         }
     };
     (0..h).flat_map(|y| (0..w).map(move |x| [value(x, y); 3])).collect()
@@ -276,7 +283,8 @@ fn resizing_and_switching_modes_match_fresh_effects() {
 }
 
 /// GPU time at 1920 x 1080 by wall clock, the single pass, the three passes and the TAA resolve
-/// alternated:
+/// alternated, on a mostly flat image (RotatedSquare: few tiles have edges) and a dense one
+/// (Lattice: most do):
 /// `cargo test -p kansei-core --release --test smaa_gpu time_smaa_1080p -- --ignored --nocapture`.
 #[test]
 #[ignore]
@@ -289,39 +297,41 @@ fn time_smaa_1080p() {
     let texture = |usage| {
         device.create_texture(&wgpu::TextureDescriptor { label: None, size, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: wgpu::TextureFormat::Rgba16Float, usage, view_formats: &[] })
     };
-    let input_tex = texture(wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
-    dev.queue.write_texture(
-        wgpu::TexelCopyTextureInfo { texture: &input_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-        bytemuck::cast_slice(&halves(&image(Kind::RotatedSquare, w, h))),
-        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 8), rows_per_image: Some(h) },
-        size,
-    );
-    let input = input_tex.create_view(&Default::default());
     let output = texture(wgpu::TextureUsages::STORAGE_BINDING).create_view(&Default::default());
     let gbuffer = GBuffer::new(device, w, h, 1);
-    let mut effects: Vec<(&str, Box<dyn PostProcessingEffect>)> = vec![
-        ("SMAA single pass", Box::new(SmaaEffect::new(SmaaOptions::default()).with_mode(SmaaMode::SinglePass))),
-        ("SMAA three passes", Box::new(SmaaEffect::new(SmaaOptions::default()).with_mode(SmaaMode::ThreePass))),
-        ("TAA resolve", Box::new(TemporalAAEffect::new(TemporalAAOptions::default()))),
-    ];
-    let mut times = vec![Vec::new(); effects.len()];
-    for round in 0..45 {
-        for (k, (_, fx)) in effects.iter_mut().enumerate() {
-            let mut encoder = device.create_command_encoder(&Default::default());
-            for _ in 0..10 {
-                fx.render(device, &dev.queue, &mut encoder, &gbuffer, &input, &gbuffer.depth_view, &output, &dev.camera, w, h);
-            }
-            let t = std::time::Instant::now();
-            dev.queue.submit([encoder.finish()]);
-            let _ = device.poll(wgpu::PollType::wait_indefinitely());
-            if round >= 5 {
-                times[k].push(t.elapsed().as_secs_f64() * 1e3 / 10.0);
+    for kind in [Kind::RotatedSquare, Kind::Lattice] {
+        let input_tex = texture(wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
+        dev.queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &input_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            bytemuck::cast_slice(&halves(&image(kind, w, h))),
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 8), rows_per_image: Some(h) },
+            size,
+        );
+        let input = input_tex.create_view(&Default::default());
+        let mut effects: Vec<(&str, Box<dyn PostProcessingEffect>)> = vec![
+            ("SMAA single pass", Box::new(SmaaEffect::new(SmaaOptions::default()).with_mode(SmaaMode::SinglePass))),
+            ("SMAA three passes", Box::new(SmaaEffect::new(SmaaOptions::default()).with_mode(SmaaMode::ThreePass))),
+            ("TAA resolve", Box::new(TemporalAAEffect::new(TemporalAAOptions::default()))),
+        ];
+        let mut times = vec![Vec::new(); effects.len()];
+        for round in 0..45 {
+            for (k, (_, fx)) in effects.iter_mut().enumerate() {
+                let mut encoder = device.create_command_encoder(&Default::default());
+                for _ in 0..10 {
+                    fx.render(device, &dev.queue, &mut encoder, &gbuffer, &input, &gbuffer.depth_view, &output, &dev.camera, w, h);
+                }
+                let t = std::time::Instant::now();
+                dev.queue.submit([encoder.finish()]);
+                let _ = device.poll(wgpu::PollType::wait_indefinitely());
+                if round >= 5 {
+                    times[k].push(t.elapsed().as_secs_f64() * 1e3 / 10.0);
+                }
             }
         }
-    }
-    for ((name, _), t) in effects.iter().zip(&mut times) {
-        t.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        eprintln!("{name}: {:.3} ms (median per frame, {w}x{h}, RotatedSquare)", t[t.len() / 2]);
+        for ((name, _), t) in effects.iter().zip(&mut times) {
+            t.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            eprintln!("{kind:?} {name}: {:.3} ms (median per frame, {w}x{h})", t[t.len() / 2]);
+        }
     }
 }
 
