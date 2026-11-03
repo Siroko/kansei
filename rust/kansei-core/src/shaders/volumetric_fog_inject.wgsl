@@ -52,6 +52,60 @@ fn smoothFalloff(dist: f32, radius: f32) -> f32 {
     return f * f;
 }
 
+// One light at a point, before the phase function: the direction toward it, and its colour times
+// its falloff and its shadow map's visibility. The fog sums them with henyeyGreenstein; the smoke
+// (volumetric_smoke_march.wgsl) with its own phase, so both are lit by the same lights.
+struct FogLight {
+    toLight  : vec3f,
+    radiance : vec3f,
+}
+
+// The i-th directional light (compute_shadows.wgsl), shadowed by the directional map if it casts.
+fn fogDirLight(i: u32, worldPos: vec3f) -> FogLight {
+    let dl = dirLights[i];
+    var visibility = 1.0;
+    if (dl.shadowed != 0u && params.hasShadowMap != 0u) {
+        visibility = dirShadowLookup(worldPos);
+    }
+    return FogLight(-normalize(dl.direction), dl.color * visibility);
+}
+
+// The i-th point light: no light past its radius, shadowed by the cube atlas if it has a layer.
+fn fogPointLight(i: u32, worldPos: vec3f) -> FogLight {
+    let pl = ptLights[i];
+    let toLight = pl.position - worldPos;
+    let dist = length(toLight);
+    if (dist > pl.radius) { return FogLight(vec3f(0.0, 1.0, 0.0), vec3f(0.0)); }
+
+    var visibility = 1.0;
+    if (pl.shadowLayer != NO_SHADOW && params.hasPointShadows != 0u) {
+        visibility = pointShadowLookup(worldPos, pl.position, pl.shadowLayer);
+    }
+    let dir = select(vec3f(0.0, 1.0, 0.0), toLight / dist, dist > 0.0);
+    return FogLight(dir, pl.color * smoothFalloff(dist, pl.radius) * visibility);
+}
+
+// The light the fog scatters toward the camera at worldPos per unit density, before the media's
+// albedo: the uniform sky around it (ambient), the directional, point and spot lights through
+// their shadows with the phase function, and the actual sky's light (volumetric_fog_media.wgsl).
+// `spotMinDist` caps the spot lights' inverse square (volumetric_fog_spot.wgsl).
+fn fogInScatter(worldPos: vec3f, viewDir: vec3f, spotMinDist: f32) -> vec3f {
+    var scatter = params.ambient;
+    for (var di = 0u; di < params.numDirLights; di++) {
+        let l = fogDirLight(di, worldPos);
+        scatter += l.radiance * henyeyGreenstein(dot(viewDir, l.toLight), params.anisotropy);
+    }
+    for (var pi = 0u; pi < params.numPointLights; pi++) {
+        let l = fogPointLight(pi, worldPos);
+        scatter += l.radiance * henyeyGreenstein(dot(viewDir, l.toLight), params.anisotropy);
+    }
+    // spot lights: cones with shadows (volumetric_fog_spot.wgsl), unless raymarched per pixel
+    if (params.skipSpots == 0u) {
+        scatter += spotInScatter(worldPos, viewDir, spotMinDist);
+    }
+    return scatter + skyAmbient(viewDir, worldPos);
+}
+
 @compute @workgroup_size(4, 4, 4)
 fn main(@builtin(global_invocation_id) gid : vec3u) {
     if (gid.x >= params.gridW || gid.y >= params.gridH || gid.z >= params.gridD) { return; }
@@ -93,36 +147,6 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
     let extinction = media.extinction * above * reach;
 
     let viewDir = normalize(worldPos - params.cameraPos);
-    var totalScatter = density * params.ambient;
-
-    for (var di = 0u; di < params.numDirLights; di++) {
-        let dl = dirLights[di];
-        var visibility = 1.0;
-        if (dl.shadowed != 0u && params.hasShadowMap != 0u) {
-            visibility = dirShadowLookup(worldPos);
-        }
-        let phase = henyeyGreenstein(dot(viewDir, -normalize(dl.direction)), params.anisotropy);
-        totalScatter += density * dl.color * visibility * phase;
-    }
-
-    for (var pi = 0u; pi < params.numPointLights; pi++) {
-        let pl = ptLights[pi];
-        let dist = length(pl.position - worldPos);
-        if (dist > pl.radius) { continue; }
-
-        var visibility = 1.0;
-        if (pl.shadowLayer != NO_SHADOW && params.hasPointShadows != 0u) {
-            visibility = pointShadowLookup(worldPos, pl.position, pl.shadowLayer);
-        }
-        let phase = henyeyGreenstein(dot(viewDir, normalize(pl.position - worldPos)), params.anisotropy);
-        totalScatter += density * pl.color * smoothFalloff(dist, pl.radius) * visibility * phase;
-    }
-
-    // spot lights: cones with shadows (volumetric_fog_spot.wgsl), unless raymarched per pixel
-    if (params.skipSpots == 0u) {
-        totalScatter += density * spotInScatter(worldPos, viewDir, max(sliceThickness, 0.25));
-    }
-
-    totalScatter = (totalScatter + density * skyAmbient(viewDir, worldPos)) * media.albedo;
+    let totalScatter = density * fogInScatter(worldPos, viewDir, max(sliceThickness, 0.25)) * media.albedo;
     textureStore(scatterExtTex, gid, vec4f(totalScatter, extinction));
 }

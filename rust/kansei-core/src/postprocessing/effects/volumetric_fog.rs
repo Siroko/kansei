@@ -1504,6 +1504,91 @@ mod tests {
         assert!((right - 1.0).abs() < 0.03, "right: {right}");
     }
 
+    /// The injection lights each froxel as density * (ambient + the sum over the lights of their
+    /// colour * falloff * HG(view, to the light)) * albedo, and the accumulation integrates the
+    /// slices front to back: a CPU march of the same formula at the froxel centres of one column
+    /// agrees with the grid (a characterization of the injection, kept through its refactors).
+    #[test]
+    fn the_injection_lights_a_froxel_as_the_formula_says() {
+        use crate::lights::{DirectionalLight, PointLight};
+        use glam::Vec3 as V;
+        let instance = wgpu::Instance::default();
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+        let (w, h) = (64u32, 32u32);
+        let tex = |format, usage| {
+            device
+                .create_texture(&wgpu::TextureDescriptor { label: None, size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format, usage, view_formats: &[] })
+                .create_view(&Default::default())
+        };
+        let input = tex(wgpu::TextureFormat::Rgba16Float, wgpu::TextureUsages::TEXTURE_BINDING);
+        let output = tex(wgpu::TextureFormat::Rgba16Float, wgpu::TextureUsages::STORAGE_BINDING);
+        let depth = tex(GBuffer::DEPTH_FORMAT, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT);
+        let gbuffer = GBuffer::new(&device, w, h, 1);
+        let (grid_w, grid_h, grid_d, near, far) = (16u32, 16u32, 32u32, 0.5f32, 60.0f32);
+        let (density, g, ambient) = (0.02f32, 0.6f32, V::splat(0.1));
+        let mut fog = VolumetricFogEffect::new(VolumetricFogOptions {
+            grid: FroxelGridOptions { grid_w, grid_h, grid_d, near, far, temporal: false, blend_factor: 1.0 },
+            base_density: density,
+            height_falloff: 0.0,
+            fog_height: 100.0,
+            anisotropy: g,
+            ambient: Vec3::new(ambient.x, ambient.y, ambient.z),
+            ..Default::default()
+        });
+        let sun_dir = V::new(-0.6, -0.5, -0.62);
+        let sun = DirectionalLight::new(Vec3::new(sun_dir.x, sun_dir.y, sun_dir.z), Vec3::new(1.0, 0.9, 0.8), 2.0);
+        let lamp_pos = V::new(1.5, 5.0, -6.0);
+        let lamp = PointLight::new(Vec3::new(lamp_pos.x, lamp_pos.y, lamp_pos.z), Vec3::new(1.0, 0.6, 0.3), 3.0, 12.0);
+        let lights = [Light::Directional(sun), Light::Point(lamp)];
+        fog.update_lights(lights.iter());
+        let mut camera = Camera::new(60.0, 0.5, 1000.0, w as f32 / h as f32);
+        camera.set_position(0.0, 5.0, 0.0);
+        camera.look_at(&Vec3::new(0.0, 5.0, -10.0));
+        camera.update_view_matrix();
+        let mut encoder = device.create_command_encoder(&Default::default());
+        fog.render(&device, &queue, &mut encoder, &gbuffer, &input, &depth, &output, &camera, w, h);
+        queue.submit(std::iter::once(encoder.finish()));
+        let v = read_volume(&device, &queue, fog.froxel_grid().unwrap());
+        let accum_at = |v: &[[f32; 4]], x: u32, y: u32, z: u32| -> V {
+            let c = v[((z * grid_h + y) * grid_w + x) as usize];
+            V::new(c[0], c[1], c[2])
+        };
+
+        // the CPU: the froxel centres of column (8, 8), lit and integrated as the shaders do
+        let inv_vp = (camera.projection_matrix.to_glam() * camera.view_matrix.to_glam()).inverse();
+        let eye = V::new(0.0, 5.0, 0.0);
+        let slice_depth = |i: f32| near * (far / near).powf(i / grid_d as f32);
+        let hg = |c: f32| (1.0 - g * g) / (4.0 * std::f32::consts::PI * (1.0 + g * g - 2.0 * g * c).powf(1.5));
+        let sun_color = V::new(1.0, 0.9, 0.8) * 2.0;
+        let lamp_color = V::new(1.0, 0.6, 0.3) * 3.0;
+        let expected_accum = |z_last: u32| -> V {
+            let (mut transmittance, mut light) = (1.0f32, V::ZERO);
+            for z in 0..=z_last {
+                let linear = slice_depth(z as f32 + 0.5);
+                let uv = glam::Vec2::new(8.5 / grid_w as f32, 8.5 / grid_h as f32);
+                let ndc_z = camera.far * (linear - camera.near) / (linear * (camera.far - camera.near));
+                let p = inv_vp.project_point3(V::new(uv.x * 2.0 - 1.0, (1.0 - uv.y) * 2.0 - 1.0, ndc_z));
+                let view = (p - eye).normalize();
+                let to_lamp = lamp_pos - p;
+                let r = (to_lamp.length() / 12.0).clamp(0.0, 1.0);
+                let falloff = if to_lamp.length() > 12.0 { 0.0 } else { (1.0 - r * r) * (1.0 - r * r) };
+                let scatter = density * (ambient + sun_color * hg(view.dot(-sun_dir.normalize())) + lamp_color * falloff * hg(view.dot(to_lamp.normalize())));
+                let thickness = slice_depth(z as f32 + 1.0) - slice_depth(z as f32);
+                let slice_t = (-density * thickness).exp();
+                light += transmittance * scatter * (1.0 - slice_t) / density;
+                transmittance *= slice_t;
+            }
+            light
+        };
+        for z in [0u32, 6, 12] {
+            let (got, want) = (accum_at(&v, 8, 8, z), expected_accum(z));
+            for c in 0..3 {
+                assert!((got[c] - want[c]).abs() <= 1e-3 * want[c].max(1e-4), "slice {z} channel {c}: {got} vs {want}");
+            }
+        }
+    }
+
     /// While the reflection is not drawn (disabled, or the camera under its plane) the fog builds
     /// no volume for it.
     #[test]
