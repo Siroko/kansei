@@ -557,3 +557,22 @@ fn switching_levels_at_runtime_keeps_rendering() {
         assert!(img.iter().all(|c| c.iter().all(|v| v.is_finite())), "frame {frame}: a pixel is not finite");
     }
 }
+
+/// An app that drops its smoke simulation without `set_smoke(None)` leaves the fog rendering
+/// (the simulation's grids are gone; the fog marches nothing).
+#[test]
+fn dropping_the_simulation_leaves_the_fog_rendering() {
+    let Some((device, queue)) = gpu() else { return };
+    let s = scene(&device, &queue, (64, 32), |_, _| Some(6.0));
+    let mut sim = SmokeSimulation::new(&device, &queue);
+    sim.add(smoke_box(Vec3::new(0.0, 1.0, -3.0), Vec3::new(2.0, 2.0, 2.0), 0.5));
+    let mut f = fog(0.02, 1.0);
+    f.set_smoke(Some(&sim.handle()));
+    render(&device, &queue, &mut f, &s, 1);
+    drop(sim);
+    let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    let img = render(&device, &queue, &mut f, &s, 1);
+    let error = pollster::block_on(scope.pop());
+    assert!(error.is_none(), "{error:?}");
+    assert!(img.iter().all(|c| c.iter().all(|v| v.is_finite())));
+}

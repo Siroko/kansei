@@ -1700,6 +1700,70 @@ mod tests {
         }
     }
 
+    /// A resize gives the smoke's march new targets and destroys the old ones (wgpu's web backend
+    /// frees nothing on drop, AGENTS.md): sampling an old one afterwards is a validation error.
+    #[test]
+    fn a_resize_destroys_the_old_smoke_targets() {
+        use crate::simulations::smoke::{SmokeFill, SmokeMotion, SmokeSimulation, SmokeVolume};
+        let instance = wgpu::Instance::default();
+        let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else { return eprintln!("no GPU adapter: skipping") };
+        let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
+        let frame = |fog: &mut VolumetricFogEffect, (w, h): (u32, u32)| {
+            let tex = |format, usage| {
+                device
+                    .create_texture(&wgpu::TextureDescriptor { label: None, size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 }, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format, usage, view_formats: &[] })
+                    .create_view(&Default::default())
+            };
+            let input = tex(wgpu::TextureFormat::Rgba16Float, wgpu::TextureUsages::TEXTURE_BINDING);
+            let output = tex(wgpu::TextureFormat::Rgba16Float, wgpu::TextureUsages::STORAGE_BINDING);
+            let depth = tex(GBuffer::DEPTH_FORMAT, wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT);
+            let gbuffer = GBuffer::new(&device, w, h, 1);
+            let mut camera = Camera::new(60.0, 0.5, 100.0, w as f32 / h as f32);
+            camera.set_position(0.0, 1.0, 0.0);
+            camera.look_at(&Vec3::new(0.0, 1.0, -1.0));
+            camera.update_view_matrix();
+            let mut encoder = device.create_command_encoder(&Default::default());
+            fog.render(&device, &queue, &mut encoder, &gbuffer, &input, &depth, &output, &camera, w, h);
+            queue.submit(std::iter::once(encoder.finish()));
+        };
+        let mut sim = SmokeSimulation::new(&device, &queue);
+        let mut ball = SmokeVolume::new(Vec3::new(0.0, 1.0, -3.0), Vec3::new(1.0, 1.0, 1.0), SmokeMotion::curl_noise());
+        ball.fill = SmokeFill::Box { density: 1.0, temperature: 0.0 };
+        sim.add(ball);
+        let mut fog = VolumetricFogEffect::new(Default::default());
+        fog.set_smoke(Some(&sim.handle()));
+        frame(&mut fog, (64, 32));
+        let old = fog.gpu.as_ref().unwrap().smoke.as_ref().unwrap().target_textures();
+        assert_eq!(old.len(), 5);
+        frame(&mut fog, (96, 48));
+        // read an old target in a pass: an error once it is destroyed
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: None,
+            source: wgpu::ShaderSource::Wgsl("@group(0) @binding(0) var t : texture_2d<f32>;\n@group(0) @binding(1) var<storage, read_write> o : array<vec4f>;\n@compute @workgroup_size(1) fn main() { o[0] = textureLoad(t, vec2u(0u), 0); }".into()),
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: None, module: &module, entry_point: Some("main"), compilation_options: Default::default(), cache: None });
+        let out = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 16, usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false });
+        for texture in &old {
+            let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let view = texture.create_view(&Default::default());
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &pipeline.get_bind_group_layout(0),
+                entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) }, wgpu::BindGroupEntry { binding: 1, resource: out.as_entire_binding() }],
+            });
+            let mut e = device.create_command_encoder(&Default::default());
+            {
+                let mut pass = e.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&pipeline);
+                pass.set_bind_group(0, &bg, &[]);
+                pass.dispatch_workgroups(1, 1, 1);
+            }
+            queue.submit([e.finish()]);
+            let error = pollster::block_on(scope.pop());
+            assert!(error.as_ref().is_some_and(|e| e.to_string().contains("destroyed")), "{:?} was not destroyed: {error:?}", texture.format());
+        }
+    }
+
     /// While the reflection is not drawn (disabled, or the camera under its plane) the fog builds
     /// no volume for it.
     #[test]

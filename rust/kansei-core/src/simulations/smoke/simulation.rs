@@ -249,6 +249,15 @@ pub struct SmokeSimulation {
     solver: Solver,
 }
 
+impl Drop for SmokeSimulation {
+    // the fog may still hold the handle: let it march nothing rather than the grids going now
+    fn drop(&mut self) {
+        let mut shared = self.handle.shared.lock().unwrap();
+        shared.volumes.clear();
+        shared.pushes.clear();
+    }
+}
+
 impl SmokeSimulation {
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
         let compute = wgpu::ShaderStages::COMPUTE;

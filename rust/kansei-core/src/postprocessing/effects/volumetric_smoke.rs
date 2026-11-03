@@ -63,38 +63,57 @@ pub(crate) struct SmokeFrameGpu {
     pub(crate) pushes: [SmokePushGpu; MAX_SMOKE_PUSHES],
 }
 
-/// A half-resolution target.
-fn target(device: &wgpu::Device, label: &str, (width, height): (u32, u32), format: wgpu::TextureFormat) -> wgpu::TextureView {
-    device
-        .create_texture(&wgpu::TextureDescriptor {
-            label: Some(label),
-            size: wgpu::Extent3d { width: width.max(1), height: height.max(1), depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
-            view_formats: &[],
-        })
-        .create_view(&Default::default())
+/// A half-resolution target and its view.
+struct Target {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+}
+
+fn target(device: &wgpu::Device, label: &str, (width, height): (u32, u32), format: wgpu::TextureFormat) -> Target {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d { width: width.max(1), height: height.max(1), depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&Default::default());
+    Target { texture, view }
 }
 
 /// The march's targets at one size.
 struct SmokeTargets {
     size: (u32, u32),
     /// (R, Ts), this frame's
-    light: wgpu::TextureView,
+    light: Target,
     /// (linear depth, previous uv, distance of the representative point), this frame's and the
     /// previous one's
-    aux: [wgpu::TextureView; 2],
+    aux: [Target; 2],
     /// the resolved (R, Ts), this frame's and the previous one's
-    history: [wgpu::TextureView; 2],
+    history: [Target; 2],
+}
+
+impl SmokeTargets {
+    fn textures(&self) -> impl Iterator<Item = &wgpu::Texture> {
+        [&self.light].into_iter().chain(&self.aux).chain(&self.history).map(|t| &t.texture)
+    }
 }
 
 /// What the composite reads of the smoke: its (R, Ts) and the aux with its depth.
 pub(crate) struct SmokeComposite {
     pub(crate) light: wgpu::TextureView,
     pub(crate) aux: wgpu::TextureView,
+}
+
+impl Drop for SmokeRenderer {
+    fn drop(&mut self) {
+        if let Some(targets) = self.targets.take() {
+            targets.textures().for_each(wgpu::Texture::destroy);
+        }
+    }
 }
 
 /// The camera and froxel grid the march needs from the fog's frame.
@@ -204,6 +223,12 @@ impl SmokeRenderer {
         }
     }
 
+    /// The march's targets' textures (tests).
+    #[cfg(test)]
+    pub(crate) fn target_textures(&self) -> Vec<wgpu::Texture> {
+        self.targets.iter().flat_map(|t| t.textures().cloned()).collect()
+    }
+
     /// Forget the history (camera cuts, a new handle).
     pub(crate) fn reset_history(&mut self) {
         self.prev_view_proj = None;
@@ -236,6 +261,10 @@ impl SmokeRenderer {
         };
         let size = (view.full_size.0.div_ceil(2), view.full_size.1.div_ceil(2));
         if self.targets.as_ref().is_none_or(|t| t.size != size) {
+            // wgpu's web backend frees nothing on drop: give the old targets back now (AGENTS.md)
+            if let Some(old) = self.targets.take() {
+                old.textures().for_each(wgpu::Texture::destroy);
+            }
             let aux = || target(device, "VolumetricFog/SmokeAux", size, wgpu::TextureFormat::Rgba32Float);
             let history = || target(device, "VolumetricFog/SmokeHistory", size, wgpu::TextureFormat::Rgba16Float);
             self.targets = Some(SmokeTargets {
@@ -304,8 +333,8 @@ impl SmokeRenderer {
             entries.push(wgpu::BindGroupEntry { binding: 38 + i as u32, resource: tex(grid(i, |v| v.velocity.as_ref())) });
         }
         entries.extend([
-            wgpu::BindGroupEntry { binding: 42, resource: tex(&targets.light) },
-            wgpu::BindGroupEntry { binding: 43, resource: tex(&targets.aux[current]) },
+            wgpu::BindGroupEntry { binding: 42, resource: tex(&targets.light.view) },
+            wgpu::BindGroupEntry { binding: 43, resource: tex(&targets.aux[current].view) },
         ]);
         let bg = cache.get(device, &wgpu::BindGroupDescriptor { label: Some("VolumetricFog/SmokeMarchBG"), layout: &self.march_bgl, entries: &entries });
         let stamp = crate::profiling::gpu_pass("VolumetricFog/SmokeMarch");
@@ -315,7 +344,7 @@ impl SmokeRenderer {
         pass.dispatch_workgroups(size.0.div_ceil(8), size.1.div_ceil(8), 1);
         drop(pass);
         if !options.temporal {
-            return Some(SmokeComposite { light: targets.light.clone(), aux: targets.aux[current].clone() });
+            return Some(SmokeComposite { light: targets.light.view.clone(), aux: targets.aux[current].view.clone() });
         }
         let temporal_bg = cache.get(
             device,
@@ -325,11 +354,11 @@ impl SmokeRenderer {
                 entries: &[
                     wgpu::BindGroupEntry { binding: 30, resource: self.frame_buffer.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 33, resource: wgpu::BindingResource::Sampler(sampler) },
-                    wgpu::BindGroupEntry { binding: 44, resource: tex(&targets.light) },
-                    wgpu::BindGroupEntry { binding: 45, resource: tex(&targets.aux[current]) },
-                    wgpu::BindGroupEntry { binding: 46, resource: tex(&targets.history[1 - current]) },
-                    wgpu::BindGroupEntry { binding: 47, resource: tex(&targets.aux[1 - current]) },
-                    wgpu::BindGroupEntry { binding: 48, resource: tex(&targets.history[current]) },
+                    wgpu::BindGroupEntry { binding: 44, resource: tex(&targets.light.view) },
+                    wgpu::BindGroupEntry { binding: 45, resource: tex(&targets.aux[current].view) },
+                    wgpu::BindGroupEntry { binding: 46, resource: tex(&targets.history[1 - current].view) },
+                    wgpu::BindGroupEntry { binding: 47, resource: tex(&targets.aux[1 - current].view) },
+                    wgpu::BindGroupEntry { binding: 48, resource: tex(&targets.history[current].view) },
                 ],
             },
         );
@@ -339,6 +368,6 @@ impl SmokeRenderer {
         pass.set_bind_group(0, &temporal_bg, &[]);
         pass.dispatch_workgroups(size.0.div_ceil(8), size.1.div_ceil(8), 1);
         drop(pass);
-        Some(SmokeComposite { light: targets.history[current].clone(), aux: targets.aux[current].clone() })
+        Some(SmokeComposite { light: targets.history[current].view.clone(), aux: targets.aux[current].view.clone() })
     }
 }

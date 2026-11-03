@@ -23,9 +23,13 @@ impl SmokeMouse {
     /// No mouse: no push anywhere.
     pub const NONE: SmokeMouse = SmokeMouse { origin: Vec3::ZERO, direction: Vec3 { x: 0.0, y: 0.0, z: -1.0 }, push: Vec3::ZERO, radius: 0.0 };
 
-    /// Whether it pushes the gas at all.
+    /// The slowest push that moves the gas, m/s: below it (a cursor easing to a stop) the mouse
+    /// leaves the gas alone.
+    pub const MIN_PUSH: f32 = 0.05;
+
+    /// Whether it pushes the gas at all (at least `MIN_PUSH`).
     pub fn is_active(&self) -> bool {
-        self.radius > 0.0 && (self.push.x != 0.0 || self.push.y != 0.0 || self.push.z != 0.0)
+        self.radius > 0.0 && self.push.length() >= Self::MIN_PUSH
     }
 
     /// The mouse from `MouseVectors`: `position` and `motion` are its `position` and `direction`

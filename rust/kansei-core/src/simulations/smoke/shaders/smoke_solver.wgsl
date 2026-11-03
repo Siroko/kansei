@@ -267,14 +267,18 @@ fn sourceVelocity(axis: u32, value: f32, p: vec3f) -> f32 {
     return v;
 }
 
-// The mouse on Fluid: round its ray, the gas is dragged toward the push's velocity (about 20 per
-// second), so a stir leaves a wake the solver carries on, and a push never adds more speed than
-// it has.
+// The mouse on Fluid: round its ray, the gas is dragged toward the push's velocity along the push
+// (about 20 per second), so a stir leaves a wake the solver carries on. Only along the push: the
+// gas's motion across it is left alone, and so is gas already moving the push's way at least as
+// fast, so a slow or sideways stir never holds the rising steam back, and a push never adds more
+// speed than it has.
 fn mouseDrag(axis: u32, value: f32, p: vec3f) -> f32 {
     if (st.mouseActive == 0u) { return value; }
+    let toward = smokeVecToBox(st.volume, st.mousePush)[axis];
+    if (abs(toward) < 1e-3 || value * sign(toward) >= abs(toward)) { return value; }
     let w = smokeMouseFalloff(cellsToWorld(p), st.mouseOrigin, st.mouseDirection, st.mouseRadius);
     if (w <= 0.0) { return value; }
-    return mix(value, smokeVecToBox(st.volume, st.mousePush)[axis], w * (1.0 - exp(-20.0 * st.dt)));
+    return mix(value, toward, w * (1.0 - exp(-20.0 * st.dt)));
 }
 
 @compute @workgroup_size(4, 4, 4)

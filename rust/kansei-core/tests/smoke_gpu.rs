@@ -536,3 +536,64 @@ fn curl_pushes_leave_a_trail() {
     eprintln!("centre of mass {com0} -> {com}");
     assert!(com.x - com0.x > 0.15, "moved {}", com.x - com0.x);
 }
+
+/// A cursor that has (nearly) stopped over the plume, or pushes across it, does not hold the
+/// rising steam back: the push only adds motion along itself.
+#[test]
+fn a_still_or_sideways_cursor_does_not_hold_the_steam_back() {
+    let Some((device, queue)) = gpu() else { return };
+    // the mean rise round the plume's axis, and the steam's own rise (weighted by its density)
+    // across the slab at the cursor's height
+    let run = |mouse: Option<SmokeMouse>| -> (f32, f32) {
+        let mut sim = SmokeSimulation::new(&device, &queue);
+        let v = default_plume();
+        let (dims, size) = (v.grid_dims(), v.size);
+        let id = sim.add(v);
+        for _ in 0..300 {
+            sim.step(1.0 / 60.0, &SmokeMouse::NONE);
+        }
+        for _ in 0..30 {
+            sim.step(1.0 / 60.0, mouse.as_ref().unwrap_or(&SmokeMouse::NONE));
+        }
+        let vel = read_rgba16(&device, &queue, sim.grid_textures(id).unwrap().velocity.unwrap(), dims);
+        let (cells, _) = read_scalars(&device, &queue, &sim, id);
+        // the v faces round the plume's axis where the cursor's ray crosses it (12 cm above the
+        // source): x = i + 1/2, y = j, z = k + 1/2 in cells, from the box's bottom centre
+        let [w, h, d] = dims;
+        let ray_y = 0.12 + 2.0 * size.y / h as f32;
+        let (mut axis, mut n, mut slab, mut m, mut weight) = (0.0f32, 0, 0.0f32, 0, 0.0f32);
+        for z in 0..d {
+            for y in 0..h {
+                for x in 0..w {
+                    let p = glam::Vec3::new((x as f32 + 0.5) / w as f32 * size.x - size.x * 0.5, y as f32 / h as f32 * size.y - ray_y, (z as f32 + 0.5) / d as f32 * size.z - size.z * 0.5);
+                    let i = ((z * h + y) * w + x) as usize;
+                    let v = vel[i][1];
+                    if p.y.abs() < 0.04 {
+                        slab += v * cells[i][0];
+                        m += 1;
+                        weight += cells[i][0];
+                        if p.x.abs() < 0.03 && p.z.abs() < 0.03 {
+                            axis += v;
+                            n += 1;
+                        }
+                    }
+                }
+            }
+        }
+        let _ = m;
+        (axis / n as f32, slab / weight.max(1e-6))
+    };
+    let v = default_plume();
+    let source = v.sources[0].position;
+    let ray = |speed: f32| SmokeMouse { origin: Vec3::new(source.x, source.y + 0.12, source.z + 1.0), direction: Vec3::new(0.0, 0.0, -1.0), push: Vec3::new(speed, 0.0, 0.0), radius: 0.08 };
+    let free = run(None);
+    let still = run(Some(ray(0.01)));
+    // a push across the plume carries the column off its axis, and a crossflow faster than the
+    // rise (0.3 against about 0.26 m/s) bends the plume over, taking some of its rise; a drag that
+    // also braked the rise kept about a seventh of it
+    let sideways = run(Some(ray(0.3)));
+    eprintln!("mean rise round the axis / across the slab: free {free:?}, a still cursor {still:?}, a sideways push {sideways:?}");
+    assert!(free.0 > 0.05, "the plume barely rises there: {free:?}");
+    assert!((still.0 - free.0).abs() < 0.01, "a still cursor changed the rise: {still:?} vs {free:?}");
+    assert!(sideways.1 > 0.3 * free.1, "a sideways push held the rise back: {sideways:?} vs {free:?}");
+}
