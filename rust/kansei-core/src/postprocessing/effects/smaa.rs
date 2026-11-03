@@ -43,6 +43,33 @@
 //! is no diagonal search (High has 8 diagonal steps). The three passes' reach is
 //! [`SmaaOptions::three_pass_reach`].
 //!
+//! # One pass
+//!
+//! [`SmaaMode::SinglePass`] (the default) runs SMAA's three passes in one compute dispatch
+//! (`smaa_single.wgsl`). A workgroup of 16 x 16 invocations serves a tile of 16 x 16 output
+//! pixels; the tile's blend reads the weights of a 17 x 17 block (the tile and the ring right of
+//! and below it).
+//!
+//! - **Early exit.** First it loads the luma of the block's 20 x 20 surroundings (each invocation
+//!   its own pixel, whose colour it keeps, then the ring) and finds the block's edges. A tile with
+//!   none (the sky, flat walls) stores its input and stops.
+//! - **Apron.** Otherwise it loads what the block's searches reach, in two arms: along the rows
+//!   for the runs of top edges (luma columns -18..34 by rows -4..18 of the tile, edges -16..33 by
+//!   -2..17) and down the columns for the runs of left edges (the transpose, only the ends the
+//!   first arm lacks). The arms' width is the reach: a search from the block walks at most
+//!   [`SmaaEffect::REACH`] pixels each way, and one more for its far end's crossing edges.
+//! - **Memory.** The luma as f32, the edge flags at two bits a pixel (packed with workgroup
+//!   atomics), the block's weights packed into 8 bits each (as the three passes' `rgba8unorm`
+//!   store them): about 9.3 KB of WebGPU's default 16 KB.
+//!
+//! The search, area, corner and blend code is `smaa_common.wgsl`'s, shared with the three passes,
+//! which read the same functions' pixels from textures; `tests/smaa_gpu.rs` checks the two give
+//! the same image, partial tiles and tiny frames included.
+//!
+//! The pipeline turns off wgpu's zeroing of workgroup memory (natively, naga's Metal backend does
+//! it from one invocation, which doubled the pass's time) and clears its edge flags itself;
+//! browsers zero it whatever the pipeline asks.
+//!
 //! # Where it differs from iryoku's reference
 //!
 //! - Compute passes, not fragment passes, and the weights pass skips pixels with no edge by an
@@ -366,7 +393,9 @@ impl SmaaEffect {
                 layout: Some(&layout),
                 module: &module,
                 entry_point: Some("main"),
-                compilation_options: Default::default(),
+                // the shader clears what it reads before writing (its edge flags); naga's Metal
+                // backend would zero all its workgroup memory from one invocation
+                compilation_options: wgpu::PipelineCompilationOptions { zero_initialize_workgroup_memory: false, ..Default::default() },
                 cache: None,
             });
             Pipeline { pipeline, bgl }

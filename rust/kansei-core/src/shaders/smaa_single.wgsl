@@ -177,27 +177,52 @@ fn main(
     let i = i32(li);
     let pixel = smaaOrigin + vec2i(lid.xy);
 
-    // Phase 1: the block's luma surroundings, then its edges
-    const LUMA_BLOCK = SMAA_LUMA_BLOCK_N * SMAA_LUMA_BLOCK_N;
-    for (var j = 0; j < (LUMA_BLOCK + SMAA_GROUP - 1) / SMAA_GROUP; j++) {
-        let k = i + j * SMAA_GROUP;
-        if (k < LUMA_BLOCK) {
-            smaaStoreLuma(vec2i(k % SMAA_LUMA_BLOCK_N, k / SMAA_LUMA_BLOCK_N) - vec2i(2));
+    // Nothing else is read before it is written, so only the edge flags and the tile's flag are
+    // cleared (smaa.rs turns off the backend's zeroing of the whole workgroup memory, which naga's
+    // Metal backend does from one invocation)
+    if (i < SMAA_ACROSS_N * SMAA_H_WORDS) {
+        atomicStore(&smaaEdgesH[i], 0u);
+    }
+    if (i < SMAA_ACROSS_N * SMAA_V_WORDS) {
+        atomicStore(&smaaEdgesV[i], 0u);
+    }
+    if (i == 0) {
+        smaaTileHasEdges = 0u;
+    }
+
+    // Phase 1: the block's luma surroundings (each invocation its own pixel, kept for a
+    // pass-through, then the 144 round the tile), then its edges (each its own pixel, then the
+    // 33 of the ring right of and below the tile)
+    let color = smaaColorAt(pixel);
+    smaaLumaH[smaaLumaIndexH(vec2i(lid.xy))] = smaaLumaOf(color);
+    const RING = SMAA_LUMA_BLOCK_N * SMAA_LUMA_BLOCK_N - SMAA_GROUP;
+    if (i < RING) {
+        // rows -2 and -1, rows 16 and 17, then columns -2, -1, 16 and 17 of rows 0 .. 15
+        var r : vec2i;
+        if (i < 2 * 2 * SMAA_LUMA_BLOCK_N) {
+            let row = i / SMAA_LUMA_BLOCK_N;
+            r = vec2i(i % SMAA_LUMA_BLOCK_N - 2, select(row - 2, row + SMAA_TILE - 2, row >= 2));
+        } else {
+            let n = i - 2 * 2 * SMAA_LUMA_BLOCK_N;
+            let c = n % 4;
+            r = vec2i(select(c - 2, c + SMAA_TILE - 2, c >= 2), n / 4);
         }
+        smaaStoreLuma(r);
     }
     workgroupBarrier();
-    const BLOCK = SMAA_BLOCK * SMAA_BLOCK;
-    for (var j = 0; j < (BLOCK + SMAA_GROUP - 1) / SMAA_GROUP; j++) {
-        let k = i + j * SMAA_GROUP;
-        if (k < BLOCK) {
-            if (smaaStoreEdges(vec2i(k % SMAA_BLOCK, k / SMAA_BLOCK))) {
-                smaaTileHasEdges = 1u;
-            }
+    if (smaaStoreEdges(vec2i(lid.xy))) {
+        smaaTileHasEdges = 1u;
+    }
+    if (i < 2 * SMAA_TILE + 1) {
+        // column 16 (rows 0 .. 16), then row 16 (columns 0 .. 15)
+        let r = select(vec2i(i - SMAA_BLOCK, SMAA_TILE), vec2i(SMAA_TILE, i), i < SMAA_BLOCK);
+        if (smaaStoreEdges(r)) {
+            smaaTileHasEdges = 1u;
         }
     }
     if (workgroupUniformLoad(&smaaTileHasEdges) == 0u) {
         if (smaaInFrame(pixel)) {
-            textureStore(smaaOutput, pixel, vec4f(smaaColorAt(pixel), 1.0));
+            textureStore(smaaOutput, pixel, vec4f(color, 1.0));
         }
         return;
     }
@@ -249,6 +274,7 @@ fn main(
     workgroupBarrier();
 
     // the block's weights
+    const BLOCK = SMAA_BLOCK * SMAA_BLOCK;
     for (var j = 0; j < (BLOCK + SMAA_GROUP - 1) / SMAA_GROUP; j++) {
         let k = i + j * SMAA_GROUP;
         if (k < BLOCK) {
