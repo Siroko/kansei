@@ -5,7 +5,8 @@
 //! axis swayed by two sines of height and time each way (`amplitude`, `wavelength`, `speed`;
 //! no sway at the rim, full sway a wavelength up), its density diluted as it widens, pulsing
 //! gently as it rises, and fading with the time the gas takes to rise at its source's speed
-//! (`dissipation` per second). Nothing outside the box.
+//! (`dissipation` per second). Nothing outside the box. A volume with no sources holds its
+//! layers fill (`SmokeFill::Layers`), rolling slowly.
 
 use super::volume::{SmokeVolume, SmokeVolumeGpu};
 use crate::math::Vec3;
@@ -16,6 +17,25 @@ pub(crate) const WAVES_DENSITY_PER_RATE: f32 = 0.3;
 fn smoothstep01(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
+}
+
+/// WGSL `smokeLayers`: `count` soft sheets over the unit cube's height, rolling and uneven.
+pub(crate) fn layers(local: glam::Vec3, count: u32, thickness: f32, phase: f32) -> f32 {
+    if count == 0 {
+        return 0.0;
+    }
+    let tau = std::f32::consts::TAU;
+    let spacing = 1.0 / count as f32;
+    let sigma = thickness.max(0.02) * spacing;
+    let mut d = 0.0;
+    for i in 0..count {
+        let fi = i as f32;
+        let centre = (fi + 0.5) * spacing + 0.15 * spacing * (tau * (0.6 * local.x + 0.35 * local.z) + fi * 2.1 + phase).sin();
+        let t = (local.y - centre) / sigma;
+        let uneven = 1.0 + 0.2 * (tau * (1.3 * local.z - 0.4 * local.x) + fi * 1.3 + 0.7 * phase).sin();
+        d += (-0.5 * t * t).exp() * uneven;
+    }
+    d
 }
 
 /// The Waves density of `volume` at a world point, at `time` (the CPU mirror of the march's).
@@ -33,6 +53,9 @@ pub(crate) fn waves_density_gpu(v: &SmokeVolumeGpu, p: glam::Vec3, time: f32) ->
         return 0.0;
     }
     let k = std::f32::consts::TAU / v.waves_wavelength;
+    if v.num_sources == 0 {
+        return v.layer_density * layers(local, v.layer_count, v.layer_thickness, 0.1 * v.waves_speed * time);
+    }
     let mut total = 0.0;
     for i in 0..v.num_sources as usize {
         let s = &v.sources[i];
@@ -131,6 +154,30 @@ mod tests {
         for x in [x0, x1] {
             assert!((x - src.x).abs() <= amplitude + radius + spread * 0.4, "{x} strays from {}", src.x);
         }
+    }
+
+    #[test]
+    fn waves_layers_lie_in_sheets() {
+        use crate::simulations::smoke::SmokeFill;
+        let mut v = SmokeVolume::new(Vec3::new(0.0, 1.5, 0.0), Vec3::new(6.0, 3.0, 5.0), SmokeMotion::waves());
+        v.fill = SmokeFill::Layers { count: 3, thickness: 0.25, density: 0.6 };
+        let n = 48u32;
+        let at = |x: u32, y: u32, z: u32| {
+            let local = Vec3::new((x as f32 + 0.5) / n as f32, (y as f32 + 0.5) / n as f32, (z as f32 + 0.5) / n as f32);
+            waves_density(&v, v.to_world(local), 0.0)
+        };
+        let profile: Vec<f32> = (0..n).map(|y| (0..n).flat_map(|z| (0..n).map(move |x| (x, z))).map(|(x, z)| at(x, y, z)).sum::<f32>() / (n * n) as f32).collect();
+        let max = profile.iter().cloned().fold(0.0f32, f32::max);
+        let peaks: Vec<usize> = (1..n as usize - 1).filter(|&y| profile[y] > profile[y - 1] && profile[y] >= profile[y + 1] && profile[y] > 0.1 * max).collect();
+        assert_eq!(peaks.len(), 3, "profile {profile:?}");
+        let mid = peaks[1];
+        let (mut lo, mut hi) = (mid, mid);
+        while lo > 0 && profile[lo - 1] < profile[lo] { lo -= 1; }
+        while hi + 1 < n as usize && profile[hi + 1] < profile[hi] { hi += 1; }
+        let along_x: Vec<f32> = (0..n).map(|x| (lo as u32..=hi as u32).flat_map(|y| (0..n).map(move |z| (y, z))).map(|(y, z)| at(x, y, z)).sum()).collect();
+        let mean = along_x.iter().sum::<f32>() / n as f32;
+        let cv = (along_x.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / n as f32).sqrt() / mean;
+        assert!(cv < 0.3, "cv {cv}");
     }
 
     /// The WGSL and the CPU agree.

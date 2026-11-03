@@ -375,3 +375,69 @@ fn curl_noise_carries_the_gas_up_and_keeps_it() {
     assert!((com.y - com0.y - 0.2).abs() < 0.06, "rose {}", com.y - com0.y);
     assert!((mass / mass0 - 1.0).abs() < 0.10, "mass {mass0} -> {mass}");
 }
+
+/// Sheets along y: the number of local maxima of the x-z mean density's profile over y, and the
+/// coefficient of variation along x of the middle sheet's band (summed over its rows and z).
+fn sheets(density: impl Fn(u32, u32, u32) -> f32, [w, h, d]: [u32; 3]) -> (usize, f32) {
+    let profile: Vec<f32> = (0..h).map(|y| (0..d).flat_map(|z| (0..w).map(move |x| (x, z))).map(|(x, z)| density(x, y, z)).sum::<f32>() / (w * d) as f32).collect();
+    let max = profile.iter().cloned().fold(0.0f32, f32::max);
+    let peaks: Vec<usize> = (1..h as usize - 1).filter(|&y| profile[y] > profile[y - 1] && profile[y] >= profile[y + 1] && profile[y] > 0.1 * max).collect();
+    if peaks.len() < 2 {
+        return (peaks.len(), f32::NAN);
+    }
+    // the middle peak's band: to the minima either side
+    let mid = peaks[peaks.len() / 2];
+    let (mut lo, mut hi) = (mid, mid);
+    while lo > 0 && profile[lo - 1] < profile[lo] { lo -= 1; }
+    while hi + 1 < h as usize && profile[hi + 1] < profile[hi] { hi += 1; }
+    let along_x: Vec<f32> = (0..w).map(|x| (lo as u32..=hi as u32).flat_map(|y| (0..d).map(move |z| (y, z))).map(|(y, z)| density(x, y, z)).sum()).collect();
+    let mean = along_x.iter().sum::<f32>() / w as f32;
+    let var = along_x.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / w as f32;
+    (peaks.len(), var.sqrt() / mean)
+}
+
+/// A room of hanging smoke: three sheets, no source.
+fn layers_room(motion: SmokeMotion) -> SmokeVolume {
+    let mut v = SmokeVolume::new(Vec3::new(0.0, 1.5, 0.0), Vec3::new(6.0, 3.0, 5.0), motion);
+    v.resolution = 64;
+    v.look.dissipation = 0.0;
+    v.fill = SmokeFill::Layers { count: 3, thickness: 0.25, density: 0.6 };
+    v
+}
+
+#[test]
+fn layers_fill_lies_in_horizontal_sheets() {
+    let Some((device, queue)) = gpu() else { return };
+    let mut sim = SmokeSimulation::new(&device, &queue);
+    let id = sim.add(layers_room(SmokeMotion::fluid()));
+    let (cells, dims) = read_scalars(&device, &queue, &sim, id);
+    let [w, h, _] = dims;
+    let (count, cv) = sheets(|x, y, z| cells[((z * h + y) * w + x) as usize][0], dims);
+    eprintln!("{count} sheets, the middle one's variation along x {cv}");
+    assert_eq!(count, 3);
+    assert!(cv < 0.3, "cv {cv}");
+}
+
+#[test]
+fn layers_drift_on_fluid_and_do_not_dissipate() {
+    let Some((device, queue)) = gpu() else { return };
+    let mut sim = SmokeSimulation::new(&device, &queue);
+    let motion = fluid(|s| {
+        (s.ambient_draft, s.draft_scale, s.weight, s.buoyancy) = (0.05, 1.5, 0.0, 0.0);
+    });
+    let v = layers_room(motion);
+    let size = v.size;
+    let id = sim.add(v);
+    let (before, dims) = read_scalars(&device, &queue, &sim, id);
+    let (mass0, _) = mass_and_com(&before, dims, size);
+    for _ in 0..300 {
+        sim.step(1.0 / 60.0, &SmokeMouse::NONE);
+    }
+    let (after, _) = read_scalars(&device, &queue, &sim, id);
+    let (mass, _) = mass_and_com(&after, dims, size);
+    let l1: f32 = before.iter().map(|c| c[0].abs()).sum();
+    let change: f32 = before.iter().zip(&after).map(|(a, b)| (a[0] - b[0]).abs()).sum();
+    eprintln!("mass {mass0} -> {mass}, L1 change {} of L1", change / l1);
+    assert!((mass / mass0 - 1.0).abs() < 0.05, "mass {mass0} -> {mass}");
+    assert!(change > 0.05 * l1, "the layers barely moved: {}", change / l1);
+}

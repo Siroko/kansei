@@ -236,9 +236,15 @@ fn faceForce(axis: u32, q: vec3i, p: vec3f) -> f32 {
     return f;
 }
 
-// Forces beyond the gas's own: the ambient draft and the mouse (smoke_solver's later stages).
+// Forces beyond the gas's own, at a world point, along the box's axes: the ambient draft (a
+// weak, slow curl-noise force: it stirs hanging smoke without piling it against a wall) and the
+// mouse (a later stage).
 fn smokeExtraForce(p: vec3f) -> vec3f {
-    return vec3f(0.0);
+    var f = vec3f(0.0);
+    if (st.ambientDraft != 0.0) {
+        f += st.ambientDraft * curlNoise(p / st.draftScale, st.time * 0.05);
+    }
+    return smokeVecToBox(st.volume, f);
 }
 
 // The sources' velocity blended in at a face (`axis`, at `p` in cells): each source's own, and a

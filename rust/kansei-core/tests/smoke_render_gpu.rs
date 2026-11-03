@@ -499,3 +499,61 @@ fn the_history_follows_the_gas() {
     eprintln!("the blob's centroid column: with history {got}, without {want}");
     assert!((got - want).abs() < 1.0, "the history lags: {got} vs {want}");
 }
+
+#[test]
+fn overlapping_volumes_march_as_one_medium() {
+    let Some((device, queue)) = gpu() else { return };
+    let s = scene(&device, &queue, (64, 32), |_, _| Some(12.0));
+    let render_boxes = |boxes: &[(Vec3, Vec3, f32)]| {
+        let mut sim = SmokeSimulation::new(&device, &queue);
+        for (c, size, d) in boxes {
+            sim.add(smoke_box(*c, *size, *d));
+        }
+        let mut f = fog(0.02, 1.0);
+        f.set_smoke(Some(&sim.handle()));
+        render(&device, &queue, &mut f, &s, 1)
+    };
+    // two coincident boxes against one of their summed density
+    let (c, size) = (Vec3::new(0.0, 1.0, -5.0), Vec3::new(8.0, 8.0, 3.0));
+    let two = render_boxes(&[(c, size, 0.25), (c, size, 0.25)]);
+    let one = render_boxes(&[(c, size, 0.5)]);
+    let (a, b) = (mean(&two, s.w, (32, 16), (8, 4)), mean(&one, s.w, (32, 16), (8, 4)));
+    eprintln!("coincident: two {a}, one {b}");
+    assert!((a / b - 1.0).abs() < 0.02, "two {a}, one {b}");
+    // two boxes touching at x = 0 against one spanning both: the middle row, column by column
+    let left = render_boxes(&[(Vec3::new(-2.0, 1.0, -5.0), Vec3::new(4.0, 8.0, 3.0), 0.5), (Vec3::new(2.0, 1.0, -5.0), Vec3::new(4.0, 8.0, 3.0), 0.5)]);
+    let whole = render_boxes(&[(Vec3::new(0.0, 1.0, -5.0), Vec3::new(8.0, 8.0, 3.0), 0.5)]);
+    let y = s.h / 2;
+    let worst = (0..s.w).map(|x| { let i = (y * s.w + x) as usize; (left[i][0] / whole[i][0] - 1.0).abs() }).fold(0.0f32, f32::max);
+    eprintln!("touching: worst column {worst}");
+    assert!(worst < 0.02, "a column differs by {worst}");
+}
+
+#[test]
+fn switching_levels_at_runtime_keeps_rendering() {
+    let Some((device, queue)) = gpu() else { return };
+    let s = scene(&device, &queue, (64, 32), |_, _| Some(6.0));
+    let mut sim = SmokeSimulation::new(&device, &queue);
+    let source = SmokeSource { position: Vec3::new(0.0, 0.5, -3.0), radius: 0.05, ..Default::default() };
+    let mut plume = SmokeVolume::rising_from(source, 0.8, SmokeMotion::fluid());
+    plume.resolution = 32;
+    let plume = sim.add(plume);
+    let mut layers = SmokeVolume::new(Vec3::new(0.0, 1.0, -3.0), Vec3::new(4.0, 2.0, 4.0), SmokeMotion::fluid());
+    (layers.resolution, layers.fill) = (24, SmokeFill::Layers { count: 3, thickness: 0.25, density: 0.6 });
+    let layers = sim.add(layers);
+    let mut f = fog(0.02, 1.0);
+    f.smoke_render.temporal = true;
+    f.set_smoke(Some(&sim.handle()));
+    let levels = [SmokeMotion::fluid(), SmokeMotion::waves(), SmokeMotion::curl_noise()];
+    for frame in 0..12 {
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        sim.set_motion(plume, levels[frame % 3]);
+        sim.set_motion(layers, levels[(frame + 1) % 3]);
+        sim.set_enabled(layers, frame % 2 == 0);
+        sim.step(1.0 / 60.0, &SmokeMouse::NONE);
+        let img = render(&device, &queue, &mut f, &s, 1);
+        let error = pollster::block_on(scope.pop());
+        assert!(error.is_none(), "frame {frame}: {error:?}");
+        assert!(img.iter().all(|c| c.iter().all(|v| v.is_finite())), "frame {frame}: a pixel is not finite");
+    }
+}

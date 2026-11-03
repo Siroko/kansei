@@ -144,6 +144,25 @@ fn smokeCurlVelocity(v: SmokeVolumeData, p: vec3f, time: f32) -> vec3f {
     return curlNoise(p / v.curlScale, time * v.curlSpeed) * v.curlStrength + vec3f(0.0, v.curlRise, 0.0);
 }
 
+// Hanging smoke (SmokeFill::Layers): `count` soft horizontal sheets spread evenly over the box's
+// height, each a Gaussian about `thickness` of the spacing between them, their heights gently
+// rolling in x and z and their density gently uneven; `phase` moves the rolls (Waves). At a
+// point of the unit cube; about 1 at a sheet's middle.
+fn smokeLayers(local: vec3f, count: u32, thickness: f32, phase: f32) -> f32 {
+    if (count == 0u) { return 0.0; }
+    let spacing = 1.0 / f32(count);
+    let sigma = max(thickness, 0.02) * spacing;
+    var d = 0.0;
+    for (var i = 0u; i < count; i++) {
+        let fi = f32(i);
+        let centre = (fi + 0.5) * spacing + 0.15 * spacing * sin(6.28318530718 * (0.6 * local.x + 0.35 * local.z) + fi * 2.1 + phase);
+        let t = (local.y - centre) / sigma;
+        let uneven = 1.0 + 0.2 * sin(6.28318530718 * (1.3 * local.z - 0.4 * local.x) + fi * 1.3 + 0.7 * phase);
+        d += exp(-0.5 * t * t) * uneven;
+    }
+    return d;
+}
+
 // The Waves level's density at a world point (simulations::smoke::waves, whose CPU mirror it
 // is): each source's column, Gaussian across, widening by `wavesSpread` a metre, its axis swayed
 // by sines of height and time, diluted as it widens, pulsing as it rises, fading with the time
@@ -154,6 +173,10 @@ fn smokeWavesDensity(v: SmokeVolumeData, p: vec3f, time: f32) -> f32 {
     let local = smokeToLocal(v, p);
     if (any(local < vec3f(0.0)) || any(local > vec3f(1.0))) { return 0.0; }
     let k = 6.28318530718 / v.wavesWavelength;
+    // a volume with no sources and a layers fill: its sheets, rolling slowly
+    if (v.numSources == 0u) {
+        return v.layerDensity * smokeLayers(local, v.layerCount, v.layerThickness, 0.1 * v.wavesSpeed * time);
+    }
     var total = 0.0;
     for (var i = 0u; i < v.numSources; i++) {
         let s = v.sources[i];

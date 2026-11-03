@@ -21,7 +21,7 @@ use kansei_core::pacing::FixedStep;
 use kansei_core::postprocessing::effects::{TemporalAAEffect, TemporalAAOptions, ToneMapEffect, ToneMapOptions, VolumetricFogEffect, VolumetricFogOptions};
 use kansei_core::postprocessing::{PostProcessingEffect, PostProcessingVolume};
 use kansei_core::renderers::{Renderer, RendererConfig};
-use kansei_core::simulations::smoke::{SmokeMotion, SmokeMouse, SmokeSimulation, SmokeSource, SmokeVolume, SmokeVolumeId};
+use kansei_core::simulations::smoke::{CurlSettings, FluidSmokeSettings, SmokeFill, SmokeMotion, SmokeMouse, SmokeSimulation, SmokeSource, SmokeVolume, SmokeVolumeId};
 use kansei_wasm::{flag, param, Canvas};
 
 /// The room's inside: x and z half extents, and its height (metres).
@@ -107,6 +107,52 @@ fn plume(motion: SmokeMotion) -> SmokeVolume {
     v
 }
 
+/// The hanging layers' look: thin haze, not steam.
+const LAYERS_DENSITY: f32 = 0.5;
+
+/// The motion levels in the panel's order.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Level {
+    Waves,
+    Curl,
+    Fluid,
+}
+
+impl Level {
+    /// The plume's motion at this level: the engine's defaults.
+    fn plume(self) -> SmokeMotion {
+        match self {
+            Level::Waves => SmokeMotion::waves(),
+            Level::Curl => SmokeMotion::curl_noise(),
+            Level::Fluid => SmokeMotion::fluid(),
+        }
+    }
+
+    /// The hanging layers' motion at this level: they don't rise or fall; on Fluid a weak,
+    /// large-scale ambient draft keeps them drifting (a slow curl-noise force, not a wind that
+    /// would pile them against a wall); on Curl noise, eddies a metre and a half across, which
+    /// the room's coarser grid resolves.
+    fn layers(self) -> SmokeMotion {
+        match self {
+            Level::Waves => SmokeMotion::waves(),
+            Level::Curl => SmokeMotion::CurlNoise(CurlSettings { strength: 0.05, scale: 1.5, speed: 0.05, rise: 0.0 }),
+            Level::Fluid => SmokeMotion::Fluid(FluidSmokeSettings { buoyancy: 0.0, weight: 0.0, vorticity: 0.5, ambient_draft: 0.05, draft_scale: 1.5, ..Default::default() }),
+        }
+    }
+}
+
+/// The room-sized volume of hanging smoke: three soft sheets, no source, no dissipation, at a
+/// coarser grid than the plume's (it overlaps the plume's box; the fog marches both as one).
+fn hanging_layers(resolution: u32, level: Level) -> SmokeVolume {
+    let [hx, h, hz] = ROOM;
+    let mut v = SmokeVolume::new(Vec3::new(0.0, h * 0.5, 0.0), Vec3::new(2.0 * hx, h, 2.0 * hz), level.layers());
+    v.resolution = resolution;
+    v.fill = SmokeFill::Layers { count: 3, thickness: 0.25, density: 0.6 };
+    v.look.density_scale = LAYERS_DENSITY;
+    v.look.dissipation = 0.0;
+    v
+}
+
 /// `stats=1`: frames and sim steps in the current window, and when it started.
 struct Stats {
     frames: u32,
@@ -123,6 +169,8 @@ struct State {
     smoke: SmokeSimulation,
     #[allow(dead_code)]
     plume: SmokeVolumeId,
+    #[allow(dead_code)]
+    layers: SmokeVolumeId,
     fixed: FixedStep,
     stats: Option<Stats>,
 }
@@ -224,12 +272,14 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     scene.add(SceneNode::Light(Light::Directional(sun)));
 
     let mut smoke = SmokeSimulation::new(renderer.device(), renderer.queue());
-    let motion = match param("motion").as_deref() {
-        Some("waves") => SmokeMotion::waves(),
-        Some("curl") => SmokeMotion::curl_noise(),
-        _ => SmokeMotion::fluid(),
+    let level = match param("motion").as_deref() {
+        Some("waves") => Level::Waves,
+        Some("curl") => Level::Curl,
+        _ => Level::Fluid,
     };
-    let plume = smoke.add(plume(motion));
+    let plume = smoke.add(plume(level.plume()));
+    let layers = smoke.add(hanging_layers((96 * 2 / 3u32).max(16), level));
+    smoke.set_enabled(layers, flag("layers", false));
     let stats = flag("stats", false).then(|| Stats { frames: 0, steps: 0, start: kansei_wasm::now() });
     renderer.set_profiling(stats.is_some());
 
@@ -263,7 +313,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
 
     log::info!("Kansei — Volumetric Smoke (WASM) ready, TAA {taa}");
     let fixed = FixedStep::new(1.0 / 60.0);
-    let state = Rc::new(RefCell::new(State { renderer, scene, camera, controls, volume, smoke, plume, fixed, stats }));
+    let state = Rc::new(RefCell::new(State { renderer, scene, camera, controls, volume, smoke, plume, layers, fixed, stats }));
     STATE.with(|s| *s.borrow_mut() = Some(state.clone()));
     kansei_wasm::run(&canvas, move |frame| {
         let mut st = state.borrow_mut();

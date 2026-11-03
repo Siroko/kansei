@@ -3,7 +3,7 @@
 
 struct SmokeFillParams {
     dims           : vec3u,
-    kind           : u32,     // 0 none, 1 box, 2 sphere
+    kind           : u32,     // 0 none, 1 box, 2 sphere, 3 layers
     size           : vec3f,   // the box's full extents, metres
     density        : f32,
     sphereCenter   : vec3f,   // along the box's axes from its centre, metres
@@ -33,6 +33,8 @@ fn fill(@builtin(global_invocation_id) gid : vec3u) {
         let band = max(0.25 * fp.radius, 2.0 * cell);
         let t = saturate((fp.radius - length(q - fp.sphereCenter)) / band);
         w = t * t * (3.0 - 2.0 * t);
+    } else if (fp.kind == 3u) {
+        w = smokeLayers(local, fp.layerCount, fp.layerThickness, 0.0);
     }
     textureStore(scalarsOut, gid, vec4f(fp.density * w, fp.temperature * w, 0.0, 0.0));
     textureStore(velocityOut, gid, vec4f(0.0));

@@ -421,7 +421,9 @@ impl SmokeSimulation {
                 params.sphere_center = [(l.x - 0.5) * size[0], (l.y - 0.5) * size[1], (l.z - 0.5) * size[2]];
                 (params.radius, params.density, params.temperature) = (radius, density, temperature);
             }
-            SmokeFill::Layers { .. } => {}
+            SmokeFill::Layers { count, thickness, density } => {
+                (params.kind, params.density, params.layer_count, params.layer_thickness) = (3, density, count, thickness);
+            }
         }
         self.queue.write_buffer(&self.fill.params, 0, bytemuck::bytes_of(&params));
         let velocity = grids.velocity().unwrap_or(&self.fill.no_velocity);
