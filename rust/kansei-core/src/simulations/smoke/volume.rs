@@ -128,7 +128,8 @@ pub struct SmokeLook {
     pub albedo: Vec3,
     /// Extinction = density * density_scale * extinction.
     pub extinction: f32,
-    /// Density lost per second (exponential rate); on Waves, per metre the plume rises.
+    /// Density lost per second (exponential rate); on Waves, per second the gas takes to rise
+    /// at its source's speed.
     pub dissipation: f32,
     /// The fraction of the box over which every face fades the density, so no outline shows.
     pub edge_fade: f32,

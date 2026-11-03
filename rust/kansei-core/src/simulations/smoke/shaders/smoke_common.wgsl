@@ -143,3 +143,35 @@ fn smokePhase(cosTheta: f32, g: f32, tau: f32) -> f32 {
 fn smokeCurlVelocity(v: SmokeVolumeData, p: vec3f, time: f32) -> vec3f {
     return curlNoise(p / v.curlScale, time * v.curlSpeed) * v.curlStrength + vec3f(0.0, v.curlRise, 0.0);
 }
+
+// The Waves level's density at a world point (simulations::smoke::waves, whose CPU mirror it
+// is): each source's column, Gaussian across, widening by `wavesSpread` a metre, its axis swayed
+// by sines of height and time, diluted as it widens, pulsing as it rises, fading with the time
+// the gas takes to rise at its source's speed; nothing outside the box.
+const SMOKE_WAVES_DENSITY_PER_RATE : f32 = 0.3;
+
+fn smokeWavesDensity(v: SmokeVolumeData, p: vec3f, time: f32) -> f32 {
+    let local = smokeToLocal(v, p);
+    if (any(local < vec3f(0.0)) || any(local > vec3f(1.0))) { return 0.0; }
+    let k = 6.28318530718 / v.wavesWavelength;
+    var total = 0.0;
+    for (var i = 0u; i < v.numSources; i++) {
+        let s = v.sources[i];
+        let h = p.y - s.position.y;
+        if (h < -s.radius) { continue; }
+        let st = saturate((h + s.radius) / s.radius);
+        let start = st * st * (3.0 - 2.0 * st);
+        let hp = max(h, 0.0);
+        let grow = saturate(hp / v.wavesWavelength);
+        let ph = k * hp - v.wavesSpeed * time + f32(i) * 1.7;
+        let sway = vec2f(sin(ph) + 0.5 * sin(1.7 * ph + 1.1), cos(0.8 * ph + 0.3) + 0.5 * cos(2.1 * ph + 2.3)) * (v.wavesAmplitude * grow / 1.5);
+        let radius = s.radius + v.wavesSpread * hp;
+        let q = length(p.xz - s.position.xz - sway) / radius;
+        let dilution = (s.radius / radius) * (s.radius / radius);
+        let rise = max(length(s.velocity), 0.05);
+        let fade = exp(-v.dissipation * hp / rise);
+        let pulse = 0.8 + 0.2 * sin(0.5 * k * hp - 1.3 * v.wavesSpeed * time + f32(i));
+        total += SMOKE_WAVES_DENSITY_PER_RATE * s.rate * dilution * fade * pulse * start * exp(-2.0 * q * q);
+    }
+    return total;
+}

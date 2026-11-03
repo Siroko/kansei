@@ -128,7 +128,9 @@ fn smokeDensityAt(i: u32, p: vec3f) -> f32 {
     let local = smokeToLocal(v, p);
     if (any(local < vec3f(0.0)) || any(local > vec3f(1.0))) { return 0.0; }
     var d = 0.0;
-    if (v.motion != SMOKE_WAVES) {
+    if (v.motion == SMOKE_WAVES) {
+        d = smokeWavesDensity(v, p, sf.time);
+    } else {
         d = max(smokeGridAt(i, local).r, 0.0);
     }
     return d * v.densityScale * smokeEdgeFade(v, local);

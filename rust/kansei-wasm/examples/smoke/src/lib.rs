@@ -224,7 +224,12 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     scene.add(SceneNode::Light(Light::Directional(sun)));
 
     let mut smoke = SmokeSimulation::new(renderer.device(), renderer.queue());
-    let plume = smoke.add(plume(SmokeMotion::fluid()));
+    let motion = match param("motion").as_deref() {
+        Some("waves") => SmokeMotion::waves(),
+        Some("curl") => SmokeMotion::curl_noise(),
+        _ => SmokeMotion::fluid(),
+    };
+    let plume = smoke.add(plume(motion));
     let stats = flag("stats", false).then(|| Stats { frames: 0, steps: 0, start: kansei_wasm::now() });
     renderer.set_profiling(stats.is_some());
 

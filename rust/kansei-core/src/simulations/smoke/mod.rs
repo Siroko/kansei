@@ -31,6 +31,7 @@ mod mouse;
 mod simulation;
 mod solver;
 mod volume;
+mod waves;
 
 pub use mouse::SmokeMouse;
 pub use simulation::{SmokeGridTextures, SmokeHandle, SmokeSimulation, SmokeVolumeId};
