@@ -31,7 +31,8 @@ pub struct Window {
 impl Window {
     /// The window of `mode` from its profile, over `elapsed_ms` and `frames`.
     pub fn from_profile(profile: &FrameProfile, mode: Aa, elapsed_ms: f64, frames: u32) -> Self {
-        let sum = |pick: &dyn Fn(&str) -> bool| profile.gpu.iter().filter(|p| pick(p.label)).map(|p| p.exclusive_ms).sum::<f64>();
+        // + 0.0: an empty sum is -0.0
+        let sum = |pick: &dyn Fn(&str) -> bool| profile.gpu.iter().filter(|p| pick(p.label)).map(|p| p.exclusive_ms).sum::<f64>() + 0.0;
         let aa = match mode {
             Aa::Taa => sum(&|l| l == "TAA/Resolve"),
             _ => sum(&|l| l.starts_with("SMAA")),
@@ -203,6 +204,9 @@ mod tests {
         assert!((w.aa_ms.unwrap() - 0.35).abs() < 1e-9 && w.velocity_ms == 0.4 && w.interval_ms == 8.0 && w.gpu_ms == 9.0);
         assert_eq!(Window::from_profile(&profile, Aa::Taa, 1.0, 1).aa_ms, Some(0.7));
         assert_eq!(Window::from_profile(&FrameProfile::default(), Aa::Smaa, 1.0, 1).aa_ms, None);
+        // no velocity pass (skipped): 0, printed as 0.000, not -0.000 (an empty f64 sum is -0.0)
+        let skipped = Window::from_profile(&FrameProfile { gpu_frames: 30, gpu: vec![pass("SMAA/Edges", 0.1)], ..Default::default() }, Aa::Smaa, 1.0, 1);
+        assert!(skipped.velocity_ms == 0.0 && skipped.velocity_ms.is_sign_positive(), "{}", skipped.velocity_ms);
     }
 
     #[test]
