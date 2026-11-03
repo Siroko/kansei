@@ -28,8 +28,11 @@ fn fill(@builtin(global_invocation_id) gid : vec3u) {
     if (fp.kind == 1u) {
         w = 1.0;
     } else if (fp.kind == 2u) {
-        // a ball, its edge soft over one cell
-        w = saturate((fp.radius - length(q - fp.sphereCenter)) / cell + 0.5);
+        // a ball, its density falling smoothly to 0 over the outer quarter of its radius (and at
+        // least two cells), so the advection's limiter has no step to clip
+        let band = max(0.25 * fp.radius, 2.0 * cell);
+        let t = saturate((fp.radius - length(q - fp.sphereCenter)) / band);
+        w = t * t * (3.0 - 2.0 * t);
     }
     textureStore(scalarsOut, gid, vec4f(fp.density * w, fp.temperature * w, 0.0, 0.0));
     textureStore(velocityOut, gid, vec4f(0.0));

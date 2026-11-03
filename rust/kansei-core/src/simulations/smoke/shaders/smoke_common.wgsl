@@ -58,7 +58,7 @@ struct SmokeStep {
     ambientDraft      : f32,
     draftScale        : f32,
     mouseActive       : u32,
-    _pad0             : f32,
+    pressureIterations: u32,    // 0: no projection
     _pad1             : f32,
     sourceTemperature : vec4f,  // each source's
     mouseOrigin       : vec3f,

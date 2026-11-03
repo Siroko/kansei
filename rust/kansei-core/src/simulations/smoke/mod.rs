@@ -29,6 +29,7 @@
 
 mod mouse;
 mod simulation;
+mod solver;
 mod volume;
 
 pub use mouse::SmokeMouse;
@@ -58,6 +59,7 @@ pub const CURL_NOISE_WGSL: &str = include_str!("shaders/curl_noise.wgsl");
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const SMOKE_COMMON_WGSL: &str = concat!(include_str!("shaders/curl_noise.wgsl"), include_str!("shaders/smoke_common.wgsl"));
 const FILL_WGSL: &str = concat!(include_str!("shaders/curl_noise.wgsl"), include_str!("shaders/smoke_common.wgsl"), include_str!("shaders/smoke_fill.wgsl"));
+const SOLVER_WGSL: &str = concat!(include_str!("shaders/curl_noise.wgsl"), include_str!("shaders/smoke_common.wgsl"), include_str!("shaders/smoke_solver.wgsl"));
 
 pub(crate) const MOTION_WAVES: u32 = 0;
 pub(crate) const MOTION_CURL: u32 = 1;
@@ -65,7 +67,7 @@ pub(crate) const MOTION_FLUID: u32 = 2;
 
 #[cfg(test)]
 pub(crate) fn shader_sources() -> Vec<(&'static str, &'static str)> {
-    vec![("smoke_common", SMOKE_COMMON_WGSL), ("smoke_fill", FILL_WGSL)]
+    vec![("smoke_common", SMOKE_COMMON_WGSL), ("smoke_fill", FILL_WGSL), ("smoke_solver", SOLVER_WGSL)]
 }
 
 #[cfg(test)]

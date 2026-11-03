@@ -163,7 +163,8 @@ pub enum SmokeFill {
     None,
     /// The whole box.
     Box { density: f32, temperature: f32 },
-    /// A ball, `center` in world space, `radius` in metres.
+    /// A ball, `center` in world space, `radius` in metres, its density falling smoothly to 0
+    /// over the outer quarter of the radius (at least two cells).
     Sphere { center: Vec3, radius: f32, density: f32, temperature: f32 },
     /// `count` soft horizontal sheets spread over the box's height, each about `thickness` of the
     /// height between them, gently uneven in x and z: smoke left hanging in a room.

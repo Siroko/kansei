@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use bytemuck::{Pod, Zeroable};
 
 use super::mouse::SmokeMouse;
+use super::solver::{Solver, VolumeStep};
 use super::volume::{SmokeFill, SmokeMotion, SmokeVolume, SmokeVolumeGpu};
 use super::{FILL_WGSL, MAX_SMOKE_VOLUMES};
 
@@ -28,7 +29,8 @@ pub(crate) struct SmokeStepGpu {
     pub(crate) ambient_draft: f32,
     pub(crate) draft_scale: f32,
     pub(crate) mouse_active: u32,
-    pub(crate) _pad0: [f32; 2],
+    pub(crate) pressure_iterations: u32,
+    pub(crate) _pad1: f32,
     pub(crate) source_temperature: [f32; 4],
     pub(crate) mouse_origin: [f32; 3],
     pub(crate) mouse_radius: f32,
@@ -94,7 +96,9 @@ pub(crate) struct FluidGrids {
     /// MAC velocities (x: u on the cell's -x face, y: v on -y, z: w on -z), ping-ponged.
     pub(crate) velocity: [Grid3; 2],
     pub(crate) current: usize,
+    /// Jacobi's two pressures; `pressure_current` holds the last solution (the next warm start).
     pub(crate) pressure: [Grid3; 2],
+    pub(crate) pressure_current: usize,
     pub(crate) divergence: Grid3,
     pub(crate) vorticity: Grid3,
 }
@@ -120,6 +124,7 @@ impl Grids {
                 velocity: [0, 1].map(|_| Grid3::new(device, "Smoke/Velocity", dims, vector)),
                 current: 0,
                 pressure: [0, 1].map(|_| Grid3::new(device, "Smoke/Pressure", dims, scalar)),
+                pressure_current: 0,
                 divergence: Grid3::new(device, "Smoke/Divergence", dims, scalar),
                 vorticity: Grid3::new(device, "Smoke/Vorticity", dims, vector),
             }),
@@ -147,6 +152,34 @@ impl Drop for Grids {
             }
         }
     }
+}
+
+/// A volume's `SmokeStep` for a step of `dt` at `time`.
+fn step_gpu(volume: &SmokeVolume, dims: [u32; 3], dt: f32, time: f32, mouse: &SmokeMouse) -> SmokeStepGpu {
+    let mut step = SmokeStepGpu { volume: volume.gpu(dims), dt, time, ..Zeroable::zeroed() };
+    if let SmokeMotion::Fluid(f) = volume.motion {
+        step.buoyancy = f.buoyancy;
+        step.weight = f.weight;
+        step.cooling = f.cooling.max(0.0);
+        step.vorticity = f.vorticity.max(0.0);
+        step.max_speed = f.max_speed.max(1e-3);
+        step.ambient_draft = f.ambient_draft;
+        step.draft_scale = f.draft_scale.max(1e-3);
+        step.pressure_iterations = f.pressure_iterations;
+    } else {
+        step.max_speed = 1e9;
+    }
+    for (t, s) in step.source_temperature.iter_mut().zip(&volume.sources) {
+        *t = s.temperature;
+    }
+    if mouse.is_active() {
+        step.mouse_active = 1;
+        step.mouse_origin = [mouse.origin.x, mouse.origin.y, mouse.origin.z];
+        step.mouse_direction = [mouse.direction.x, mouse.direction.y, mouse.direction.z];
+        step.mouse_radius = mouse.radius;
+        step.mouse_push = [mouse.push.x, mouse.push.y, mouse.push.z];
+    }
+    step
 }
 
 /// What the fog reads of a volume each frame.
@@ -209,8 +242,8 @@ pub struct SmokeSimulation {
     handle: SmokeHandle,
     fill: FillGpu,
     /// every volume's `SmokeStep` slot, written once a step
-    #[allow(dead_code)]
     step_buffer: wgpu::Buffer,
+    solver: Solver,
 }
 
 impl SmokeSimulation {
@@ -254,6 +287,7 @@ impl SmokeSimulation {
                 no_velocity: Grid3::new(device, "Smoke/NoVelocity", [1, 1, 1], wgpu::TextureFormat::Rgba16Float),
             },
             step_buffer: buffer("Smoke/Steps", STEP_SLOT * MAX_SMOKE_VOLUMES as u64),
+            solver: Solver::new(device),
         }
     }
 
@@ -313,12 +347,44 @@ impl SmokeSimulation {
 
     /// Advance the gas `dt` seconds with `mouse` pushing it. `dt <= 0` only refreshes what the
     /// fog reads (after editing a volume's box or look).
-    pub fn step(&mut self, dt: f32, _mouse: &SmokeMouse) {
+    pub fn step(&mut self, dt: f32, mouse: &SmokeMouse) {
         if dt > 0.0 {
             self.time += dt;
+            self.simulate(dt, mouse);
             self.handle.shared.lock().unwrap().advanced += dt;
         }
         self.refresh_handle();
+    }
+
+    /// One step of every enabled volume with a grid: their parameters in one write, their
+    /// passes in one submit.
+    fn simulate(&mut self, dt: f32, mouse: &SmokeMouse) {
+        let mut data = vec![0u8; STEP_SLOT as usize * MAX_SMOKE_VOLUMES];
+        let mut any = false;
+        for (i, slot) in self.slots.iter().enumerate() {
+            let Some(grids) = slot.grids.as_ref().filter(|_| slot.enabled) else { continue };
+            let step = step_gpu(&slot.volume, grids.dims, dt, self.time, mouse);
+            let o = i * STEP_SLOT as usize;
+            data[o..o + std::mem::size_of::<SmokeStepGpu>()].copy_from_slice(bytemuck::bytes_of(&step));
+            any = true;
+        }
+        if !any {
+            return;
+        }
+        self.queue.write_buffer(&self.step_buffer, 0, &data);
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("Smoke/Step") });
+        for (i, slot) in self.slots.iter_mut().enumerate() {
+            if !slot.enabled {
+                continue;
+            }
+            let Some(grids) = slot.grids.as_mut() else { continue };
+            let pressure_iterations = match slot.volume.motion {
+                SmokeMotion::Fluid(f) => f.pressure_iterations,
+                _ => 0,
+            };
+            self.solver.step(&self.device, &mut encoder, &self.step_buffer, grids, VolumeStep { slot: i, pressure_iterations });
+        }
+        self.queue.submit(std::iter::once(encoder.finish()));
     }
 
     /// The simulation's clock, seconds.

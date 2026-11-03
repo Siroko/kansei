@@ -76,3 +76,216 @@ fn a_sphere_fill_fills_its_cells() {
     let waves = sim.add(SmokeVolume::new(Vec3::ZERO, Vec3::new(1.0, 1.0, 1.0), SmokeMotion::waves()));
     assert!(sim.grid_textures(waves).is_none());
 }
+
+fn f32_to_f16(v: f32) -> u16 {
+    let bits = v.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let a = v.abs();
+    if a < 6.1e-5 {
+        // subnormal (or zero)
+        return sign | (a / 2f32.powi(-24)).round() as u16;
+    }
+    let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+    if exp >= 31 {
+        return sign | 0x7c00;
+    }
+    let mant = bits & 0x7f_ffff;
+    // round to nearest
+    let mut h = ((exp as u32) << 10) | (mant >> 13);
+    if mant & 0x1000 != 0 {
+        h += 1;
+    }
+    sign | h as u16
+}
+
+/// Write an rgba16float 3D texture from f32 texels (x fastest).
+fn write_rgba16(queue: &wgpu::Queue, texture: &wgpu::Texture, dims: [u32; 3], texels: &[[f32; 4]]) {
+    let [w, h, d] = dims;
+    let data: Vec<u16> = texels.iter().flat_map(|t| t.map(f32_to_f16)).collect();
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo { texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+        bytemuck::cast_slice(&data),
+        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 8), rows_per_image: Some(h) },
+        wgpu::Extent3d { width: w, height: h, depth_or_array_layers: d },
+    );
+}
+
+/// The MAC grid's divergence per cell, rms (walls: the +faces hold 0), cells `h` metres.
+fn rms_mac_div(vel: &[[f32; 4]], dims: [u32; 3], h: [f32; 3]) -> f32 {
+    let [w, hh, d] = dims;
+    let at = |x: u32, y: u32, z: u32| vel[((z * hh + y) * w + x) as usize];
+    let mut sum = 0.0f64;
+    for z in 0..d {
+        for y in 0..hh {
+            for x in 0..w {
+                let c = at(x, y, z);
+                let u1 = if x + 1 < w { at(x + 1, y, z)[0] } else { 0.0 };
+                let v1 = if y + 1 < hh { at(x, y + 1, z)[1] } else { 0.0 };
+                let w1 = if z + 1 < d { at(x, y, z + 1)[2] } else { 0.0 };
+                let div = (u1 - c[0]) / h[0] + (v1 - c[1]) / h[1] + (w1 - c[2]) / h[2];
+                sum += (div * div) as f64;
+            }
+        }
+    }
+    (sum / (w * hh * d) as f64).sqrt() as f32
+}
+
+/// Total density, and its centre of mass in the box's local metres from its minimum corner.
+fn mass_and_com(cells: &[[f32; 2]], dims: [u32; 3], size: Vec3) -> (f32, glam::Vec3) {
+    let [w, h, d] = dims;
+    let (mut mass, mut moment) = (0.0f64, glam::DVec3::ZERO);
+    for z in 0..d {
+        for y in 0..h {
+            for x in 0..w {
+                let m = cells[((z * h + y) * w + x) as usize][0] as f64;
+                let p = glam::DVec3::new((x as f64 + 0.5) / w as f64 * size.x as f64, (y as f64 + 0.5) / h as f64 * size.y as f64, (z as f64 + 0.5) / d as f64 * size.z as f64);
+                mass += m;
+                moment += p * m;
+            }
+        }
+    }
+    (mass as f32, (moment / mass.max(1e-12)).as_vec3())
+}
+
+fn fluid(f: impl FnOnce(&mut FluidSmokeSettings)) -> SmokeMotion {
+    let mut s = FluidSmokeSettings::default();
+    f(&mut s);
+    SmokeMotion::Fluid(s)
+}
+
+#[test]
+fn the_projection_leaves_no_divergence() {
+    let Some((device, queue)) = gpu() else { return };
+    let mut sim = SmokeSimulation::new(&device, &queue);
+    let motion = fluid(|s| {
+        (s.buoyancy, s.weight, s.vorticity, s.cooling, s.pressure_iterations) = (0.0, 0.0, 0.0, 0.0, 1000);
+    });
+    let mut v = SmokeVolume::new(Vec3::new(0.5, 0.5, 0.5), Vec3::new(1.0, 1.0, 1.0), motion);
+    v.resolution = 16;
+    v.look.dissipation = 0.0;
+    let id = sim.add(v);
+    let dims = [16u32; 3];
+    // v = (p - c) exp(-|p - c|^2 / 0.04) on the faces: x on the -x face, y on -y, z on -z
+    let field = |p: glam::Vec3| {
+        let q = p - glam::Vec3::splat(0.5);
+        q * (-q.length_squared() / 0.04).exp()
+    };
+    let n = 16.0;
+    let mut texels = Vec::new();
+    for z in 0..16 {
+        for y in 0..16 {
+            for x in 0..16 {
+                let (fx, fy, fz) = (x as f32, y as f32, z as f32);
+                texels.push([
+                    field(glam::Vec3::new(fx / n, (fy + 0.5) / n, (fz + 0.5) / n)).x,
+                    field(glam::Vec3::new((fx + 0.5) / n, fy / n, (fz + 0.5) / n)).y,
+                    field(glam::Vec3::new((fx + 0.5) / n, (fy + 0.5) / n, fz / n)).z,
+                    0.0,
+                ]);
+            }
+        }
+    }
+    write_rgba16(&queue, sim.grid_textures(id).unwrap().velocity.unwrap(), dims, &texels);
+    let before = rms_mac_div(&texels, dims, [1.0 / n; 3]);
+    sim.step(1.0 / 60.0, &SmokeMouse::NONE);
+    let grid = sim.grid_textures(id).unwrap();
+    let after = rms_mac_div(&read_rgba16(&device, &queue, grid.velocity.unwrap(), dims), dims, [1.0 / n; 3]);
+    eprintln!("rms divergence: before {before}, after {after}");
+    assert!(after < 0.02 * before, "before {before}, after {after}");
+}
+
+/// A hot ball of smoke 0.3 m above the floor of a 1 x 1.5 x 1 m box.
+fn hot_blob(dissipation: f32) -> SmokeVolume {
+    let mut v = SmokeVolume::new(Vec3::new(0.5, 0.75, 0.5), Vec3::new(1.0, 1.5, 1.0), SmokeMotion::fluid());
+    v.resolution = 48;
+    v.look.dissipation = dissipation;
+    v.fill = SmokeFill::Sphere { center: Vec3::new(0.5, 0.3, 0.5), radius: 0.15, density: 1.0, temperature: 1.0 };
+    v
+}
+
+#[test]
+fn a_hot_blob_rises() {
+    let Some((device, queue)) = gpu() else { return };
+    let mut sim = SmokeSimulation::new(&device, &queue);
+    let v = hot_blob(SmokeLook::default().dissipation);
+    let size = v.size;
+    let id = sim.add(v);
+    let (cells, dims) = read_scalars(&device, &queue, &sim, id);
+    let (_, com0) = mass_and_com(&cells, dims, size);
+    for _ in 0..90 {
+        sim.step(1.0 / 60.0, &SmokeMouse::NONE);
+    }
+    let (cells, _) = read_scalars(&device, &queue, &sim, id);
+    let (_, com) = mass_and_com(&cells, dims, size);
+    eprintln!("centre of mass {com0} -> {com}");
+    assert!(com.y - com0.y > 0.15, "rose {}", com.y - com0.y);
+    assert!((com.x - com0.x).abs() < 0.02 && (com.z - com0.z).abs() < 0.02, "drifted {com0} -> {com}");
+}
+
+#[test]
+fn the_gas_stays_finite_and_in_its_box() {
+    let Some((device, queue)) = gpu() else { return };
+    let mut sim = SmokeSimulation::new(&device, &queue);
+    let v = hot_blob(0.0);
+    let size = v.size;
+    let id = sim.add(v);
+    let (cells, dims) = read_scalars(&device, &queue, &sim, id);
+    let (mass0, _) = mass_and_com(&cells, dims, size);
+    let max0 = cells.iter().map(|c| c[0]).fold(0.0f32, f32::max);
+    for _ in 0..600 {
+        sim.step(1.0 / 60.0, &SmokeMouse::NONE);
+    }
+    let (cells, _) = read_scalars(&device, &queue, &sim, id);
+    let all_finite = cells.iter().all(|c| c[0].is_finite() && c[1].is_finite());
+    let min = cells.iter().map(|c| c[0]).fold(f32::MAX, f32::min);
+    let max = cells.iter().map(|c| c[0]).fold(0.0f32, f32::max);
+    let (mass, _) = mass_and_com(&cells, dims, size);
+    eprintln!("density {min}..{max} (was ..{max0}), mass {mass0} -> {mass}");
+    assert!(all_finite && min >= 0.0 && max <= max0 * 1.001, "density {min}..{max}, was ..{max0}");
+    assert!((mass / mass0 - 1.0).abs() < 0.10, "mass {mass0} -> {mass}");
+}
+
+#[test]
+fn the_default_plume_fades_before_the_lid() {
+    let Some((device, queue)) = gpu() else { return };
+    let mut sim = SmokeSimulation::new(&device, &queue);
+    let source = SmokeSource { position: Vec3::new(0.0, 0.0, 0.0), radius: 0.03, rate: 4.0, temperature: 1.0, velocity: Vec3::new(0.0, 0.15, 0.0) };
+    let v = SmokeVolume::rising_from(source, 0.8, SmokeMotion::fluid());
+    let dissipation = v.look.dissipation;
+    let id = sim.add(v);
+    for _ in 0..1200 {
+        sim.step(1.0 / 60.0, &SmokeMouse::NONE);
+    }
+    let (cells, dims) = read_scalars(&device, &queue, &sim, id);
+    let [w, h, d] = dims;
+    let at = |x: u32, y: u32, z: u32| cells[((z * h + y) * w + x) as usize];
+    // the top tenth of the rows, all of each
+    let top_rows = h / 10;
+    let mut top = 0.0;
+    for y in h - top_rows..h {
+        for z in 0..d {
+            for x in 0..w {
+                top += at(x, y, z)[0];
+            }
+        }
+    }
+    top /= (top_rows * w * d) as f32;
+    // the source's column (its radius), its lower third
+    let (cx, cz, r) = (w / 2, d / 2, (0.03 / (0.4 / w as f32)).ceil() as u32);
+    let (mut column, mut n) = (0.0, 0);
+    for y in 0..h / 3 {
+        for z in cz - r..cz + r {
+            for x in cx - r..cx + r {
+                column += at(x, y, z)[0];
+                n += 1;
+            }
+        }
+    }
+    column /= n as f32;
+    let max_density = cells.iter().map(|c| c[0]).fold(0.0f32, f32::max);
+    let max_temperature = cells.iter().map(|c| c[1]).fold(0.0f32, f32::max);
+    eprintln!("top rows {top}, source column {column}, max density {max_density}, max temperature {max_temperature}");
+    assert!(top < 0.1 * column, "top rows {top}, source column {column}");
+    assert!(max_density <= 1.05 * 4.0 / dissipation && max_temperature <= 1.001, "max density {max_density}, max temperature {max_temperature}");
+}
+
