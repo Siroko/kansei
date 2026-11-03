@@ -1,0 +1,216 @@
+// Smoke volumes (simulations::smoke), shared by the fill, the solver and the fog's march: a
+// volume's data as the GPU reads it, its box maths and its edge fade. Needs curl_noise.wgsl.
+//
+// A volume is a box in world space, yawed about +Y as LocalFogVolume is. Its grids span the
+// box: local coordinates [0, 1]^3, cell (i, j, k) centred at (i + 0.5, j + 0.5, k + 0.5) / dims.
+
+const SMOKE_MAX_VOLUMES : u32 = 4u;
+const SMOKE_MAX_SOURCES : u32 = 4u;
+const SMOKE_WAVES : u32 = 0u;
+const SMOKE_CURL  : u32 = 1u;
+const SMOKE_FLUID : u32 = 2u;
+
+struct SmokeSourceData {
+    position : vec3f,
+    radius   : f32,
+    velocity : vec3f,
+    rate     : f32,     // density per second at the centre
+}
+
+struct SmokeVolumeData {
+    center          : vec3f,
+    cosYaw          : f32,
+    size            : vec3f,    // full extents, metres
+    sinYaw          : f32,
+    dims            : vec3u,    // the grid's cells (Waves: the step length's)
+    motion          : u32,      // SMOKE_WAVES, SMOKE_CURL or SMOKE_FLUID
+    albedo          : vec3f,
+    densityScale    : f32,
+    extinction      : f32,
+    dissipation     : f32,
+    edgeFade        : f32,      // fraction of the box
+    numSources      : u32,
+    wavesAmplitude  : f32,
+    wavesWavelength : f32,
+    wavesSpeed      : f32,
+    wavesSpread     : f32,
+    wavesRelaxTime  : f32,
+    curlStrength    : f32,
+    curlScale       : f32,
+    curlSpeed       : f32,
+    curlRise        : f32,
+    layerCount      : u32,      // SmokeFill::Layers (0: none)
+    layerThickness  : f32,
+    layerDensity    : f32,
+    sources         : array<SmokeSourceData, 4>,
+}
+
+// One volume's step (SmokeSimulation::step), a slot of its own in one buffer.
+struct SmokeStep {
+    volume            : SmokeVolumeData,
+    dt                : f32,
+    time              : f32,
+    buoyancy          : f32,
+    weight            : f32,
+    cooling           : f32,
+    vorticity         : f32,
+    maxSpeed          : f32,
+    ambientDraft      : f32,
+    draftScale        : f32,
+    mouseActive       : u32,
+    pressureIterations: u32,    // 0: no projection
+    _pad1             : f32,
+    sourceTemperature : vec4f,  // each source's
+    mouseOrigin       : vec3f,
+    mouseRadius       : f32,
+    mouseDirection    : vec3f,
+    _pad2             : f32,
+    mousePush         : vec3f,  // m/s
+    _pad3             : f32,
+}
+
+// World vector into the box's axes (metres, not scaled).
+fn smokeVecToBox(v: SmokeVolumeData, d: vec3f) -> vec3f {
+    return vec3f(v.cosYaw * d.x - v.sinYaw * d.z, d.y, v.sinYaw * d.x + v.cosYaw * d.z);
+}
+
+// A vector along the box's axes into world space.
+fn smokeBoxToWorld(v: SmokeVolumeData, q: vec3f) -> vec3f {
+    return vec3f(v.cosYaw * q.x + v.sinYaw * q.z, q.y, -v.sinYaw * q.x + v.cosYaw * q.z);
+}
+
+// A world point in the box's unit cube.
+fn smokeToLocal(v: SmokeVolumeData, p: vec3f) -> vec3f {
+    return smokeVecToBox(v, p - v.center) / v.size + 0.5;
+}
+
+// A point of the unit cube in world space.
+fn smokeLocalToWorld(v: SmokeVolumeData, local: vec3f) -> vec3f {
+    return v.center + smokeBoxToWorld(v, (local - 0.5) * v.size);
+}
+
+// The part [t0, t1] of the ray o + t d inside the box, t0 >= 0; empty when x >= y.
+fn smokeRayInterval(v: SmokeVolumeData, o: vec3f, d: vec3f) -> vec2f {
+    let q = smokeVecToBox(v, o - v.center);
+    let r = smokeVecToBox(v, d);
+    let half = v.size * 0.5;
+    let inv = 1.0 / select(r, vec3f(1e-12), abs(r) < vec3f(1e-12));
+    let a = (-half - q) * inv;
+    let b = (half - q) * inv;
+    let lo = min(a, b);
+    let hi = max(a, b);
+    return vec2f(max(max(lo.x, max(lo.y, lo.z)), 0.0), min(hi.x, min(hi.y, hi.z)));
+}
+
+// 1 inside the box, fading to 0 over the outer `edgeFade` of it at every face.
+fn smokeEdgeFade(v: SmokeVolumeData, local: vec3f) -> f32 {
+    let e = min(local, 1.0 - local);
+    let m = min(e.x, min(e.y, e.z));
+    if (v.edgeFade <= 0.0) { return select(0.0, 1.0, m >= 0.0); }
+    let t = saturate(m / v.edgeFade);
+    return t * t * (3.0 - 2.0 * t);
+}
+
+// The edge of a cell along the box's longest side, metres.
+fn smokeCellSize(v: SmokeVolumeData) -> f32 {
+    return max(v.size.x, max(v.size.y, v.size.z)) / f32(max(v.dims.x, max(v.dims.y, v.dims.z)));
+}
+
+// Henyey-Greenstein, as the fog's henyeyGreenstein (volumetric_fog_inject.wgsl).
+fn smokeHG(cosTheta: f32, g: f32) -> f32 {
+    let g2 = g * g;
+    return (1.0 - g2) * 0.0795774715 / pow(1.0 + g2 - 2.0 * g * cosTheta, 1.5);
+}
+
+// The light a sample of smoke scatters toward the camera per unit of a light's radiance, with
+// `tau` the smoke's optical depth toward the light: single scattering through the smoke's own
+// shadow, plus two of Wrenninge's multiple-scattering octaves (each half the extinction and half
+// the anisotropy, at half the weight), counted only for what single scattering lost to the
+// shadow. With tau = 0 it is the fog's phase, so thin smoke scatters as the fog does.
+fn smokePhase(cosTheta: f32, g: f32, tau: f32) -> f32 {
+    let single = exp(-tau);
+    var p = smokeHG(cosTheta, g) * single;
+    var a = 1.0;
+    for (var o = 0; o < 2; o++) {
+        a *= 0.5;
+        p += a * smokeHG(cosTheta, a * g) * (exp(-a * tau) - single);
+    }
+    return p;
+}
+
+// The Curl noise level's velocity at a world point, m/s: curl noise of the volume's scale and
+// speed, times its strength, and its rise (divergence-free, so the gas neither piles up nor thins).
+fn smokeCurlVelocity(v: SmokeVolumeData, p: vec3f, time: f32) -> vec3f {
+    return curlNoise(p / v.curlScale, time * v.curlSpeed) * v.curlStrength + vec3f(0.0, v.curlRise, 0.0);
+}
+
+// Hanging smoke (SmokeFill::Layers): `count` soft horizontal sheets spread evenly over the box's
+// height, each a Gaussian about `thickness` of the spacing between them, their heights gently
+// rolling in x and z and their density gently uneven; `phase` moves the rolls (Waves). At a
+// point of the unit cube; about 1 at a sheet's middle.
+fn smokeLayers(local: vec3f, count: u32, thickness: f32, phase: f32) -> f32 {
+    if (count == 0u) { return 0.0; }
+    let spacing = 1.0 / f32(count);
+    let sigma = max(thickness, 0.02) * spacing;
+    var d = 0.0;
+    for (var i = 0u; i < count; i++) {
+        let fi = f32(i);
+        let centre = (fi + 0.5) * spacing + 0.15 * spacing * sin(6.28318530718 * (0.6 * local.x + 0.35 * local.z) + fi * 2.1 + phase);
+        let t = (local.y - centre) / sigma;
+        let uneven = 1.0 + 0.2 * sin(6.28318530718 * (1.3 * local.z - 0.4 * local.x) + fi * 1.3 + 0.7 * phase);
+        d += exp(-0.5 * t * t) * uneven;
+    }
+    return d;
+}
+
+// The Waves level's density at a world point (simulations::smoke::waves, whose CPU mirror it
+// is): each source's column, Gaussian across, widening by `wavesSpread` a metre, its axis swayed
+// by sines of height and time, diluted as it widens, pulsing as it rises, fading with the time
+// the gas takes to rise at its source's speed; nothing outside the box.
+const SMOKE_WAVES_DENSITY_PER_RATE : f32 = 0.5;
+// The column ends where its Gaussian falls under a thousandth of its middle: sqrt(ln(1000) / 2)
+// of its radius from its axis.
+const SMOKE_WAVES_REACH : f32 = 1.8585;
+const SMOKE_WAVES_FLOOR : f32 = 0.001;
+
+fn smokeWavesDensity(v: SmokeVolumeData, p: vec3f, time: f32) -> f32 {
+    let local = smokeToLocal(v, p);
+    if (any(local < vec3f(0.0)) || any(local > vec3f(1.0))) { return 0.0; }
+    let k = 6.28318530718 / v.wavesWavelength;
+    // a volume with no sources and a layers fill: its sheets, rolling slowly
+    if (v.numSources == 0u) {
+        return v.layerDensity * smokeLayers(local, v.layerCount, v.layerThickness, 0.1 * v.wavesSpeed * time);
+    }
+    var total = 0.0;
+    for (var i = 0u; i < v.numSources; i++) {
+        let s = v.sources[i];
+        let h = p.y - s.position.y;
+        if (h < -s.radius) { continue; }
+        let st = saturate((h + s.radius) / s.radius);
+        let start = st * st * (3.0 - 2.0 * st);
+        let hp = max(h, 0.0);
+        let radius = s.radius + v.wavesSpread * hp;
+        // past the column's reach and its sway (at most the amplitude): nothing to compute
+        if (length(p.xz - s.position.xz) > v.wavesAmplitude + SMOKE_WAVES_REACH * radius) { continue; }
+        let grow = saturate(hp / v.wavesWavelength);
+        let ph = k * hp - v.wavesSpeed * time + f32(i) * 1.7;
+        let sway = vec2f(sin(ph) + 0.5 * sin(1.7 * ph + 1.1), cos(0.8 * ph + 0.3) + 0.5 * cos(2.1 * ph + 2.3)) * (v.wavesAmplitude * grow / 1.5);
+        let q = length(p.xz - s.position.xz - sway) / radius;
+        let across = max(exp(-2.0 * q * q) - SMOKE_WAVES_FLOOR, 0.0) / (1.0 - SMOKE_WAVES_FLOOR);
+        if (across <= 0.0) { continue; }
+        let dilution = s.radius / radius;
+        let rise = max(length(s.velocity), 0.05);
+        let fade = exp(-v.dissipation * hp / rise);
+        let pulse = 0.8 + 0.2 * sin(0.5 * k * hp - 1.3 * v.wavesSpeed * time + f32(i));
+        total += SMOKE_WAVES_DENSITY_PER_RATE * s.rate * dilution * fade * pulse * start * across;
+    }
+    return total;
+}
+
+// How much of the mouse's push reaches a world point: 1 on its ray, 0 at `radius` from it.
+fn smokeMouseFalloff(p: vec3f, origin: vec3f, direction: vec3f, radius: f32) -> f32 {
+    let d = length(cross(p - origin, direction));
+    let r = saturate(d / max(radius, 1e-6));
+    let f = 1.0 - r * r;
+    return f * f;
+}

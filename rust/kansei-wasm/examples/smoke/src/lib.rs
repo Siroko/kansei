@@ -1,0 +1,451 @@
+//! Volumetric smoke through the volumetric fog: a dark room with one window, a low sun through
+//! it in a shaft that faint fog makes visible, a table in the shaft and steam rising off a cup on
+//! it. The steam is a `SmokeSimulation` volume (Waves, Curl noise or Fluid) marched and lit by
+//! the `VolumetricFogEffect` (`set_smoke`), so the window frame's shadow cuts through it as it
+//! does through the fog; hovering stirs it. With `?layers=1` smoke hangs in the room in sheets
+//! (a second, room-sized volume the plume rises into). See README.md for the URL parameters.
+
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use wasm_bindgen::prelude::*;
+
+use kansei_core::cameras::Camera;
+use kansei_core::controls::{CameraControls, MouseVectors};
+use kansei_core::froxels::FroxelGridOptions;
+use kansei_core::geometries::{BoxGeometry, CylinderGeometry, PlaneGeometry};
+use kansei_core::lights::{DirectionalLight, Light};
+use kansei_core::materials::{Material, StandardLitOptions};
+use kansei_core::math::{Vec3, Vec4};
+use kansei_core::objects::{Renderable, Scene, SceneNode};
+use kansei_core::pacing::FixedStep;
+use kansei_core::postprocessing::effects::{TemporalAAEffect, TemporalAAOptions, ToneMapEffect, ToneMapOptions, VolumetricFogEffect, VolumetricFogOptions};
+use kansei_core::postprocessing::{PostProcessingEffect, PostProcessingVolume};
+use kansei_core::renderers::{Renderer, RendererConfig};
+use kansei_core::simulations::smoke::{
+    CurlSettings, FluidSmokeSettings, SmokeFill, SmokeMotion, SmokeMouse, SmokeSimulation, SmokeSource, SmokeVolume, SmokeVolumeId, MAX_SMOKE_RESOLUTION,
+    MIN_SMOKE_RESOLUTION,
+};
+use kansei_wasm::{flag, param, param_or, Canvas};
+
+/// The room's inside: x and z half extents, and its height (metres).
+const ROOM: [f32; 3] = [3.0, 3.0, 2.5];
+/// The window in the +x wall: z half width, and its sill and head heights.
+const WINDOW: [f32; 3] = [0.6, 1.0, 2.2];
+/// The table's top centre and the cup on it.
+const TABLE: [f32; 3] = [1.2, 0.75, 0.0];
+const CUP_HEIGHT: f32 = 0.09;
+const CUP_RADIUS: f32 = 0.045;
+/// The low sun: the direction it travels (in through the window, from +x), and its radiance.
+const SUN_DIR: [f32; 3] = [-0.88, -0.31, 0.12];
+const SUN: f32 = 10.0;
+/// The fog's default density (per metre) and anisotropy: enough to show the shaft from the side.
+const FOG_DENSITY: f32 = 0.05;
+const FOG_ANISOTROPY: f32 = 0.35;
+/// The bright day seen through the window (radiance).
+const DAYLIGHT: [f32; 3] = [2.6, 2.8, 3.2];
+
+/// The steam: its source (the cup's rim, a gentle lift), and how densely it reads.
+const STEAM_RATE: f32 = 6.0;
+const STEAM_DENSITY: f32 = 20.0;
+/// The hanging layers' look: thin haze, not steam.
+const LAYERS_DENSITY: f32 = 0.5;
+/// The mouse's stir: its push per unit of the cursor's speed, and its reach round the ray (m).
+const MOUSE_STRENGTH: f32 = 1.0;
+const MOUSE_RADIUS: f32 = 0.08;
+/// The plume's grid (cells along its height) by default; the layers take two thirds.
+const RESOLUTION: u32 = 96;
+
+fn surface(label: &str, base: [f32; 3], velocity: bool) -> Material {
+    Material::standard_lit(label, &StandardLitOptions {
+        base_color: base,
+        roughness: 0.85,
+        sky_up: [0.02, 0.022, 0.026],
+        sky_down: [0.01, 0.009, 0.008],
+        outputs_velocity: velocity,
+        ..Default::default()
+    })
+}
+
+/// A box of `size` centred at `at`.
+fn slab(scene: &mut Scene, label: &str, size: [f32; 3], at: [f32; 3], base: [f32; 3], velocity: bool) {
+    let mut r = Renderable::new(BoxGeometry::new(size[0], size[1], size[2]), surface(label, base, velocity));
+    r.object.set_position(at[0], at[1], at[2]);
+    scene.add(SceneNode::Renderable(r));
+}
+
+/// The room, its window with a cross-shaped frame and the day behind it, the table and the cup.
+fn build_room(scene: &mut Scene, velocity: bool) {
+    let [hx, h, hz] = ROOM;
+    let t = 0.1;
+    let wall = [0.16, 0.15, 0.14];
+    slab(scene, "Floor", [2.0 * hx + 2.0 * t, t, 2.0 * hz + 2.0 * t], [0.0, -t * 0.5, 0.0], [0.22, 0.16, 0.11], velocity);
+    slab(scene, "Ceiling", [2.0 * hx + 2.0 * t, t, 2.0 * hz + 2.0 * t], [0.0, h + t * 0.5, 0.0], wall, velocity);
+    slab(scene, "WallBack", [t, h + 2.0 * t, 2.0 * hz + 2.0 * t], [-hx - t * 0.5, h * 0.5, 0.0], wall, velocity);
+    for z in [-1.0f32, 1.0] {
+        slab(scene, "WallSide", [2.0 * hx + 2.0 * t, h + 2.0 * t, t], [0.0, h * 0.5, z * (hz + t * 0.5)], wall, velocity);
+    }
+    // the window wall, round its opening
+    let [wz, sill, head] = WINDOW;
+    let x = hx + t * 0.5;
+    slab(scene, "WallWindowBelow", [t, sill + t, 2.0 * hz + 2.0 * t], [x, (sill - t) * 0.5, 0.0], wall, velocity);
+    slab(scene, "WallWindowAbove", [t, h - head + t, 2.0 * hz + 2.0 * t], [x, (head + h + t) * 0.5, 0.0], wall, velocity);
+    for z in [-1.0f32, 1.0] {
+        let width = hz + t - wz;
+        slab(scene, "WallWindowSide", [t, head - sill, width], [x, (sill + head) * 0.5, z * (wz + width * 0.5)], wall, velocity);
+    }
+    // the frame: a cross
+    let frame = [0.05, 0.045, 0.04];
+    slab(scene, "FrameVertical", [0.06, head - sill, 0.05], [x, (sill + head) * 0.5, 0.0], frame, velocity);
+    slab(scene, "FrameHorizontal", [0.06, 0.05, 2.0 * wz], [x, (sill + head) * 0.5, 0.0], frame, velocity);
+    // the bright day outside, behind the panes: it casts no shadow (the sun comes through it)
+    let mut day = Renderable::new(PlaneGeometry::new(12.0, 8.0), Material::emissive("Daylight", DAYLIGHT));
+    day.object.set_position(hx + 4.0, h * 0.5, 0.0);
+    day.object.rotation.y = -std::f32::consts::FRAC_PI_2;
+    day.cast_shadow = false;
+    scene.add(SceneNode::Renderable(day));
+    // the table and the cup
+    let [tx, ty, tz] = TABLE;
+    let wood = [0.3, 0.18, 0.1];
+    slab(scene, "TableTop", [1.2, 0.05, 0.8], [tx, ty - 0.025, tz], wood, velocity);
+    for (dx, dz) in [(-0.55f32, -0.35f32), (0.55, -0.35), (-0.55, 0.35), (0.55, 0.35)] {
+        slab(scene, "TableLeg", [0.05, ty - 0.05, 0.05], [tx + dx, (ty - 0.05) * 0.5, tz + dz], wood, velocity);
+    }
+    let mut cup = Renderable::new(CylinderGeometry::new(0.038, CUP_RADIUS, CUP_HEIGHT, 32, 1), surface("Cup", [0.75, 0.73, 0.7], velocity));
+    cup.object.set_position(tx, ty, tz);
+    scene.add(SceneNode::Renderable(cup));
+}
+
+/// Where the steam leaves the cup.
+fn cup_top() -> Vec3 {
+    Vec3::new(TABLE[0], TABLE[1] + CUP_HEIGHT, TABLE[2])
+}
+
+/// The steam's source: the cup's rim, a gentle lift.
+fn steam_source() -> SmokeSource {
+    SmokeSource { position: cup_top(), radius: 0.8 * CUP_RADIUS, rate: STEAM_RATE, temperature: 1.0, velocity: Vec3::new(0.0, 0.1, 0.0) }
+}
+
+/// The motion levels in the panel's order (`motion` 0, 1, 2).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Level {
+    Waves,
+    Curl,
+    Fluid,
+}
+
+impl Level {
+    fn from_index(i: u32) -> Self {
+        match i {
+            0 => Level::Waves,
+            1 => Level::Curl,
+            _ => Level::Fluid,
+        }
+    }
+
+    fn index(self) -> u32 {
+        self as u32
+    }
+
+    /// The plume's motion at this level: hot steam lifting off a drink (gentler than the
+    /// engine's Fluid defaults, so it stays dense near the rim).
+    fn plume(self) -> SmokeMotion {
+        match self {
+            Level::Waves => SmokeMotion::waves(),
+            Level::Curl => SmokeMotion::curl_noise(),
+            Level::Fluid => SmokeMotion::Fluid(FluidSmokeSettings { buoyancy: 1.0, ..Default::default() }),
+        }
+    }
+
+    /// The hanging layers' motion at this level: they don't rise or fall; on Fluid a weak,
+    /// large-scale ambient draft keeps them drifting (a slow curl-noise force, not a wind that
+    /// would pile them against a wall); on Curl noise, eddies a metre and a half across, which
+    /// the room's coarser grid resolves.
+    fn layers(self) -> SmokeMotion {
+        match self {
+            Level::Waves => SmokeMotion::waves(),
+            Level::Curl => SmokeMotion::CurlNoise(CurlSettings { strength: 0.05, scale: 1.5, speed: 0.05, rise: 0.0 }),
+            Level::Fluid => SmokeMotion::Fluid(FluidSmokeSettings { buoyancy: 0.0, weight: 0.0, vorticity: 0.5, ambient_draft: 0.05, draft_scale: 1.5, ..Default::default() }),
+        }
+    }
+}
+
+/// The plume over the cup: steam rising from it, 0.8 m tall.
+fn plume(resolution: u32, level: Level) -> SmokeVolume {
+    let mut v = SmokeVolume::rising_from(steam_source(), 0.8, level.plume());
+    v.resolution = resolution;
+    v.look.density_scale = STEAM_DENSITY;
+    v
+}
+
+/// The room-sized volume of hanging smoke: three soft sheets, no source, no dissipation, at a
+/// coarser grid than the plume's (it overlaps the plume's box; the fog marches both as one).
+fn hanging_layers(resolution: u32, level: Level) -> SmokeVolume {
+    let [hx, h, hz] = ROOM;
+    let mut v = SmokeVolume::new(Vec3::new(0.0, h * 0.5, 0.0), Vec3::new(2.0 * hx, h, 2.0 * hz), level.layers());
+    v.resolution = resolution;
+    v.fill = SmokeFill::Layers { count: 3, thickness: 0.25, density: 0.6 };
+    v.look.density_scale = LAYERS_DENSITY;
+    v.look.dissipation = 0.0;
+    v
+}
+
+/// `stats=1`: frames and sim steps in the current window, and when it started.
+struct Stats {
+    frames: u32,
+    steps: u32,
+    start: f64,
+}
+
+struct State {
+    renderer: Renderer,
+    scene: Scene,
+    camera: Camera,
+    controls: CameraControls,
+    mouse: MouseVectors,
+    volume: PostProcessingVolume,
+    smoke: SmokeSimulation,
+    plume: SmokeVolumeId,
+    layers: SmokeVolumeId,
+    level: Level,
+    steam: bool,
+    /// Scales both volumes' density (1: their own).
+    density: f32,
+    mouse_strength: f32,
+    mouse_radius: f32,
+    fixed: FixedStep,
+    stats: Option<Stats>,
+}
+
+thread_local! {
+    static STATE: RefCell<Option<Rc<RefCell<State>>>> = const { RefCell::new(None) };
+}
+
+fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
+    let state = STATE.with(|s| s.borrow().clone())?;
+    let mut st = state.borrow_mut();
+    Some(f(&mut st))
+}
+
+impl State {
+    fn fog(&mut self) -> Option<&mut VolumetricFogEffect> {
+        self.volume.effect_mut::<VolumetricFogEffect>()
+    }
+
+    /// The mouse as the smoke takes it: none while the camera is being dragged (orbiting
+    /// doesn't tear the plume), else a push at the plume's depth.
+    fn smoke_mouse(&self, dt: f32) -> SmokeMouse {
+        if self.controls.is_dragging() || dt <= 0.0 {
+            return SmokeMouse::NONE;
+        }
+        let inv_view = self.camera.inverse_view_matrix.to_glam();
+        let eye = Vec3::from(inv_view.w_axis.truncate());
+        let forward = Vec3::from(-inv_view.z_axis.truncate().normalize());
+        let depth = (self.smoke.volume(self.plume).center - eye).dot(&forward).max(0.1);
+        SmokeMouse::from_screen(&self.camera, self.mouse.position, self.mouse.direction, dt, self.mouse_strength, self.mouse_radius, depth)
+    }
+
+    fn frame(&mut self, dt: f32, time: f32) {
+        self.controls.update(&mut self.camera, dt);
+        self.mouse.update(dt);
+        let mouse = self.smoke_mouse(dt);
+        let steps = self.fixed.advance(dt as f64);
+        for _ in 0..steps {
+            self.smoke.step(self.fixed.step as f32, &mouse);
+        }
+        if let Some(fog) = self.fog() {
+            fog.time = time;
+        }
+        self.renderer.render_with_postprocessing(&mut self.scene, &mut self.camera, &mut self.volume);
+        kansei_wasm::perf::profile(&mut self.renderer);
+        if let Some(stats) = self.stats.as_mut() {
+            stats.frames += 1;
+            stats.steps += steps;
+            if stats.frames == 240 {
+                let now = kansei_wasm::now();
+                let (w, h) = self.renderer.render_size();
+                log::info!(
+                    "smoke stats: {w}x{h}, {:.2} ms between frames, {:.2} sim steps a frame\n{}",
+                    (now - stats.start) * 1000.0 / 240.0,
+                    stats.steps as f32 / 240.0,
+                    self.renderer.take_profile().report()
+                );
+                *stats = Stats { frames: 0, steps: 0, start: now };
+            }
+        }
+    }
+
+    /// The volumes' look and sources after a change of density or steam.
+    fn apply_look(&mut self) {
+        let (density, steam) = (self.density, self.steam);
+        let plume = self.smoke.volume_mut(self.plume);
+        plume.look.density_scale = STEAM_DENSITY * density;
+        plume.sources[0].rate = if steam { STEAM_RATE } else { 0.0 };
+        self.smoke.volume_mut(self.layers).look.density_scale = LAYERS_DENSITY * density;
+        // what the fog reads follows now, not at the next step
+        self.smoke.step(0.0, &SmokeMouse::NONE);
+    }
+
+    fn view_json(&mut self) -> String {
+        let fog_density = self.fog().map_or(0.0, |f| f.base_density);
+        let t = self.controls.look_target();
+        let r3 = |v: f32| (v * 1000.0).round() / 1000.0;
+        format!(
+            "{{\"motion\":{},\"steam\":{},\"layers\":{},\"density\":{},\"mouseStrength\":{},\"mouseRadius\":{},\"fogDensity\":{},\
+             \"radius\":{},\"azimuth\":{},\"elevation\":{},\"target\":[{},{},{}]}}",
+            self.level.index(),
+            self.steam as u32,
+            self.smoke.is_enabled(self.layers) as u32,
+            r3(self.density),
+            r3(self.mouse_strength),
+            r3(self.mouse_radius),
+            r3(fog_density),
+            r3(self.controls.radius),
+            r3(self.controls.azimuth().to_degrees()),
+            r3(self.controls.elevation().to_degrees()),
+            r3(t.x),
+            r3(t.y),
+            r3(t.z)
+        )
+    }
+
+    fn set(&mut self, key: &str, value: f32) {
+        match key {
+            "motion" => {
+                self.level = Level::from_index(value.max(0.0).round() as u32);
+                self.smoke.set_motion(self.plume, self.level.plume());
+                self.smoke.set_motion(self.layers, self.level.layers());
+            }
+            "steam" => {
+                self.steam = value != 0.0;
+                self.apply_look();
+            }
+            "layers" => self.smoke.set_enabled(self.layers, value != 0.0),
+            "density" => {
+                self.density = value.max(0.0);
+                self.apply_look();
+            }
+            "mouseStrength" => self.mouse_strength = value.max(0.0),
+            "mouseRadius" => self.mouse_radius = value.max(0.005),
+            "fogDensity" => {
+                if let Some(fog) = self.fog() {
+                    fog.base_density = value.max(0.0);
+                }
+            }
+            "radius" | "azimuth" | "elevation" | "targetX" | "targetY" | "targetZ" => {
+                let (mut t, mut r, mut a, mut e) = (self.controls.look_target(), self.controls.radius, self.controls.azimuth(), self.controls.elevation());
+                match key {
+                    "radius" => r = value.max(0.2),
+                    "azimuth" => a = value.to_radians(),
+                    "elevation" => e = value.to_radians(),
+                    "targetX" => t.x = value,
+                    "targetY" => t.y = value,
+                    _ => t.z = value,
+                }
+                self.controls.set_view(t, r, a, e);
+            }
+            _ => log::warn!("smoke: no setting {key}"),
+        }
+    }
+}
+
+#[wasm_bindgen]
+pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
+    let canvas = Canvas::find(canvas_id)?;
+    let mut renderer = canvas.renderer(RendererConfig { sample_count: 1, clear_color: Vec4::new(0.0, 0.0, 0.0, 1.0), ..Default::default() }).await;
+    renderer.enable_shadows(2048);
+    let taa = param("aa").as_deref() != Some("off");
+    let level = match param("motion").as_deref() {
+        Some("waves") => Level::Waves,
+        Some("curl") => Level::Curl,
+        _ => Level::Fluid,
+    };
+    let resolution = param_or("res", RESOLUTION).clamp(MIN_SMOKE_RESOLUTION, MAX_SMOKE_RESOLUTION);
+
+    let mut scene = Scene::new();
+    build_room(&mut scene, taa);
+    let mut sun = DirectionalLight::new(Vec3::from(SUN_DIR).normalize(), Vec3::new(1.0, 0.9, 0.75), SUN);
+    sun.cast_shadow = true;
+    scene.add(SceneNode::Light(Light::Directional(sun)));
+
+    let mut smoke = SmokeSimulation::new(renderer.device(), renderer.queue());
+    let plume = smoke.add(plume(resolution, level));
+    let layers = smoke.add(hanging_layers((resolution * 2 / 3).max(MIN_SMOKE_RESOLUTION), level));
+    smoke.set_enabled(layers, flag("layers", false));
+    let stats = flag("stats", false).then(|| Stats { frames: 0, steps: 0, start: kansei_wasm::now() });
+    renderer.set_profiling(stats.is_some());
+
+    let mut fog = VolumetricFogEffect::new(VolumetricFogOptions {
+        grid: FroxelGridOptions { far: 20.0, temporal: true, ..Default::default() },
+        base_density: FOG_DENSITY,
+        height_falloff: 0.0,
+        anisotropy: FOG_ANISOTROPY,
+        ambient: Vec3::new(0.004, 0.0045, 0.005),
+        ..Default::default()
+    });
+    fog.set_shadow_map(renderer.shadow_map());
+    fog.update_lights(scene.lights());
+    fog.set_smoke(Some(&smoke.handle()));
+
+    let tonemap = ToneMapEffect::new(ToneMapOptions::for_surface(renderer.presentation_format()));
+    let mut effects: Vec<Box<dyn PostProcessingEffect>> = vec![Box::new(fog)];
+    if taa {
+        effects.push(Box::new(TemporalAAEffect::new(TemporalAAOptions { exposure: tonemap.total_exposure(), ..Default::default() })));
+    }
+    effects.push(Box::new(tonemap));
+    let volume = PostProcessingVolume::new(&renderer, effects);
+
+    // drag to orbit, right-drag or shift-drag to pan, the wheel to zoom: looking at the steam
+    // from the room, the window on the right
+    let mut camera = Camera::new(45.0, 0.05, 15.0, canvas.aspect());
+    camera.update_projection_matrix();
+    let target = Vec3::new(TABLE[0] - 0.1, TABLE[1] + 0.35, TABLE[2]);
+    let mut controls = CameraControls::from_canvas(canvas.element(), target, 2.2).with_mouse_pan(canvas.element());
+    controls.set_view(target, 2.2, -0.25, 0.12);
+    // hovering stirs the smoke
+    let mouse = MouseVectors::from_canvas(canvas.element());
+
+    log::info!("Kansei — Volumetric Smoke (WASM) ready: {level:?}, grid {resolution}, TAA {taa}");
+    let fixed = FixedStep::new(1.0 / 60.0);
+    let state = Rc::new(RefCell::new(State {
+        renderer,
+        scene,
+        camera,
+        controls,
+        mouse,
+        volume,
+        smoke,
+        plume,
+        layers,
+        level,
+        steam: true,
+        density: 1.0,
+        mouse_strength: MOUSE_STRENGTH,
+        mouse_radius: MOUSE_RADIUS,
+        fixed,
+        stats,
+    }));
+    STATE.with(|s| *s.borrow_mut() = Some(state.clone()));
+    kansei_wasm::run(&canvas, move |frame| {
+        let mut st = state.borrow_mut();
+        let st = &mut *st;
+        frame.resize(&mut st.renderer, &mut st.camera);
+        st.frame(frame.dt, frame.time as f32);
+    });
+    Ok(())
+}
+
+/// The current settings and view as JSON (the keys `set` takes).
+#[wasm_bindgen]
+pub fn view() -> String {
+    with_state(|s| s.view_json()).unwrap_or_default()
+}
+
+/// Set one value by its `view` key: `motion` (0 waves, 1 curl noise, 2 fluid), `steam` and
+/// `layers` (0 or 1), `density` (both volumes', 1 their own), `mouseStrength`, `mouseRadius`
+/// (m), `fogDensity` (per metre); the view's `radius`, `azimuth` and `elevation` (degrees),
+/// `targetX`/`Y`/`Z`.
+#[wasm_bindgen]
+pub fn set(key: &str, value: f32) {
+    with_state(|s| s.set(key, value));
+}

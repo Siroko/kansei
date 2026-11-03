@@ -132,6 +132,9 @@ Both engines have these features unless an item is marked (Rust) or (TS).
   background, the materials, the ray-traced reflections and glass, and the GI
 - Physically based sky atmosphere (Hillaire's LUTs, aerial perspective), froxel volumetric fog
   with local fog volumes
+- Volumetric smoke and steam at three levels of motion (sine waves, curl noise, a grid fluid with
+  buoyancy and vorticity), stirred by the mouse, lit and composited through the volumetric fog
+  (Rust)
 
 **Global illumination and ray tracing**
 - Voxel GI: scene voxelization through each material's own vertex shader, cone tracing, a

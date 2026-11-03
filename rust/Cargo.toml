@@ -30,6 +30,7 @@ exclude = [
     "kansei-wasm/examples/cluster-lod",
     "kansei-wasm/examples/ktx2-texture",
     "kansei-wasm/examples/specular",
+    "kansei-wasm/examples/smoke",
     "kansei-wasm/demos/fluid_clock",
     "kansei-wasm/demos/glass-particles",
     "kansei-wasm/demos/joydivision",
