@@ -7,7 +7,7 @@ use kansei_core::cameras::Camera;
 use kansei_core::postprocessing::effects::{FilmGrain, SmaaEffect, SmaaMode, SmaaOptions};
 use kansei_core::postprocessing::{GBuffer, PostProcessingEffect};
 
-const MODES: &[SmaaMode] = &[SmaaMode::ThreePass];
+const MODES: &[SmaaMode] = &[SmaaMode::SinglePass, SmaaMode::ThreePass];
 
 struct Dev {
     device: wgpu::Device,
@@ -109,10 +109,35 @@ fn render_with(dev: &Dev, fx: &mut SmaaEffect, input: &[[f32; 3]], w: u32, h: u3
 
 /// A fresh `SmaaEffect` in `mode` with `film` on `input`.
 fn run(dev: &Dev, mode: SmaaMode, input: &[[f32; 3]], w: u32, h: u32, film: FilmGrain) -> Vec<[u16; 4]> {
-    let mut fx = SmaaEffect::new(SmaaOptions::default()).with_mode(mode);
+    run_with_options(dev, mode, SmaaOptions::default(), input, w, h, film)
+}
+
+fn run_with_options(dev: &Dev, mode: SmaaMode, options: SmaaOptions, input: &[[f32; 3]], w: u32, h: u32, film: FilmGrain) -> Vec<[u16; 4]> {
+    let mut fx = SmaaEffect::new(options).with_mode(mode);
     fx.set_film(film);
     render_with(dev, &mut fx, input, w, h)
 }
+
+fn srgb_decode(v: f32) -> f32 {
+    if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+}
+
+/// The largest difference of any channel between two outputs, and the pixels that differ by more
+/// than 2/255 in any channel.
+fn difference(a: &[[u16; 4]], b: &[[u16; 4]]) -> (f32, f32, usize) {
+    let (mut max, mut sum, mut over) = (0f32, 0f64, 0);
+    for (p, q) in a.iter().zip(b) {
+        let d = (0..3).map(|c| (f16_to_f32(p[c]) - f16_to_f32(q[c])).abs()).fold(0f32, f32::max);
+        max = max.max(d);
+        sum += d as f64;
+        if d > 2.0 / 255.0 {
+            over += 1;
+        }
+    }
+    (max, (sum / a.len() as f64) as f32, over)
+}
+
+const KINDS: [Kind; 8] = [Kind::Flat, Kind::Noise, Kind::StraightVertical, Kind::StraightHorizontal, Kind::RotatedSquare, Kind::NearHorizontal, Kind::NearVertical, Kind::Diagonal];
 
 #[derive(Debug, Clone, Copy)]
 enum Kind {
@@ -206,5 +231,114 @@ fn jagged_edges_are_blended_between_their_sides() {
             }
             assert!(moved >= 50, "{mode:?} {kind:?}: only {moved} pixels blended");
         }
+    }
+}
+
+/// The single pass computes the three passes' image (at the same reach), partial tiles and tiny
+/// frames included, on an encoded signal and on a linear one.
+#[test]
+fn single_pass_matches_three_pass() {
+    let Some(dev) = gpu() else { return eprintln!("no GPU adapter: skipping") };
+    for (w, h) in [(250, 190), (7, 5)] {
+        for encoded in [true, false] {
+            let film = FilmGrain { encode_srgb: encoded, ..Default::default() };
+            for kind in KINDS {
+                let mut input = image(kind, w, h);
+                if !encoded {
+                    input.iter_mut().for_each(|c| c.iter_mut().for_each(|v| *v = srgb_decode(*v)));
+                }
+                let single = run(&dev, SmaaMode::SinglePass, &input, w, h, film);
+                let three = run(&dev, SmaaMode::ThreePass, &input, w, h, film);
+                let (max, _, over) = difference(&single, &three);
+                assert!(max <= 2.0 / 255.0, "{kind:?} {w}x{h} encoded {encoded}: max {max} ({over} pixels over 2/255)");
+            }
+        }
+    }
+    // not vacuous: the single pass blends
+    let input = image(Kind::RotatedSquare, 250, 190);
+    let single = run(&dev, SmaaMode::SinglePass, &input, 250, 190, FilmGrain::default());
+    let (_, _, moved) = difference(&single, &halves(&input));
+    assert!(moved >= 50, "the single pass moved only {moved} pixels");
+}
+
+/// One effect resized and switched between modes renders what a fresh one does.
+#[test]
+fn resizing_and_switching_modes_match_fresh_effects() {
+    let Some(dev) = gpu() else { return eprintln!("no GPU adapter: skipping") };
+    let mut fx = SmaaEffect::new(SmaaOptions::default());
+    for (mode, (w, h)) in [(SmaaMode::ThreePass, (64, 48)), (SmaaMode::ThreePass, (96, 80)), (SmaaMode::SinglePass, (96, 80)), (SmaaMode::ThreePass, (64, 48))] {
+        let input = image(Kind::RotatedSquare, w, h);
+        fx.set_mode(mode);
+        let reused = render_with(&dev, &mut fx, &input, w, h);
+        let fresh = run(&dev, mode, &input, w, h, FilmGrain::default());
+        assert!(reused == fresh, "{mode:?} {w}x{h}: the reused effect differs from a fresh one");
+    }
+}
+
+/// GPU time at 1920 x 1080 by wall clock, the single pass, the three passes and the TAA resolve
+/// alternated:
+/// `cargo test -p kansei-core --release --test smaa_gpu time_smaa_1080p -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn time_smaa_1080p() {
+    use kansei_core::postprocessing::effects::{TemporalAAEffect, TemporalAAOptions};
+    let Some(dev) = gpu() else { return eprintln!("no GPU adapter: skipping") };
+    let (w, h) = (1920u32, 1080u32);
+    let device = &dev.device;
+    let size = wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 };
+    let texture = |usage| {
+        device.create_texture(&wgpu::TextureDescriptor { label: None, size, mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2, format: wgpu::TextureFormat::Rgba16Float, usage, view_formats: &[] })
+    };
+    let input_tex = texture(wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
+    dev.queue.write_texture(
+        wgpu::TexelCopyTextureInfo { texture: &input_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+        bytemuck::cast_slice(&halves(&image(Kind::RotatedSquare, w, h))),
+        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 8), rows_per_image: Some(h) },
+        size,
+    );
+    let input = input_tex.create_view(&Default::default());
+    let output = texture(wgpu::TextureUsages::STORAGE_BINDING).create_view(&Default::default());
+    let gbuffer = GBuffer::new(device, w, h, 1);
+    let mut effects: Vec<(&str, Box<dyn PostProcessingEffect>)> = vec![
+        ("SMAA single pass", Box::new(SmaaEffect::new(SmaaOptions::default()).with_mode(SmaaMode::SinglePass))),
+        ("SMAA three passes", Box::new(SmaaEffect::new(SmaaOptions::default()).with_mode(SmaaMode::ThreePass))),
+        ("TAA resolve", Box::new(TemporalAAEffect::new(TemporalAAOptions::default()))),
+    ];
+    let mut times = vec![Vec::new(); effects.len()];
+    for round in 0..45 {
+        for (k, (_, fx)) in effects.iter_mut().enumerate() {
+            let mut encoder = device.create_command_encoder(&Default::default());
+            for _ in 0..10 {
+                fx.render(device, &dev.queue, &mut encoder, &gbuffer, &input, &gbuffer.depth_view, &output, &dev.camera, w, h);
+            }
+            let t = std::time::Instant::now();
+            dev.queue.submit([encoder.finish()]);
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            if round >= 5 {
+                times[k].push(t.elapsed().as_secs_f64() * 1e3 / 10.0);
+            }
+        }
+    }
+    for ((name, _), t) in effects.iter().zip(&mut times) {
+        t.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        eprintln!("{name}: {:.3} ms (median per frame, {w}x{h}, RotatedSquare)", t[t.len() / 2]);
+    }
+}
+
+/// What the single pass's reach costs against the three passes at reach 32, on every image at
+/// 1920 x 1080:
+/// `cargo test -p kansei-core --release --test smaa_gpu reach_cost_on_synthetic_edges -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn reach_cost_on_synthetic_edges() {
+    let Some(dev) = gpu() else { return eprintln!("no GPU adapter: skipping") };
+    let (w, h) = (1920, 1080);
+    let far = SmaaOptions { three_pass_reach: 32, ..Default::default() };
+    for kind in KINDS {
+        let input = image(kind, w, h);
+        let single = run(&dev, SmaaMode::SinglePass, &input, w, h, FilmGrain::default());
+        let three = run_with_options(&dev, SmaaMode::ThreePass, far, &input, w, h, FilmGrain::default());
+        let (max, mean, over) = difference(&single, &three);
+        eprintln!("{kind:?}: mean {mean:.6}, max {max:.4} ({:.1}/255), {over} pixels over 2/255", max * 255.0);
     }
 }

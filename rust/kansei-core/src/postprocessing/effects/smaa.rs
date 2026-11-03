@@ -89,6 +89,10 @@ use crate::postprocessing::PostProcessingEffect;
 use crate::renderers::GBuffer;
 
 const THREE_PASS_WGSL: &str = concat!(include_str!("../../shaders/smaa_common.wgsl"), include_str!("../../shaders/smaa_passes.wgsl"));
+/// With `KANSEI_SMAA_REACH` for [`SmaaEffect::REACH`] (`single_pass_wgsl`).
+const SINGLE_PASS_WGSL: &str = concat!(include_str!("../../shaders/smaa_common.wgsl"), include_str!("../../shaders/smaa_single.wgsl"));
+/// The single pass's tile (smaa_single.wgsl's SMAA_TILE): one workgroup's output pixels a side.
+const TILE: u32 = 16;
 /// SMAA's area texture, its 1x subtexture (see the module docs).
 const AREA: &[u8] = include_bytes!("smaa_area.bin");
 const AREA_SIZE: (u32, u32) = (160, 80);
@@ -103,9 +107,12 @@ const FLAG_DITHER: u32 = 2;
 /// How [`SmaaEffect`] runs SMAA.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SmaaMode {
+    /// One compute dispatch: each workgroup finds the edges, the weights and the blend of a
+    /// 16 x 16 tile in its own memory, reaching [`SmaaEffect::REACH`].
+    #[default]
+    SinglePass,
     /// Three compute passes (edges, blending weights, neighbourhood blending) over textures, the
     /// reference, at [`SmaaOptions::three_pass_reach`].
-    #[default]
     ThreePass,
 }
 
@@ -213,6 +220,8 @@ struct Gpu {
     area_texture: wgpu::Texture,
     area: wgpu::TextureView,
     sampler: wgpu::Sampler,
+    /// Made on the first single-pass frame.
+    single: Option<Pipeline>,
     /// Made on the first three-pass frame.
     three: Option<ThreePass>,
 }
@@ -326,7 +335,60 @@ impl SmaaEffect {
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             ..Default::default()
         });
-        self.gpu = Some(Gpu { params, area_texture, area, sampler, three: None });
+        self.gpu = Some(Gpu { params, area_texture, area, sampler, single: None, three: None });
+    }
+
+    /// The single pass's WGSL, its reach filled in.
+    fn single_pass_wgsl() -> String {
+        SINGLE_PASS_WGSL.replace("KANSEI_SMAA_REACH", &Self::REACH.to_string())
+    }
+
+    /// One dispatch of 16 x 16 tiles (`params` already written).
+    fn encode_single_pass(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, input: &wgpu::TextureView, output: &wgpu::TextureView, width: u32, height: u32) {
+        let gpu = self.gpu.as_mut().unwrap();
+        gpu.single.get_or_insert_with(|| {
+            let entry = |binding, ty| wgpu::BindGroupLayoutEntry { binding, visibility: wgpu::ShaderStages::COMPUTE, ty, count: None };
+            let texture = wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false };
+            let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("SMAA/BGL"),
+                entries: &[
+                    entry(0, wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }),
+                    entry(1, texture),
+                    entry(2, texture),
+                    entry(3, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)),
+                    entry(4, wgpu::BindingType::StorageTexture { access: wgpu::StorageTextureAccess::WriteOnly, format: GBuffer::COLOR_FORMAT, view_dimension: wgpu::TextureViewDimension::D2 }),
+                ],
+            });
+            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("SMAA/SinglePass"), source: wgpu::ShaderSource::Wgsl(Self::single_pass_wgsl().into()) });
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("SMAA/Layout"), bind_group_layouts: &[Some(&bgl)], immediate_size: 0 });
+            let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("SMAA"),
+                layout: Some(&layout),
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+            Pipeline { pipeline, bgl }
+        });
+        let gpu = self.gpu.as_ref().unwrap();
+        let single = gpu.single.as_ref().unwrap();
+        let bind_group = self.bind_groups.get(device, &wgpu::BindGroupDescriptor {
+            label: Some("SMAA/BG"),
+            layout: &single.bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: gpu.params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(input) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&gpu.area) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&gpu.sampler) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(output) },
+            ],
+        });
+        let stamp = crate::profiling::gpu_pass("SMAA");
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("SMAA"), timestamp_writes: stamp.as_ref().map(crate::profiling::PassStamp::compute) });
+        pass.set_pipeline(&single.pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(width.div_ceil(TILE), height.div_ceil(TILE), 1);
     }
 
     /// Edges, weights and blend, each its own compute pass (`params` already written).
@@ -379,6 +441,11 @@ impl SmaaEffect {
     pub(crate) fn three_pass_source() -> &'static str {
         THREE_PASS_WGSL
     }
+
+    #[cfg(test)]
+    pub(crate) fn single_pass_source() -> String {
+        Self::single_pass_wgsl()
+    }
 }
 
 impl PostProcessingEffect for SmaaEffect {
@@ -404,6 +471,7 @@ impl PostProcessingEffect for SmaaEffect {
         self.frame = self.frame.wrapping_add(1);
         queue.write_buffer(&self.gpu.as_ref().unwrap().params, 0, bytemuck::bytes_of(&params));
         match self.mode {
+            SmaaMode::SinglePass => self.encode_single_pass(device, encoder, input, output, width, height),
             SmaaMode::ThreePass => self.encode_three_pass(device, encoder, input, output, width, height),
         }
     }
@@ -459,6 +527,23 @@ mod tests {
             .unwrap();
         assert_eq!(span, std::mem::size_of::<SmaaParamsGpu>());
         assert_eq!(span, 48);
+    }
+
+    #[test]
+    fn the_single_pass_fits_webgpu_s_default_limits() {
+        let code = SmaaEffect::single_pass_source();
+        let module = naga::front::wgsl::parse_str(&code).unwrap_or_else(|e| panic!("{}", e.emit_to_string(&code)));
+        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all()).validate(&module).unwrap_or_else(|e| panic!("{e:?}"));
+        let mut layouter = naga::proc::Layouter::default();
+        layouter.update(module.to_ctx()).unwrap();
+        let bytes: u32 = module
+            .global_variables
+            .iter()
+            .filter(|(_, g)| g.space == naga::AddressSpace::WorkGroup)
+            .map(|(_, g)| layouter[g.ty].size.next_multiple_of(16))
+            .sum();
+        assert!(bytes <= 16384, "{bytes} bytes of workgroup memory");
+        assert_eq!(module.entry_points[0].workgroup_size, [16, 16, 1]);
     }
 
     #[test]
