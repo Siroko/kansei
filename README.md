@@ -53,7 +53,8 @@ Live examples: [kansei.graphics](https://kansei.graphics/) · [all examples](htt
 
 Kansei is a WebGPU engine for real-time rendering and GPU simulation, written twice: once in
 TypeScript for the browser and once in Rust for the browser (WebAssembly) and the desktop. Both
-engines share their WGSL shaders and are kept at feature parity.
+engines share their WGSL shaders and the shape of their API. New features land in Rust first;
+the [features](#features) list marks the ones the TypeScript engine does not have yet.
 
 It is a personal, experimental engine rather than a general-purpose one: expect APIs to change.
 
@@ -74,7 +75,7 @@ It is a personal, experimental engine rather than a general-purpose one: expect 
 | Engine | Where | Runs on | Use it from |
 |---|---|---|---|
 | TypeScript | `src/` | Browsers with WebGPU | TS/JS, bundled with Vite or any ESM bundler |
-| Rust | `rust/kansei-core` | Native (Vulkan, Metal, DX12) and browsers (WebGPU), through `wgpu` 24 | Rust: `kansei-wasm` for the web, your own window loop (e.g. `winit`) for desktop |
+| Rust | `rust/kansei-core` | Native (Vulkan, Metal, DX12) and browsers (WebGPU), through `wgpu` 30 | Rust: `kansei-wasm` for the web, your own window loop (e.g. `winit`) for desktop |
 
 The two engines are one design with two implementations:
 
@@ -103,22 +104,32 @@ Design goals:
 
 ## Features
 
-Both engines have these features unless an item says otherwise.
+Both engines have these features unless an item is marked (Rust) or (TS).
 
 **Rendering**
 - Scene graph of `Renderable`s, instanced geometry, primitives (box, plane, sphere, cylinder,
   icosphere, heightfield) and custom geometry
 - Stock materials: `basic_lit` (forward Blinn-Phong) and `standard_lit` (GBuffer: lights,
-  shadows, sky hemisphere, emission, instancing, mirror and glass), `emissive`, `gradient_sky`;
-  custom WGSL materials and compute passes
+  shadows, sky hemisphere, emission, instancing, mirror and glass, and a specular factor from
+  glTF's `KHR_materials_specular` for truly matte surfaces), `emissive`, `gradient_sky`; custom
+  WGSL materials and compute passes
 - Forward or deferred rendering: a single-sample GBuffer with motion vectors, or MSAA forward
 - Orbit camera controls, a frame loop that caps frames in flight, fixed-step simulation pacing
 - GPU profiling: per-pass GPU times and the frame's CPU sections
+- A performance overlay on every web example (Rust): fps, CPU and GPU time with graphs, draw
+  calls, triangles, pipelines and GPU memory; expanded, draws and triangles by pass and
+  material, memory by label
+- Less work on frames where little changes (Rust): bind groups kept across frames, spot shadows
+  that redraw only the casters that move, and an RT grid whose static triangles are rebuilt
+  only when they change; on the web, a recorded list of pipelines compiled in parallel before
+  the first frame, so a first visit does not stutter
 
 **Lighting and shadows**
 - Directional, point, spot and area lights; clustered light lists for many spot lights
 - Directional shadow maps, cascaded shadows, point-light cube shadows and a spot shadow atlas,
   with contact-hardening penumbrae
+- Interchangeable environments (Rust): a gradient or an equirectangular HDRI lights the
+  background, the materials, the ray-traced reflections and glass, and the GI
 - Physically based sky atmosphere (Hillaire's LUTs, aerial perspective), froxel volumetric fog
   with local fog volumes
 
@@ -126,16 +137,22 @@ Both engines have these features unless an item says otherwise.
 - Voxel GI: scene voxelization through each material's own vertex shader, cone tracing, a
   distance field and irradiance probes; a clipmap around the camera for large outdoor scenes
 - Screen-space GI
-- Ray tracing on a GPU-built grid of the scene's triangles around the camera: hybrid diffuse GI
-  (rays plus voxel GI for further bounces, SVGF denoising, a reference path-tracing mode),
-  reflections, and mirror and glass materials (Fresnel, refraction, frosted glass); on native, hardware ray
-  queries over the same triangles (Vulkan, Metal on M3 and later)
-- A BVH path tracer (the path-traced Cornell box example)
+- Ray tracing on a GPU-built grid of the scene's triangles around the camera, with a separate
+  layer for moving objects: hybrid diffuse GI (rays plus voxel GI for further bounces, SVGF
+  denoising, full, half or quarter resolution, a reference path-tracing mode), reflections, and
+  mirror and glass materials (Fresnel, refraction, frosted glass)
+- Ray-traced direct light and shadows, and caustics from glass (Rust)
+- Hardware ray tracing on native (Rust): the same rays traced with hardware ray queries instead
+  of the grid, on Vulkan and on Metal with M3 and later (DX12 opt-in), for every effect above
+  and the path tracer ([docs/rt-hardware.md](docs/rt-hardware.md))
+- A BVH path tracer (the path-traced Cornell box example), with an SVGF denoiser in Rust
 
 **Post-processing**
 - Physical tone mapping with EV100 exposure and film curves, colour grading, bloom
 - Temporal AA, motion blur, SSAO, god rays (TS)
 - Physical-lens depth of field with scattered bokeh
+- Contact AO, a stylised darkening where surfaces meet (Rust)
+- Distance fog: far surfaces fade into a colour, or into the gradient-sky dome behind them (Rust)
 
 **Visibility, LOD and reflections**
 - GPU instance culling per view (camera, shadow cascades, reflections): frustum, LOD bands and
@@ -247,7 +264,7 @@ The Rust engine is three crates in the `rust/` workspace:
 
 | Crate | What it is |
 |---|---|
-| `kansei-core` | The engine: renderer, scene, materials, effects, simulation, animation. Platform-neutral, on `wgpu` 24 and `glam` 0.29 (re-exported as `kansei_core::math`). |
+| `kansei-core` | The engine: renderer, scene, materials, effects, simulation, animation. Platform-neutral, on `wgpu` 30 and `glam` 0.29 (re-exported as `kansei_core::math`). |
 | `kansei-wasm` | The web runtime every browser example shares: canvas sizing, the frame loop, query parameters, fetch, input, and running an example in a Web Worker. |
 | `kansei-native` | The desktop examples (`rust/kansei-native/examples`), on `winit`. |
 
@@ -470,6 +487,8 @@ What `kansei-wasm` gives an app:
 | `fetch_bytes`, `now`, `is_phone`, `set_text` | Loading, timing, picking a quality tier, a text HUD |
 | `Keys`, `Gamepad` | Keyboard and gamepad input |
 | `launch` | Starts `start` on the page or, with `?worker=1`, in a dedicated Web Worker on the canvas transferred as an `OffscreenCanvas`. The Rust is the same in both: input events, the query string, fetches and text are forwarded. The page calls the example's other exports through the API `launch` returns, each as a promise |
+| `perf` | The performance overlay every page on `run` has (`?perf=1`, or the backquote key). `perf::profile(&mut renderer)` once a frame adds each pass's GPU time; `window.kanseiPerf.report()` returns it all as data |
+| `pipelines::warm` | Compiles a recorded manifest's pipelines in parallel before the renderer gets its device (record one with `?record_pipelines=1`), so a first visit does not stutter |
 
 For simulations, `kansei_core::pacing::FixedStep` steps at a fixed rate whatever the display's
 refresh rate (on slow frames the simulation falls behind real time rather than piling up steps). A page that only needs the main thread can import `start` and call
