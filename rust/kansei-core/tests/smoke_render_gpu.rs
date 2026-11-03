@@ -427,3 +427,75 @@ fn history_survives_a_resize() {
     eprintln!("after the resize {}, without history {}", m(&got), m(&want));
     assert!((m(&got) / m(&want) - 1.0).abs() < 0.05, "{} vs {}", m(&got), m(&want));
 }
+
+fn f32_to_f16(v: f32) -> u16 {
+    let bits = v.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let a = v.abs();
+    if a < 6.1e-5 {
+        return sign | (a / 2f32.powi(-24)).round() as u16;
+    }
+    let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+    let mant = bits & 0x7f_ffff;
+    let mut h = ((exp as u32) << 10) | (mant >> 13);
+    if mant & 0x1000 != 0 {
+        h += 1;
+    }
+    sign | h as u16
+}
+
+/// The blob's centroid column: pixels weighted by how far they differ from the background's.
+fn centroid_column(img: &[[f32; 4]], background: &[[f32; 4]], w: u32, rows: std::ops::Range<u32>) -> f32 {
+    let (mut sum, mut weight) = (0.0f64, 0.0f64);
+    for y in rows {
+        for x in 0..w {
+            let i = (y * w + x) as usize;
+            let d = (img[i][0] - background[i][0]).abs() as f64;
+            sum += d * (x as f64 + 0.5);
+            weight += d;
+        }
+    }
+    (sum / weight.max(1e-12)) as f32
+}
+
+#[test]
+fn the_history_follows_the_gas() {
+    let Some((device, queue)) = gpu() else { return };
+    let s = scene(&device, &queue, (512, 256), |_, _| Some(10.0));
+    let background = render(&device, &queue, &mut fog(0.02, 0.5), &s, 1);
+    // a ball of smoke carried along +x at 0.5 m/s: no projection (a closed box's would stop a
+    // uniform flow), no forces
+    let mut sim = SmokeSimulation::new(&device, &queue);
+    let mut settings = FluidSmokeSettings::default();
+    (settings.pressure_iterations, settings.buoyancy, settings.weight, settings.vorticity) = (0, 0.0, 0.0, 0.0);
+    let mut ball = smoke_box(Vec3::new(0.0, 1.0, -3.5), Vec3::new(2.0, 2.0, 2.0), 0.0);
+    ball.motion = SmokeMotion::Fluid(settings);
+    ball.resolution = 64;
+    ball.fill = SmokeFill::Sphere { center: Vec3::new(0.0, 1.0, -3.5), radius: 0.2, density: 6.0, temperature: 0.0 };
+    let id = sim.add(ball);
+    let grid = sim.grid_textures(id).unwrap();
+    let [gw, gh, gd] = grid.dims;
+    let one = f32_to_f16(0.5);
+    let texels: Vec<u16> = (0..gw * gh * gd).flat_map(|i| [if i % gw == 0 { 0 } else { one }, 0, 0, 0]).collect();
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo { texture: grid.velocity.unwrap(), mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+        bytemuck::cast_slice(&texels),
+        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(gw * 8), rows_per_image: Some(gh) },
+        wgpu::Extent3d { width: gw, height: gh, depth_or_array_layers: gd },
+    );
+    let mut with = fog(0.02, 0.5);
+    with.smoke_render.temporal = true;
+    with.set_smoke(Some(&sim.handle()));
+    let mut img = Vec::new();
+    for _ in 0..20 {
+        sim.step(1.0 / 60.0, &SmokeMouse::NONE);
+        img = render(&device, &queue, &mut with, &s, 1);
+    }
+    let mut still = fog(0.02, 0.5);
+    still.set_smoke(Some(&sim.handle()));
+    let want = render(&device, &queue, &mut still, &s, 1);
+    let rows = 118..138;
+    let (got, want) = (centroid_column(&img, &background, s.w, rows.clone()), centroid_column(&want, &background, s.w, rows));
+    eprintln!("the blob's centroid column: with history {got}, without {want}");
+    assert!((got - want).abs() < 1.0, "the history lags: {got} vs {want}");
+}

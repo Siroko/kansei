@@ -83,6 +83,44 @@ fn smokeGridAt(i: u32, local: vec3f) -> vec4f {
     }
 }
 
+// Volume i's velocity grid (the MAC faces' u, v, w) at a normalized point.
+fn smokeVelocityGridAt(i: u32, uvw: vec3f) -> vec4f {
+    switch i {
+        case 0u: { return textureSampleLevel(smokeVelocity0, smokeSampler, uvw, 0.0); }
+        case 1u: { return textureSampleLevel(smokeVelocity1, smokeSampler, uvw, 0.0); }
+        case 2u: { return textureSampleLevel(smokeVelocity2, smokeSampler, uvw, 0.0); }
+        default: { return textureSampleLevel(smokeVelocity3, smokeSampler, uvw, 0.0); }
+    }
+}
+
+// Volume i's gas velocity at a point of its unit cube, m/s along the box's axes: its MAC grid's
+// (Fluid), zero on the levels with no velocity grid.
+fn smokeVolumeVelocity(i: u32, local: vec3f) -> vec3f {
+    let v = sf.volumes[i];
+    if (v.motion != SMOKE_FLUID) { return vec3f(0.0); }
+    let d = vec3f(v.dims);
+    let c = local * d;
+    return vec3f(
+        smokeVelocityGridAt(i, vec3f((c.x + 0.5) / d.x, c.y / d.y, c.z / d.z)).x,
+        smokeVelocityGridAt(i, vec3f(c.x / d.x, (c.y + 0.5) / d.y, c.z / d.z)).y,
+        smokeVelocityGridAt(i, vec3f(c.x / d.x, c.y / d.y, (c.z + 0.5) / d.z)).z,
+    );
+}
+
+// The gas's velocity at p, world m/s: each volume's there, weighted by its density there.
+fn smokeVelocityAtWorld(p: vec3f) -> vec3f {
+    var vel = vec3f(0.0);
+    var weight = 0.0;
+    for (var i = 0u; i < sf.numVolumes; i++) {
+        let d = smokeDensityAt(i, p);
+        if (d <= 0.0) { continue; }
+        let v = sf.volumes[i];
+        vel += d * smokeBoxToWorld(v, smokeVolumeVelocity(i, smokeToLocal(v, p)));
+        weight += d;
+    }
+    return vel / max(weight, 1e-6);
+}
+
 // Volume i's density at p (scaled by its densityScale, faded at its faces).
 fn smokeDensityAt(i: u32, p: vec3f) -> f32 {
     let v = sf.volumes[i];
@@ -326,10 +364,15 @@ fn smokeMarch(@builtin(global_invocation_id) gid : vec3u) {
     }
     let r = max(rs + (1.0 - ts) * lPrev - rf, vec3f(0.0));
 
-    // the point the smoke's light comes from, for the history: weighted by what it absorbed
+    // the point the smoke's light comes from, for the history: weighted by what it absorbed;
+    // where it was a frame ago, moved back by the gas's velocity over the sim seconds stepped
     var tP = tScene;
-    if (weight > 1e-4) { tP = tWeighted / weight; }
-    let prev = smokePrevUv(sf.cameraPos + rdTexel * tP);
+    var gas = vec3f(0.0);
+    if (weight > 1e-4) {
+        tP = tWeighted / weight;
+        gas = smokeVelocityAtWorld(sf.cameraPos + rdTexel * tP);
+    }
+    let prev = smokePrevUv(sf.cameraPos + rdTexel * tP - gas * sf.advanced);
     textureStore(smokeLightOut, gid.xy, vec4f(min(r, vec3f(60000.0)), ts));
     textureStore(smokeAuxOut, gid.xy, vec4f(linear, prev, tP));
 }

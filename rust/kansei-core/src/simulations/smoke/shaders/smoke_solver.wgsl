@@ -231,7 +231,9 @@ fn smokeExtraForce(p: vec3f) -> vec3f {
     return vec3f(0.0);
 }
 
-// The sources' velocity blended in at a face (`axis`, at `p` in cells).
+// The sources' velocity blended in at a face (`axis`, at `p` in cells): each source's own, and a
+// curl-noise jitter of about half its speed over twice its radius, so a plume leaves its source
+// unsteady and breaks into wisps instead of rising as a still column.
 fn sourceVelocity(axis: u32, value: f32, p: vec3f) -> f32 {
     let world = cellsToWorld(p);
     let relax = 1.0 - exp(-20.0 * st.dt);
@@ -240,7 +242,9 @@ fn sourceVelocity(axis: u32, value: f32, p: vec3f) -> f32 {
         let src = st.volume.sources[i];
         let w = sourceWeight(src, world);
         if (w <= 0.0) { continue; }
-        v = mix(v, smokeVecToBox(st.volume, src.velocity)[axis], w * relax);
+        let speed = length(src.velocity);
+        let jitter = curlNoise((world - src.position) / (2.0 * src.radius) + f32(i) * 17.0, st.time * 3.0) * (0.5 * speed);
+        v = mix(v, smokeVecToBox(st.volume, src.velocity + jitter)[axis], w * relax);
     }
     return v;
 }

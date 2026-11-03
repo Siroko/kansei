@@ -17,11 +17,12 @@ use kansei_core::lights::{DirectionalLight, Light};
 use kansei_core::materials::{Material, StandardLitOptions};
 use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
+use kansei_core::pacing::FixedStep;
 use kansei_core::postprocessing::effects::{TemporalAAEffect, TemporalAAOptions, ToneMapEffect, ToneMapOptions, VolumetricFogEffect, VolumetricFogOptions};
 use kansei_core::postprocessing::{PostProcessingEffect, PostProcessingVolume};
 use kansei_core::renderers::{Renderer, RendererConfig};
-use kansei_core::simulations::smoke::{CurlSettings, SmokeFill, SmokeMotion, SmokeMouse, SmokeSimulation, SmokeSource, SmokeVolume, SmokeVolumeId};
-use kansei_wasm::{param, Canvas};
+use kansei_core::simulations::smoke::{SmokeMotion, SmokeMouse, SmokeSimulation, SmokeSource, SmokeVolume, SmokeVolumeId};
+use kansei_wasm::{flag, param, Canvas};
 
 /// The room's inside: x and z half extents, and its height (metres).
 const ROOM: [f32; 3] = [3.0, 3.0, 2.5];
@@ -95,13 +96,22 @@ fn cup_top() -> Vec3 {
     Vec3::new(TABLE[0], TABLE[1] + CUP_HEIGHT, TABLE[2])
 }
 
-/// The plume over the cup. Task 4's scaffold: a still ball of steam over it, nothing stepping it.
-fn plume() -> SmokeVolume {
-    let source = SmokeSource { position: cup_top(), radius: 0.025, ..Default::default() };
-    let mut v = SmokeVolume::rising_from(source, 0.8, SmokeMotion::CurlNoise(CurlSettings { strength: 0.0, rise: 0.0, ..Default::default() }));
-    let c = cup_top();
-    v.fill = SmokeFill::Sphere { center: Vec3::new(c.x, c.y + 0.2, c.z), radius: 0.12, density: 8.0, temperature: 0.0 };
+/// The steam's look: how dense the plume reads.
+const STEAM_DENSITY: f32 = 8.0;
+
+/// The plume over the cup: steam rising from it, 0.8 m tall, at `motion`.
+fn plume(motion: SmokeMotion) -> SmokeVolume {
+    let source = SmokeSource { position: cup_top(), radius: 0.03, ..Default::default() };
+    let mut v = SmokeVolume::rising_from(source, 0.8, motion);
+    v.look.density_scale = STEAM_DENSITY;
     v
+}
+
+/// `stats=1`: frames and sim steps in the current window, and when it started.
+struct Stats {
+    frames: u32,
+    steps: u32,
+    start: f64,
 }
 
 struct State {
@@ -113,6 +123,8 @@ struct State {
     smoke: SmokeSimulation,
     #[allow(dead_code)]
     plume: SmokeVolumeId,
+    fixed: FixedStep,
+    stats: Option<Stats>,
 }
 
 thread_local! {
@@ -132,11 +144,30 @@ impl State {
 
     fn frame(&mut self, dt: f32, time: f32) {
         self.controls.update(&mut self.camera, dt);
-        self.smoke.step(0.0, &SmokeMouse::NONE);
+        let steps = self.fixed.advance(dt as f64);
+        for _ in 0..steps {
+            self.smoke.step(self.fixed.step as f32, &SmokeMouse::NONE);
+        }
         if let Some(fog) = self.fog() {
             fog.time = time;
         }
         self.renderer.render_with_postprocessing(&mut self.scene, &mut self.camera, &mut self.volume);
+        kansei_wasm::perf::profile(&mut self.renderer);
+        if let Some(stats) = self.stats.as_mut() {
+            stats.frames += 1;
+            stats.steps += steps;
+            if stats.frames == 240 {
+                let now = kansei_wasm::now();
+                let (w, h) = self.renderer.render_size();
+                log::info!(
+                    "smoke stats: {w}x{h}, {:.2} ms between frames, {:.2} sim steps a frame\n{}",
+                    (now - stats.start) * 1000.0 / 240.0,
+                    stats.steps as f32 / 240.0,
+                    self.renderer.take_profile().report()
+                );
+                *stats = Stats { frames: 0, steps: 0, start: now };
+            }
+        }
     }
 
     fn view_json(&mut self) -> String {
@@ -193,7 +224,9 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     scene.add(SceneNode::Light(Light::Directional(sun)));
 
     let mut smoke = SmokeSimulation::new(renderer.device(), renderer.queue());
-    let plume = smoke.add(plume());
+    let plume = smoke.add(plume(SmokeMotion::fluid()));
+    let stats = flag("stats", false).then(|| Stats { frames: 0, steps: 0, start: kansei_wasm::now() });
+    renderer.set_profiling(stats.is_some());
 
     let mut fog = VolumetricFogEffect::new(VolumetricFogOptions {
         grid: FroxelGridOptions { far: 20.0, temporal: true, ..Default::default() },
@@ -224,7 +257,8 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     controls.set_view(target, 2.2, -0.25, 0.12);
 
     log::info!("Kansei — Volumetric Smoke (WASM) ready, TAA {taa}");
-    let state = Rc::new(RefCell::new(State { renderer, scene, camera, controls, volume, smoke, plume }));
+    let fixed = FixedStep::new(1.0 / 60.0);
+    let state = Rc::new(RefCell::new(State { renderer, scene, camera, controls, volume, smoke, plume, fixed, stats }));
     STATE.with(|s| *s.borrow_mut() = Some(state.clone()));
     kansei_wasm::run(&canvas, move |frame| {
         let mut st = state.borrow_mut();
