@@ -9,6 +9,9 @@ use crate::reflections::{flip_x, mirrored_view, PlanarReflection, ReflectionFog,
 use crate::renderers::{GBuffer, Renderer};
 use crate::shadows::compute_shadows::ComputeShadows;
 use crate::shadows::{CascadedShadowMap, CubeMapShadowMap, ShadowMap, SpotShadowAtlas};
+use crate::simulations::smoke::SmokeHandle;
+
+use super::volumetric_smoke::{SmokeRenderOptions, SmokeRenderer, SmokeView};
 
 const INJECT_WGSL: &str = concat!(
     include_str!("../../shaders/froxel_common.wgsl"),
@@ -38,6 +41,27 @@ const SHAFTS_WGSL: &str = concat!(
     include_str!("../../shaders/volumetric_fog_spot.wgsl"),
     include_str!("../../shaders/volumetric_fog_shafts_common.wgsl"),
     include_str!("../../shaders/volumetric_fog_shafts.wgsl"),
+);
+/// The injection's shader with the smoke's march (`smokeMarch`) appended.
+const SMOKE_MARCH_WGSL: &str = concat!(
+    include_str!("../../shaders/froxel_common.wgsl"),
+    include_str!("../../shaders/volumetric_fog_inject.wgsl"),
+    include_str!("../../atmosphere/shaders/sky_lighting.wgsl"),
+    include_str!("../../shaders/sky_occlusion.wgsl"),
+    include_str!("../../gi/shaders/clipmap_probes.wgsl"),
+    include_str!("../../shaders/volumetric_fog_media.wgsl"),
+    include_str!("../../shaders/spot_light_types.wgsl"),
+    include_str!("../../shaders/compute_shadows.wgsl"),
+    include_str!("../../shaders/volumetric_fog_spot.wgsl"),
+    include_str!("../../simulations/smoke/shaders/curl_noise.wgsl"),
+    include_str!("../../simulations/smoke/shaders/smoke_common.wgsl"),
+    include_str!("../../shaders/volumetric_smoke_march.wgsl"),
+);
+/// The composite with the smoke (`compositeSmoke`) appended.
+const SMOKE_COMPOSITE_WGSL: &str = concat!(
+    include_str!("../../shaders/froxel_common.wgsl"),
+    include_str!("../../shaders/volumetric_fog_composite.wgsl"),
+    include_str!("../../shaders/volumetric_smoke_composite.wgsl"),
 );
 const SHAFTS_TEMPORAL_WGSL: &str = concat!(
     include_str!("../../shaders/volumetric_fog_shafts_common.wgsl"),
@@ -348,6 +372,12 @@ struct Gpu {
     dummy_clipmap_probes: [wgpu::Buffer; 2],
     reflection: Option<ReflectionGpu>,
     shafts: ShaftsGpu,
+    /// The smoke's march and composite, made with the first frame that has smoke.
+    smoke: Option<SmokeRenderer>,
+    /// The composite's layout (bindings 0-6), and the injection's past its output (2-22), which
+    /// the smoke's composite and march extend.
+    composite_entries: Vec<wgpu::BindGroupLayoutEntry>,
+    media_entries: Vec<wgpu::BindGroupLayoutEntry>,
 }
 
 /// The raymarched spot-light shafts (SpotScattering::Raymarched).
@@ -418,6 +448,10 @@ pub struct VolumetricFogEffect {
     pub time: f32,
     /// How the spot lights scatter: in the froxels, or raymarched per pixel for sharp shafts.
     pub spot_scattering: SpotScattering,
+    /// How the smoke (`set_smoke`) is marched.
+    pub smoke_render: SmokeRenderOptions,
+    /// The smoke marched with the fog (`set_smoke`).
+    smoke: Option<SmokeHandle>,
     /// Temporal jitter index of the injection (1..=1024), advanced every frame.
     frame: u32,
     grid_options: FroxelGridOptions,
@@ -453,6 +487,8 @@ impl VolumetricFogEffect {
             local_volumes: Vec::new(),
             time: 0.0,
             spot_scattering: options.spot_scattering,
+            smoke_render: SmokeRenderOptions::default(),
+            smoke: None,
             frame: 1,
             grid_options: options.grid,
             shadows: ComputeShadows::new(),
@@ -481,6 +517,9 @@ impl VolumetricFogEffect {
         if let Some(g) = &mut self.gpu {
             g.grid.reset_history();
             g.shafts.prev_view_proj = None;
+            if let Some(smoke) = &mut g.smoke {
+                smoke.reset_history();
+            }
             if let Some(r) = &mut g.reflection {
                 r.grid.reset_history();
             }
@@ -604,6 +643,19 @@ impl VolumetricFogEffect {
         self.shadows.set_spot_lights(lights, shadow_atlas);
     }
 
+    /// March a smoke simulation's volumes with the fog (`SmokeSimulation::handle`), lit by the
+    /// fog's lights, shadow maps, ambient and sky (bound here once for both) and composited with
+    /// it in one pass, so fog in front of the smoke veils it and the smoke hides the fog behind
+    /// it. The march runs at half resolution against the scene's depth, every enabled volume at
+    /// once (overlapping volumes are one medium), with its own temporal filter
+    /// (`smoke_render`). The smoke shows with the fog's `base_density` at 0. `None` removes it.
+    pub fn set_smoke(&mut self, smoke: Option<&SmokeHandle>) {
+        self.smoke = smoke.cloned();
+        if let Some(smoke) = self.gpu.as_mut().and_then(|g| g.smoke.as_mut()) {
+            smoke.reset_history();
+        }
+    }
+
     fn init_gpu(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
         let grid = FroxelGrid::new(device, queue, &self.grid_options);
 
@@ -686,43 +738,45 @@ impl VolumetricFogEffect {
                 wgpu::BindGroupLayoutEntry { binding: 4, visibility: compute, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
             ],
         });
+        // the injection's parameters, media, sky and lights, which the smoke's march shares
+        let media_entries: Vec<_> = [
+            uniform(2),
+            uniform(10),
+            storage(11),
+            uniform(12),
+            // the sky occlusion (volumetric_fog_media.wgsl)
+            wgpu::BindGroupLayoutEntry {
+                binding: 18,
+                visibility: compute,
+                ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D3, multisampled: false },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry { binding: 19, visibility: compute, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
+            uniform(20),
+            // a clipmap's probes (volumetric_fog_media.wgsl)
+            uniform(21),
+            storage(22),
+        ]
+        .into_iter()
+        .chain(shadow_entries)
+        .collect();
         let inject_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("VolumetricFog/InjectBGL"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: compute,
-                    ty: wgpu::BindingType::StorageTexture {
-                        access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: wgpu::TextureFormat::Rgba16Float,
-                        view_dimension: wgpu::TextureViewDimension::D3,
-                    },
-                    count: None,
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: compute,
+                ty: wgpu::BindingType::StorageTexture {
+                    access: wgpu::StorageTextureAccess::WriteOnly,
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    view_dimension: wgpu::TextureViewDimension::D3,
                 },
-                uniform(2),
-                uniform(10),
-                storage(11),
-                uniform(12),
-                // the sky occlusion (volumetric_fog_media.wgsl)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 18,
-                    visibility: compute,
-                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D3, multisampled: false },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry { binding: 19, visibility: compute, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
-                uniform(20),
-                // a clipmap's probes (volumetric_fog_media.wgsl)
-                uniform(21),
-                storage(22),
-            ]
+                count: None,
+            }]
             .into_iter()
-            .chain(shadow_entries)
+            .chain(media_entries.iter().cloned())
             .collect::<Vec<_>>(),
         });
-        let composite_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("VolumetricFog/CompositeBGL"),
-            entries: &[
+        let composite_entries = vec![
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: compute,
@@ -771,8 +825,8 @@ impl VolumetricFogEffect {
                 },
                 uniform(5),
                 texture_2d(6, false),
-            ],
-        });
+            ];
+        let composite_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("VolumetricFog/CompositeBGL"), entries: &composite_entries });
 
         let entry_pipeline = |label: &str, code: &str, entry: &str, bgl: &wgpu::BindGroupLayout| {
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -859,6 +913,9 @@ impl VolumetricFogEffect {
                 prev_view_proj: None,
                 last_camera_frame: None,
             },
+            smoke: None,
+            composite_entries,
+            media_entries,
         });
         self.bindings_dirty = true;
     }
@@ -926,12 +983,14 @@ impl VolumetricFogEffect {
     }
 
     #[cfg(test)]
-    pub(crate) fn shader_sources() -> [(&'static str, &'static str); 4] {
+    pub(crate) fn shader_sources() -> [(&'static str, &'static str); 6] {
         [
             ("volumetric_fog_inject", INJECT_WGSL),
             ("volumetric_fog_composite", COMPOSITE_WGSL),
             ("volumetric_fog_shafts", SHAFTS_WGSL),
             ("volumetric_fog_shafts_temporal", SHAFTS_TEMPORAL_WGSL),
+            ("volumetric_smoke_march", SMOKE_MARCH_WGSL),
+            ("volumetric_smoke_composite", SMOKE_COMPOSITE_WGSL),
         ]
     }
 }
@@ -1158,22 +1217,70 @@ impl PostProcessingEffect for VolumetricFogEffect {
             shafts_view = Some(history[current].clone());
         }
 
-        // 5. composite over the scene
-        let bind_group = self.bind_groups.get(device, &wgpu::BindGroupDescriptor {
-            label: Some("VolumetricFog/CompositeBG"),
-            layout: &gpu.composite_bgl,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(input) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(depth) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(output) },
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(gpu.grid.accum_view()) },
-                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&gpu.accum_sampler) },
-                wgpu::BindGroupEntry { binding: 5, resource: gpu.composite_params.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(shafts_view.as_ref().unwrap_or(&gpu.shafts.none)) },
-            ],
-        });
+        // 4b. the smoke, marched at half resolution through the fog's lights and froxels
+        let mut smoke_targets = None;
+        if let Some(handle) = self.smoke.as_ref().filter(|h| h.has_volumes()) {
+            if gpu.smoke.is_none() {
+                gpu.smoke = Some(SmokeRenderer::new(device, SMOKE_MARCH_WGSL, SMOKE_COMPOSITE_WGSL, &gpu.media_entries, &gpu.composite_entries));
+            }
+            let sky_lighting = self.sky_lighting.as_ref().unwrap_or(&gpu.dummy_sky_lighting);
+            let (occlusion_volume, occlusion_params) = match &self.sky_occlusion {
+                Some((volume, params)) => (volume, params),
+                None => (&gpu.dummy_occlusion_volume, &gpu.dummy_occlusion_params),
+            };
+            let clipmap_probes = self.clipmap_probes.as_ref().unwrap_or(&gpu.dummy_clipmap_probes);
+            let mut fog_entries = vec![
+                wgpu::BindGroupEntry { binding: 2, resource: gpu.fog_params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 10, resource: gpu.media_params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 11, resource: gpu.volumes.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 12, resource: sky_lighting.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 18, resource: wgpu::BindingResource::TextureView(occlusion_volume) },
+                wgpu::BindGroupEntry { binding: 19, resource: wgpu::BindingResource::Sampler(&gpu.accum_sampler) },
+                wgpu::BindGroupEntry { binding: 20, resource: occlusion_params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 21, resource: clipmap_probes[0].as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 22, resource: clipmap_probes[1].as_entire_binding() },
+            ];
+            fog_entries.extend(self.shadows.entries());
+            let view = SmokeView {
+                inv_view_proj: inv_vp,
+                view_proj: vp,
+                camera_pos: glam::Vec3::new(cam.x, cam.y, cam.z),
+                view_forward: -camera.inverse_view_matrix.to_glam().z_axis.truncate().normalize(),
+                camera_near: camera.near,
+                camera_far: camera.far,
+                camera_frame: camera.frame(),
+                grid_near: composite.grid_near,
+                grid_far: composite.grid_far,
+                grid_d: composite.grid_d,
+                full_size: (width, height),
+            };
+            let renderer = gpu.smoke.as_mut().unwrap();
+            smoke_targets = renderer
+                .march(device, queue, encoder, &self.bind_groups, handle, &self.smoke_render, &view, fog_entries, depth, gpu.grid.accum_view(), &gpu.accum_sampler)
+                .map(|t| (t.light.clone(), t.aux.clone()));
+        }
+
+        // 5. composite over the scene (with the smoke, when there is some)
+        let mut entries = vec![
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(input) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(depth) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(output) },
+            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(gpu.grid.accum_view()) },
+            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&gpu.accum_sampler) },
+            wgpu::BindGroupEntry { binding: 5, resource: gpu.composite_params.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(shafts_view.as_ref().unwrap_or(&gpu.shafts.none)) },
+        ];
+        let (pipeline, layout) = match (&smoke_targets, &gpu.smoke) {
+            (Some((light, aux)), Some(smoke)) => {
+                entries.push(wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::TextureView(light) });
+                entries.push(wgpu::BindGroupEntry { binding: 8, resource: wgpu::BindingResource::TextureView(aux) });
+                (&smoke.composite, &smoke.composite_bgl)
+            }
+            _ => (&gpu.composite_pipeline, &gpu.composite_bgl),
+        };
+        let bind_group = self.bind_groups.get(device, &wgpu::BindGroupDescriptor { label: Some("VolumetricFog/CompositeBG"), layout, entries: &entries });
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("VolumetricFog/Composite"), timestamp_writes: crate::profiling::gpu_pass("VolumetricFog/Composite").as_ref().map(crate::profiling::PassStamp::compute) });
-        pass.set_pipeline(&gpu.composite_pipeline);
+        pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
         pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
     }
@@ -1221,6 +1328,9 @@ mod tests {
         assert_eq!(sizes["LocalFogVolume"], std::mem::size_of::<LocalFogVolumeGpu>());
         assert_eq!(sizes["SkyLighting"] as u64, SKY_LIGHTING_BYTES);
         assert_eq!(sizes["ShaftParams"], std::mem::size_of::<ShaftParamsGpu>());
+        assert_eq!(sizes["SmokeFrame"], std::mem::size_of::<super::super::volumetric_smoke::SmokeFrameGpu>());
+        assert_eq!(sizes["SmokePush"], std::mem::size_of::<super::super::volumetric_smoke::SmokePushGpu>());
+        assert_eq!(sizes["SmokeVolumeData"], std::mem::size_of::<crate::simulations::smoke::SmokeVolumeGpu>());
     }
 
     #[test]

@@ -16,6 +16,7 @@ mod ssgi;
 mod taa;
 mod tonemap;
 mod volumetric_fog;
+mod volumetric_smoke;
 pub use atmosphere::AtmosphereEffect;
 pub use bloom::{BloomEffect, BloomOptions};
 pub use clouds::{CloudLayer, CloudQuality, VolumetricCloudsEffect, VolumetricCloudsOptions};
@@ -37,3 +38,4 @@ pub use tonemap::{
     LocalExposure, ToneMapOptions, ToneMapper, UnrealFilm, LENS_ATTENUATION_UE4, LENS_ATTENUATION_UE5,
 };
 pub use volumetric_fog::{LocalFogShape, LocalFogVolume, SpotScattering, VolumetricFogEffect, VolumetricFogOptions};
+pub use volumetric_smoke::SmokeRenderOptions;

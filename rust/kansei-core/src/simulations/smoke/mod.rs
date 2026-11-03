@@ -55,6 +55,7 @@ pub const MAX_SMOKE_RESOLUTION: u32 = 160;
 pub const CURL_NOISE_WGSL: &str = include_str!("shaders/curl_noise.wgsl");
 
 /// Curl noise and the volumes' data and box maths, for every smoke shader.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const SMOKE_COMMON_WGSL: &str = concat!(include_str!("shaders/curl_noise.wgsl"), include_str!("shaders/smoke_common.wgsl"));
 const FILL_WGSL: &str = concat!(include_str!("shaders/curl_noise.wgsl"), include_str!("shaders/smoke_common.wgsl"), include_str!("shaders/smoke_fill.wgsl"));
 

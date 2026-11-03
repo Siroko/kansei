@@ -311,6 +311,27 @@ impl SmokeVolume {
     }
 }
 
+/// Henyey-Greenstein, as the fog's.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn hg(cos_theta: f32, g: f32) -> f32 {
+    let g2 = g * g;
+    (1.0 - g2) * 0.0795774715 / (1.0 + g2 - 2.0 * g * cos_theta).powf(1.5)
+}
+
+/// WGSL `smokePhase`: single scattering through the smoke's shadow `tau` toward the light, plus
+/// two of Wrenninge's octaves for what it lost; the fog's phase when `tau` is 0.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn smoke_phase(cos_theta: f32, g: f32, tau: f32) -> f32 {
+    let single = (-tau).exp();
+    let mut p = hg(cos_theta, g) * single;
+    let mut a = 1.0;
+    for _ in 0..2 {
+        a *= 0.5;
+        p += a * hg(cos_theta, a * g) * ((-a * tau).exp() - single);
+    }
+    p
+}
+
 // ── GPU layouts (must match smoke_common.wgsl) ──
 
 #[repr(C)]
@@ -388,6 +409,15 @@ mod tests {
         assert_eq!(c.grid_dims(), [160; 3]);
         c.resolution = 1;
         assert_eq!(c.grid_dims(), [16; 3]);
+    }
+
+    #[test]
+    fn smoke_phase_is_the_fogs_where_thin() {
+        for c in [-0.9f32, 0.0, 0.7] {
+            assert_eq!(smoke_phase(c, 0.6, 0.0), hg(c, 0.6));
+        }
+        assert!(smoke_phase(0.3, 0.6, 2.0) < smoke_phase(0.3, 0.6, 1.0));
+        assert!(smoke_phase(0.3, 0.6, 2.0) > hg(0.3, 0.6) * (-2.0f32).exp());
     }
 
     #[test]

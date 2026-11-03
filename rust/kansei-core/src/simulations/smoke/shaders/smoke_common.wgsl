@@ -115,3 +115,25 @@ fn smokeEdgeFade(v: SmokeVolumeData, local: vec3f) -> f32 {
 fn smokeCellSize(v: SmokeVolumeData) -> f32 {
     return max(v.size.x, max(v.size.y, v.size.z)) / f32(max(v.dims.x, max(v.dims.y, v.dims.z)));
 }
+
+// Henyey-Greenstein, as the fog's henyeyGreenstein (volumetric_fog_inject.wgsl).
+fn smokeHG(cosTheta: f32, g: f32) -> f32 {
+    let g2 = g * g;
+    return (1.0 - g2) * 0.0795774715 / pow(1.0 + g2 - 2.0 * g * cosTheta, 1.5);
+}
+
+// The light a sample of smoke scatters toward the camera per unit of a light's radiance, with
+// `tau` the smoke's optical depth toward the light: single scattering through the smoke's own
+// shadow, plus two of Wrenninge's multiple-scattering octaves (each half the extinction and half
+// the anisotropy, at half the weight), counted only for what single scattering lost to the
+// shadow. With tau = 0 it is the fog's phase, so thin smoke scatters as the fog does.
+fn smokePhase(cosTheta: f32, g: f32, tau: f32) -> f32 {
+    let single = exp(-tau);
+    var p = smokeHG(cosTheta, g) * single;
+    var a = 1.0;
+    for (var o = 0; o < 2; o++) {
+        a *= 0.5;
+        p += a * smokeHG(cosTheta, a * g) * (exp(-a * tau) - single);
+    }
+    return p;
+}
