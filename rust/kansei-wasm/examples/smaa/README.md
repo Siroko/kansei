@@ -33,4 +33,35 @@ speed, and the grain; it shows SMAA's reach.
 
 ## Measured
 
+MacBook Pro, Apple M4 Pro (20-core GPU), headless Chrome 156 (WebGPU, vsync off, developer
+timestamps), 2026-11-03. The GPU was shared with other work, so the modes are alternated inside
+one page (`bench=1`) and compared only with each other. The final bench, with the grain applied
+after SMAA's blend (and by the tonemapper under TAA):
+
+```text
+bench 1920x1080, 4 rounds: SMAA 1.036 ms | TAA 1.147 ms; frame GPU 1.874 / 2.365 ms; interval 9.881 / 10.277 ms; velocity pass -0.000 / 0.321 ms
+round 1: SMAA 1.024 | TAA 0.960 ms
+round 2: SMAA 0.896 | TAA 1.229 ms
+round 3: SMAA 1.074 | TAA 1.238 ms
+round 4: SMAA 1.149 | TAA 1.160 ms
+SMAA cheaper than TAA: yes
+```
+
+- The frame's GPU time is 0.49 ms lower under SMAA (1.874 against 2.365 ms). Most of that is the
+  renderer's velocity pass, 0.321 ms a frame under TAA and skipped under SMAA, which reads no
+  motion vectors. (The report printed the skipped pass as -0.000, an empty sum's sign; it prints
+  0.000 now.)
+- The anti-aliasing passes alone: SMAA's three, 1.036 ms, against the TAA resolve's 1.147 ms,
+  about 10 % less on the mean; the resolve won round 1.
+
+SMAA was planned as one compute pass, and the checkpoint benches (before the grain and the
+velocity skip) timed two single-pass designs against these three passes and TAA. Both were
+slower than the three passes on this frame, so the three passes ship (`smaa.rs`'s module docs
+have the native numbers too):
+
+| single pass, in Chrome on this page | single pass | three passes | TAA resolve |
+|---|---|---|---|
+| 16 x 16 tiles, luma and edge bits in workgroup memory | 1.231 ms | 0.716 ms | 0.785 ms |
+| 32 x 32 tiles, 4 px an invocation, edges straight from the input | 1.554 ms | 0.830 ms | 1.050 ms |
+
 Build: `wasm-pack build --target web --release` here, serve this folder, open `www/`.

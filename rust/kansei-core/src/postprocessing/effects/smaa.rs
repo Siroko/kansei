@@ -43,6 +43,15 @@
 //! 16; [`SmaaOptions::reach`] takes up to 64), and there is no diagonal search (High has 8
 //! diagonal steps).
 //!
+//! # Cost
+//!
+//! In Chrome on an Apple M4 Pro at 1920 x 1080 (the `smaa` example's `bench=1`, its passes'
+//! timestamps over four rounds, 2026-11-03): the three passes, the film grain added in the blend,
+//! take 1.036 ms against `TemporalAAEffect`'s resolve's 1.147 ms (about 10 % less on the mean; the
+//! resolve won one round of four). The frame as a whole is 0.49 ms cheaper (1.874 against
+//! 2.365 ms), most of it the renderer's velocity pass (0.321 ms), skipped when no effect in the
+//! chain reads motion vectors.
+//!
 //! # What the reach costs
 //!
 //! The default reach, 16 px, against iryoku High's 32 (the same passes with `reach: 32`), at
