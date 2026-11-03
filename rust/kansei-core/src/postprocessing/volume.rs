@@ -301,10 +301,11 @@ impl PostProcessingVolume {
             self.ensure_display_targets(display_size);
         }
 
-        // Initialise effects that haven't been set up yet
+        // Initialise effects that haven't been set up yet, and tell them the surface
         {
             let gbuffer = self.gbuffer.as_ref().unwrap();
             for effect in &mut self.effects {
+                effect.set_surface_format(self.presentation_format);
                 effect.initialize(&self.device, gbuffer, camera);
             }
         }

@@ -277,10 +277,12 @@ struct Gpu {
 /// [`ColorGradingEffect`](super::ColorGradingEffect): SMAA finds edges by luma contrast and wants
 /// perceptual values. The tonemapper writes the display signal, sRGB-encoded with
 /// `encode_srgb` (browsers' `Bgra8Unorm` surfaces) and display-linear without it (sRGB
-/// surfaces), and the volume's blit copies the chain's last texture to the surface as is; tell
-/// this effect which it is, and the grain and dither the tonemapper leaves to it, with
-/// [`set_film`](Self::set_film) (the tonemapper's [`later_film`](super::ToneMapEffect::later_film)).
-/// It finds edges on the encoded luma either way and blends in linear light.
+/// surfaces), and the volume's blit copies the chain's last texture to the surface as is. By
+/// default this effect reads the signal the surface implies, as `ToneMapOptions::for_surface`
+/// writes it (the volume tells it the surface's format); [`set_film`](Self::set_film) with the
+/// tonemapper's [`later_film`](super::ToneMapEffect::later_film) says it explicitly, and hands it
+/// the grain and dither the tonemapper leaves to it. It finds edges on the encoded luma either way
+/// and blends in linear light.
 ///
 /// It renders at full resolution (it is no upscaler), asks for no camera jitter and reads no
 /// motion vectors (a chain with it and no TAA skips the renderer's velocity pass).
@@ -296,7 +298,10 @@ struct Gpu {
 /// ```
 pub struct SmaaEffect {
     pub options: SmaaOptions,
-    film: FilmGrain,
+    /// What `set_film` gave; until then the surface decides the encoding, and there is no film.
+    film: Option<FilmGrain>,
+    /// The display signal is sRGB-encoded when nobody says: the surface isn't sRGB (the web's).
+    surface_encoded: bool,
     frame: u32,
     gpu: Option<Gpu>,
     /// the bind groups its passes make from the frame's resources, kept
@@ -308,21 +313,25 @@ impl SmaaEffect {
     pub const REACH: u32 = 16;
 
     pub fn new(options: SmaaOptions) -> Self {
-        Self { options, film: FilmGrain::default(), frame: 0, gpu: None, bind_groups: Default::default() }
+        Self { options, film: None, surface_encoded: true, frame: 0, gpu: None, bind_groups: Default::default() }
     }
 
     /// The signal it reads (`encode_srgb`) and the film it adds after blending: the tonemapper's
     /// [`later_film`](super::ToneMapEffect::later_film), each frame.
+    /// It wins over the surface's format from then on.
     pub fn set_film(&mut self, film: FilmGrain) {
-        self.film = film;
+        self.film = Some(film);
     }
 
+    /// The signal it reads and the film it adds: what `set_film` gave, else no film on the
+    /// signal the surface implies (display-linear for an sRGB surface, sRGB-encoded otherwise, as
+    /// `ToneMapOptions::for_surface` writes it).
     pub fn film(&self) -> FilmGrain {
-        self.film
+        self.film.unwrap_or(FilmGrain { encode_srgb: self.surface_encoded, ..Default::default() })
     }
 
     fn params(&self, width: u32, height: u32) -> SmaaParamsGpu {
-        let (o, f) = (&self.options, &self.film);
+        let (o, f) = (&self.options, &self.film());
         SmaaParamsGpu {
             size: [width, height],
             threshold: o.threshold,
@@ -445,6 +454,10 @@ impl PostProcessingEffect for SmaaEffect {
         self.encode(device, encoder, input, output, width, height);
     }
 
+    fn set_surface_format(&mut self, format: wgpu::TextureFormat) {
+        self.surface_encoded = !format.is_srgb();
+    }
+
     // The intermediates follow the size `render` is given.
     fn resize(&mut self, _width: u32, _height: u32, _gbuffer: &GBuffer) {}
 
@@ -501,6 +514,25 @@ mod tests {
             .unwrap();
         assert_eq!(span, std::mem::size_of::<SmaaParamsGpu>());
         assert_eq!(span, 48);
+    }
+
+    /// Until `set_film` says otherwise, the surface decides how the display signal is encoded: an
+    /// sRGB surface (native) gets it display-linear, any other (the web's) sRGB-encoded.
+    #[test]
+    fn the_surface_decides_the_encoding_until_set_film() {
+        let mut smaa = SmaaEffect::new(Default::default());
+        assert!(smaa.film().encode_srgb, "before any surface: encoded, as the web's");
+        smaa.set_surface_format(wgpu::TextureFormat::Bgra8UnormSrgb);
+        assert_eq!(smaa.film(), FilmGrain { encode_srgb: false, ..Default::default() });
+        assert_eq!(smaa.params(64, 64).flags & FLAG_ENCODED, 0);
+        smaa.set_surface_format(wgpu::TextureFormat::Bgra8Unorm);
+        assert!(smaa.film().encode_srgb);
+        assert_eq!(smaa.params(64, 64).flags & FLAG_ENCODED, FLAG_ENCODED);
+        // set_film is explicit and wins over the surface
+        let film = FilmGrain { encode_srgb: true, grain: 0.3, grain_size: 1.6, dither: true };
+        smaa.set_film(film);
+        smaa.set_surface_format(wgpu::TextureFormat::Rgba8UnormSrgb);
+        assert_eq!(smaa.film(), film);
     }
 
     #[test]

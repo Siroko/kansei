@@ -273,6 +273,57 @@ fn a_linear_signal_gives_the_encoded_signal_s_image() {
     assert!(moved >= 50, "only {moved} pixels blended");
 }
 
+/// A native app on an sRGB surface that never calls `set_film`: its tonemapper writes
+/// display-linear light (`ToneMapOptions::for_surface`), and SMAA, told the surface's format as a
+/// volume tells it, reads it as linear (edges on the encoded luma, blends in linear light): the
+/// image an explicit `encode_srgb: false` gives, not the one an encoded signal would.
+#[test]
+fn an_srgb_surface_without_set_film_reads_a_linear_signal() {
+    let Some(dev) = gpu() else { return eprintln!("no GPU adapter: skipping") };
+    let (w, h) = (250, 190);
+    for kind in [Kind::RotatedSquare, Kind::NearHorizontal, Kind::FaintBright] {
+        let linear: Vec<[f32; 3]> = image(kind, w, h).iter().map(|c| c.map(srgb_decode)).collect();
+        let mut fx = SmaaEffect::new(SmaaOptions::default());
+        fx.set_surface_format(wgpu::TextureFormat::Bgra8UnormSrgb);
+        let surface = render_with(&dev, &mut fx, &linear, w, h);
+        let explicit = run(&dev, &linear, w, h, FilmGrain { encode_srgb: false, ..Default::default() });
+        assert!(surface == explicit, "{kind:?}: the sRGB surface's default differs from encode_srgb: false");
+        let encoded = run(&dev, &linear, w, h, FilmGrain::default());
+        assert!(surface != encoded, "{kind:?}: not vacuous, read as encoded it would differ");
+    }
+}
+
+/// A `PostProcessingVolume` hands its surface's format to its effects: on the headless renderer's
+/// sRGB surface, a chain of a tonemapper for that surface and an `SmaaEffect` nobody called
+/// `set_film` on reads display-linear light.
+#[test]
+fn a_volume_tells_smaa_its_surface() {
+    use kansei_core::postprocessing::PostProcessingVolume;
+    use kansei_core::renderers::{Renderer, RendererConfig};
+    let instance = wgpu::Instance::default();
+    let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())) else { return eprintln!("no GPU adapter: skipping") };
+    let mut renderer = Renderer::new(RendererConfig { width: 64, height: 64, sample_count: 1, ..Default::default() });
+    pollster::block_on(renderer.initialize_headless(&adapter));
+    let format = renderer.presentation_format();
+    assert!(format.is_srgb(), "the headless renderer's surface: {format:?}");
+    let effects: Vec<Box<dyn PostProcessingEffect>> = vec![Box::new(ToneMapEffect::new(ToneMapOptions::for_surface(format))), Box::new(SmaaEffect::new(SmaaOptions::default()))];
+    let mut volume = PostProcessingVolume::new(&renderer, effects);
+    assert!(volume.effect::<SmaaEffect>().unwrap().film().encode_srgb, "before its first frame");
+    let surface = renderer.device().create_texture(&wgpu::TextureDescriptor {
+        label: None,
+        size: wgpu::Extent3d { width: 64, height: 64, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    volume.render(&Camera::new(60.0, 0.1, 100.0, 1.0), &surface.create_view(&Default::default()), 64, 64);
+    let _ = renderer.device().poll(wgpu::PollType::wait_indefinitely());
+    assert!(!volume.effect::<SmaaEffect>().unwrap().film().encode_srgb, "SMAA reads the sRGB surface's signal as linear");
+}
+
 /// One effect resized back and forth renders what a fresh one does (its edges and weights follow
 /// the frame's size).
 #[test]
