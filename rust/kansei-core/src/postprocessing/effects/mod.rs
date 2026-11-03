@@ -11,6 +11,7 @@ mod fluid_surface;
 mod height_fog;
 mod motion_blur;
 mod screen_space_glass;
+mod smaa;
 mod ssao;
 mod ssgi;
 mod taa;
@@ -29,11 +30,12 @@ pub use fluid_surface::{FluidGlassSurface, FluidMask, FluidSurfaceEffect, FluidS
 pub use height_fog::{HeightFogEffect, HeightFogLayer};
 pub use motion_blur::{MotionBlurEffect, MotionBlurOptions};
 pub use screen_space_glass::{ScreenSpaceGlassEffect, ScreenSpaceGlassOptions};
+pub use smaa::{SmaaEffect, SmaaMode, SmaaOptions};
 pub use ssao::{SSAOAmbient, SSAOEffect, SSAOOptions};
 pub use ssgi::{GiQuality, ScreenSpaceGIEffect, ScreenSpaceGIOptions};
 pub use taa::{TemporalAAEffect, TemporalAAOptions};
 pub use tonemap::{
-    ev100_from_camera, exposure_from_ev100, exposure_from_ev100_lens, unreal_white_balance_matrix, white_balance_matrix, ColorGrade, ToneMapEffect,
-    LocalExposure, ToneMapOptions, ToneMapper, UnrealFilm, LENS_ATTENUATION_UE4, LENS_ATTENUATION_UE5,
+    ev100_from_camera, exposure_from_ev100, exposure_from_ev100_lens, unreal_white_balance_matrix, white_balance_matrix, ColorGrade, FilmGrain,
+    ToneMapEffect, LocalExposure, ToneMapOptions, ToneMapper, UnrealFilm, LENS_ATTENUATION_UE4, LENS_ATTENUATION_UE5,
 };
 pub use volumetric_fog::{LocalFogShape, LocalFogVolume, SpotScattering, VolumetricFogEffect, VolumetricFogOptions};

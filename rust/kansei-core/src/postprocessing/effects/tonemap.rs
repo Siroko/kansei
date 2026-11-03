@@ -251,6 +251,26 @@ impl ToneMapOptions {
     }
 }
 
+/// The display signal [`SmaaEffect`](super::SmaaEffect) reads (the tonemapper's output), and the
+/// film it adds after blending: the tonemapper's grain and dither, left to it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FilmGrain {
+    /// The signal is sRGB-encoded (`ToneMapOptions::encode_srgb`); display-linear otherwise.
+    pub encode_srgb: bool,
+    /// Grain amplitude, 0 = off (`ToneMapOptions::grain`).
+    pub grain: f32,
+    /// Grain size in pixels (`ToneMapOptions::grain_size`).
+    pub grain_size: f32,
+    /// Triangular dither of one 8-bit step (`ToneMapOptions::dither`).
+    pub dither: bool,
+}
+
+impl Default for FilmGrain {
+    fn default() -> Self {
+        Self { encode_srgb: true, grain: 0.0, grain_size: 1.6, dither: false }
+    }
+}
+
 // ── White balance ──
 
 /// CIE 1931 xy of the Planckian locus at `kelvin` (Kim et al. 2002 cubic fit, 1667-25000 K).
