@@ -5,7 +5,7 @@ use crate::math::Vec3;
 use crate::postprocessing::PostProcessingEffect;
 use crate::renderers::GBuffer;
 
-const WGSL: &str = concat!(include_str!("../../shaders/tonemap_params.wgsl"), include_str!("../../shaders/tonemap.wgsl"));
+const WGSL: &str = concat!(include_str!("../../shaders/tonemap_params.wgsl"), include_str!("../../shaders/film_grain.wgsl"), include_str!("../../shaders/tonemap.wgsl"));
 const LOCAL_EXPOSURE_WGSL: &str = concat!(include_str!("../../shaders/tonemap_params.wgsl"), include_str!("../../shaders/local_exposure.wgsl"));
 
 /// The lens attenuation q of Unreal Engine 5 (`r.EyeAdaptation.LensAttenuation`), with which
@@ -214,6 +214,12 @@ pub struct ToneMapOptions {
     pub encode_srgb: bool,
     /// Triangular dither of one 8-bit step against banding.
     pub dither: bool,
+    /// Leave the grain and the dither to a later pass that applies them:
+    /// [`SmaaEffect`](super::SmaaEffect), given [`ToneMapEffect::later_film`] each frame, adds
+    /// them after its blend, so it doesn't smooth the grain as edges. Without such a pass the
+    /// picture has neither. The vignette and the chromatic aberration stay here (they work on
+    /// scene light and are smooth).
+    pub defer_film: bool,
     /// Unreal's local exposure; off when `None`.
     pub local_exposure: Option<LocalExposure>,
     /// The aspect (width / height) of the frame the picture is the centre crop of, when it is
@@ -237,6 +243,7 @@ impl Default for ToneMapOptions {
             grain_size: 1.6,
             encode_srgb: true,
             dither: true,
+            defer_film: false,
             local_exposure: None,
             frame_aspect: None,
         }
@@ -248,6 +255,26 @@ impl ToneMapOptions {
     /// (`renderer.presentation_format()`): encode unless the surface is sRGB already.
     pub fn for_surface(format: wgpu::TextureFormat) -> Self {
         Self { encode_srgb: !format.is_srgb(), ..Default::default() }
+    }
+}
+
+/// The display signal [`SmaaEffect`](super::SmaaEffect) reads (the tonemapper's output), and the
+/// film it adds after blending: the tonemapper's grain and dither, left to it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FilmGrain {
+    /// The signal is sRGB-encoded (`ToneMapOptions::encode_srgb`); display-linear otherwise.
+    pub encode_srgb: bool,
+    /// Grain amplitude, 0 = off (`ToneMapOptions::grain`).
+    pub grain: f32,
+    /// Grain size in pixels (`ToneMapOptions::grain_size`).
+    pub grain_size: f32,
+    /// Triangular dither of one 8-bit step (`ToneMapOptions::dither`).
+    pub dither: bool,
+}
+
+impl Default for FilmGrain {
+    fn default() -> Self {
+        Self { encode_srgb: true, grain: 0.0, grain_size: 1.6, dither: false }
     }
 }
 
@@ -425,6 +452,8 @@ struct ToneMapParamsGpu {
 const FLAG_ENCODE_SRGB: u32 = 1;
 const FLAG_DITHER: u32 = 2;
 const FLAG_LOCAL_EXPOSURE: u32 = 4;
+/// Grain and dither left to a later pass (tonemap.wgsl's FLAG_DEFER_FILM).
+const FLAG_DEFER_FILM: u32 = 8;
 /// Half-resolution texels per side of a bilateral grid cell (local_exposure.wgsl's LOCAL_CELL).
 const LOCAL_CELL: u32 = 64;
 /// Bins of the grid.
@@ -491,6 +520,19 @@ impl ToneMapEffect {
         self.options.exposure * 2f32.powf(self.options.exposure_compensation)
     }
 
+    /// What a later pass gets of the picture: the signal it reads (`encode_srgb`), and the grain
+    /// and dither to add when `defer_film` leaves them to it (none otherwise). Hand it to
+    /// [`SmaaEffect::set_film`](super::SmaaEffect::set_film) each frame.
+    pub fn later_film(&self) -> FilmGrain {
+        let o = &self.options;
+        FilmGrain {
+            encode_srgb: o.encode_srgb,
+            grain: if o.defer_film { o.grain.max(0.0) } else { 0.0 },
+            grain_size: o.grain_size.max(1.0),
+            dither: o.defer_film && o.dither,
+        }
+    }
+
     fn params(&self, width: u32, height: u32) -> ToneMapParamsGpu {
         let o = &self.options;
         let g = &o.grade;
@@ -522,7 +564,10 @@ impl ToneMapEffect {
             height,
             frame: self.frame,
             tonemapper: o.tonemapper.gpu_id(),
-            flags: if o.encode_srgb { FLAG_ENCODE_SRGB } else { 0 } | if o.dither { FLAG_DITHER } else { 0 } | if o.local_exposure.is_some() { FLAG_LOCAL_EXPOSURE } else { 0 },
+            flags: if o.encode_srgb { FLAG_ENCODE_SRGB } else { 0 }
+                | if o.dither { FLAG_DITHER } else { 0 }
+                | if o.local_exposure.is_some() { FLAG_LOCAL_EXPOSURE } else { 0 }
+                | if o.defer_film { FLAG_DEFER_FILM } else { 0 },
             frame_aspect: o.frame_aspect.unwrap_or(0.0).max(0.0),
             film: [f.slope, f.toe, f.shoulder, f.black_clip],
             film2: [f.white_clip, f.blue_correction.clamp(0.0, 1.0), f.expand_gamut.max(0.0), 1.0],
@@ -758,6 +803,11 @@ impl PostProcessingEffect for ToneMapEffect {
 
     fn destroy(&mut self) {
         self.gpu = None;
+    }
+
+    // never binds the GBuffer's velocity: a chain of such effects skips the velocity pass
+    fn reads_velocity(&self) -> bool {
+        false
     }
 
     fn as_any(&self) -> &dyn std::any::Any { self }
@@ -1050,6 +1100,13 @@ mod tests {
         fx.options.encode_srgb = true;
         fx.options.dither = false;
         assert_eq!(fx.params(640, 360).flags, FLAG_ENCODE_SRGB);
+        fx.options.defer_film = true;
+        assert_eq!(fx.params(640, 360).flags & FLAG_DEFER_FILM, FLAG_DEFER_FILM);
+        fx.options.grain = 0.4;
+        fx.options.dither = true;
+        assert_eq!(fx.later_film(), FilmGrain { encode_srgb: true, grain: 0.4, grain_size: 1.6, dither: true });
+        fx.options.defer_film = false;
+        assert_eq!(fx.later_film(), FilmGrain { encode_srgb: true, grain: 0.0, grain_size: 1.6, dither: false });
     }
 
     /// Unreal's white balance matrix, against a transcription of TonemapCommon.ush's

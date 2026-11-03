@@ -150,6 +150,7 @@ Both engines have these features unless an item is marked (Rust) or (TS).
 **Post-processing**
 - Physical tone mapping with EV100 exposure and film curves, colour grading, bloom
 - Temporal AA, motion blur, SSAO, god rays (TS)
+- SMAA, a single-frame anti-aliasing for fast motion where TAA smears, in three compute passes (Rust)
 - Physical-lens depth of field with scattered bokeh
 - Contact AO, a stylised darkening where surfaces meet (Rust)
 - Distance fog: far surfaces fade into a colour, or into the gradient-sky dome behind them (Rust)
@@ -570,4 +571,5 @@ MIT, see [LICENSE](LICENSE). Some example assets carry their own licences, noted
 (for instance the Stanford dragon in `rust/kansei-wasm/examples/gi-box/www/assets/license.txt`).
 The engine uses [gl-matrix](https://github.com/toji/gl-matrix) (MIT), [wgpu](https://wgpu.rs/)
 and [glam](https://github.com/bitshifter/glam-rs) (MIT/Apache-2.0), and the Basis Universal
-transcoder (Apache-2.0).
+transcoder (Apache-2.0). `SmaaEffect` embeds SMAA's area texture and ports its shaders
+([iryoku/smaa](https://github.com/iryoku/smaa), Jimenez et al., MIT).

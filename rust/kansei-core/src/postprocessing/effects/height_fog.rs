@@ -293,6 +293,11 @@ impl PostProcessingEffect for HeightFogEffect {
         self.gpu = None;
     }
 
+    // never binds the GBuffer's velocity: a chain of such effects skips the velocity pass
+    fn reads_velocity(&self) -> bool {
+        false
+    }
+
     fn as_any(&self) -> &dyn std::any::Any { self }
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
 }

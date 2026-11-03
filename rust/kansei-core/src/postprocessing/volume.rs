@@ -98,6 +98,12 @@ impl PostProcessingVolume {
         self.effects.iter().any(|e| self.runs(e.as_ref()) && e.wants_jitter())
     }
 
+    /// Whether any effect that runs reads the GBuffer's velocity (the renderer draws its velocity
+    /// pass only then; `PostProcessingEffect::reads_velocity`).
+    pub fn reads_velocity(&self) -> bool {
+        reads_velocity(&self.disabled, &self.effects)
+    }
+
     /// Run the chain's effects of type `T` (the default) or skip them: a skipped effect costs
     /// nothing, the next one reading what it would have read, and keeps its place, state and
     /// resources for when it runs again (reset a temporal one's history then). A toggle for any
@@ -295,10 +301,11 @@ impl PostProcessingVolume {
             self.ensure_display_targets(display_size);
         }
 
-        // Initialise effects that haven't been set up yet
+        // Initialise effects that haven't been set up yet, and tell them the surface
         {
             let gbuffer = self.gbuffer.as_ref().unwrap();
             for effect in &mut self.effects {
+                effect.set_surface_format(self.presentation_format);
                 effect.initialize(&self.device, gbuffer, camera);
             }
         }
@@ -413,11 +420,19 @@ fn runs(disabled: &[std::any::TypeId], effect: &dyn PostProcessingEffect) -> boo
     effect.is_active() && !disabled.contains(&effect.as_any().type_id())
 }
 
+/// Whether an effect of `effects` that runs reads the GBuffer's velocity.
+fn reads_velocity(disabled: &[std::any::TypeId], effects: &[Box<dyn PostProcessingEffect>]) -> bool {
+    effects.iter().any(|e| runs(disabled, e.as_ref()) && e.reads_velocity())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    struct Probe(bool);
+    struct Probe {
+        active: bool,
+        reads: bool,
+    }
 
     impl PostProcessingEffect for Probe {
         fn initialize(&mut self, _: &wgpu::Device, _: &GBuffer, _: &Camera) {}
@@ -425,7 +440,10 @@ mod tests {
         fn render(&mut self, _: &wgpu::Device, _: &wgpu::Queue, _: &mut wgpu::CommandEncoder, _: &GBuffer, _: &wgpu::TextureView, _: &wgpu::TextureView, _: &wgpu::TextureView, _: &Camera, _: u32, _: u32) {}
         fn resize(&mut self, _: u32, _: u32, _: &GBuffer) {}
         fn is_active(&self) -> bool {
-            self.0
+            self.active
+        }
+        fn reads_velocity(&self) -> bool {
+            self.reads
         }
         fn destroy(&mut self) {}
         fn as_any(&self) -> &dyn std::any::Any {
@@ -440,10 +458,20 @@ mod tests {
     /// the others.
     #[test]
     fn a_skipped_type_does_not_run() {
-        let probe = Probe(true);
+        let probe = Probe { active: true, reads: true };
         assert!(runs(&[], &probe));
         assert!(!runs(&[std::any::TypeId::of::<Probe>()], &probe));
         assert!(runs(&[std::any::TypeId::of::<u32>()], &probe));
-        assert!(!runs(&[], &Probe(false)));
+        assert!(!runs(&[], &Probe { active: false, reads: true }));
+    }
+
+    /// The velocity pass runs for a chain only through an effect that runs and reads it.
+    #[test]
+    fn a_chain_reads_velocity_only_through_a_running_effect_that_reads_it() {
+        let probe = |active, reads| -> Box<dyn PostProcessingEffect> { Box::new(Probe { active, reads }) };
+        assert!(!reads_velocity(&[], &[probe(true, false), probe(true, false)]));
+        assert!(reads_velocity(&[], &[probe(true, false), probe(true, true)]));
+        assert!(!reads_velocity(&[], &[probe(false, true)]));
+        assert!(!reads_velocity(&[std::any::TypeId::of::<Probe>()], &[probe(true, true)]));
     }
 }

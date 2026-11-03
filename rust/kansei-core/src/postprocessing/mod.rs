@@ -19,7 +19,9 @@
 //! 7. bloom (scattering in the lens, on scene light);
 //! 8. [`effects::ToneMapEffect`] (exposure, lens vignetting and fringing, grade, tone curve, grain,
 //!    output encoding);
-//! 9. display-space tweaks such as [`effects::ColorGradingEffect`].
+//! 9. display-space tweaks such as [`effects::ColorGradingEffect`];
+//! 10. [`effects::SmaaEffect`], last, on the display signal: a single-frame anti-aliasing picked
+//!     *instead of* the TAA of step 4 (for fast motion, where the TAA's history smears).
 
 pub mod effects;
 

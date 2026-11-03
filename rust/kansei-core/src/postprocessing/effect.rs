@@ -40,6 +40,13 @@ pub trait PostProcessingEffect {
     fn upscales_to_display(&self) -> bool {
         false
     }
+    /// Whether the effect binds the GBuffer's velocity texture. The renderer skips its velocity
+    /// pass on frames when no running effect of the chain reads it (the texture then keeps an
+    /// older frame's vectors). True by default; return false only from an effect that never binds
+    /// `gbuffer.velocity_view`.
+    fn reads_velocity(&self) -> bool {
+        true
+    }
     fn destroy(&mut self);
     /// Light by this environment (`environment::EnvironmentLighting`, from a
     /// `GradientEnvironment`, `SkyAtmosphere::lighting` or an `HdrEnvironment`): an effect that
@@ -47,6 +54,12 @@ pub trait PostProcessingEffect {
     /// place of the one it had. `PostProcessingVolume::set_environment` hands it to every effect.
     /// Nothing by default.
     fn set_environment(&mut self, _environment: &crate::environment::EnvironmentLighting) {}
+    /// The format of the surface the volume's blit copies the chain's last image to
+    /// (`Renderer::presentation_format`). An sRGB surface encodes on write, so a display signal
+    /// for it is display-linear (`ToneMapOptions::for_surface`); any other surface shows the
+    /// values as they are. `PostProcessingVolume` hands it to every effect before each frame.
+    /// Nothing by default.
+    fn set_surface_format(&mut self, _format: wgpu::TextureFormat) {}
     /// A short name for profiling (the type's name by default).
     fn name(&self) -> &'static str {
         let path = std::any::type_name::<Self>();
