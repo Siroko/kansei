@@ -166,7 +166,7 @@
           <li><a href="#rendering">Rendering</a></li>
           <li hidden><a href="#lighting">Lighting and shadows</a></li>
           <li><a href="#gi">GI and ray tracing</a></li>
-          <li hidden><a href="#atmosphere">Atmosphere and fog</a></li>
+          <li><a href="#atmosphere">Atmosphere and fog</a></li>
           <li><a href="#post">Post-processing</a></li>
           <li><a href="#visibility">Visibility, LOD and reflections</a></li>
           <li><a href="#fluid">Fluid</a></li>
@@ -305,7 +305,7 @@
         </ul>
       </section>
 
-      <section class="area" id="atmosphere" hidden aria-labelledby="atmosphere-title">
+      <section class="area" id="atmosphere" aria-labelledby="atmosphere-title">
         <h2 class="label label-spaced" id="atmosphere-title">Atmosphere and fog</h2>
         <ul class="example-list examples">
           <li hidden>
@@ -322,6 +322,16 @@
             <span class="run">
               <a class="run-ts" href="./index_volumetric_fog.html" title="TypeScript">TS</a>
               <a class="run-rust" href="/examples/volumetric-fog/" data-rust title="Rust / WASM">WASM</a>
+            </span>
+          </li>
+          <li>
+            <span class="demo-name">Volumetric smoke</span>
+            <span class="demo-desc">Steam rising off a cup in a dark room, lit by a low sun through the window and the fog's own shadow map, stirred by the mouse: a grid fluid with buoyancy and vorticity, curl noise or sines, with smoke hanging in the room in sheets to switch on</span>
+            <span class="run">
+              <a class="run-rust" href="/examples/smoke/" data-rust title="Rust / WASM">WASM</a>
+              <a class="run-rust run-variant" href="/examples/smoke/?motion=curl" data-rust title="Advected by curl noise and a rise (Rust / WASM)">Curl noise</a>
+              <a class="run-rust run-variant" href="/examples/smoke/?motion=waves" data-rust title="Swayed by sums of sines, no simulation (Rust / WASM)">Waves</a>
+              <a class="run-rust run-variant" href="/examples/smoke/?layers=1" data-rust title="Smoke hanging in the room in sheets (Rust / WASM)">Layers</a>
             </span>
           </li>
           <li hidden>
