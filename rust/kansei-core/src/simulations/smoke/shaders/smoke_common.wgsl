@@ -137,3 +137,9 @@ fn smokePhase(cosTheta: f32, g: f32, tau: f32) -> f32 {
     }
     return p;
 }
+
+// The Curl noise level's velocity at a world point, m/s: curl noise of the volume's scale and
+// speed, times its strength, and its rise (divergence-free, so the gas neither piles up nor thins).
+fn smokeCurlVelocity(v: SmokeVolumeData, p: vec3f, time: f32) -> vec3f {
+    return curlNoise(p / v.curlScale, time * v.curlSpeed) * v.curlStrength + vec3f(0.0, v.curlRise, 0.0);
+}

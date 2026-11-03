@@ -50,11 +50,14 @@ fn curlNoiseGradient(p: vec3f) -> vec4f {
     return vec4f(value, grad);
 }
 
-// Two octaves of one potential component, offset by `seed` and drifting with `time`.
+// Two octaves of one potential component, offset by `seed` and drifting with `time`: 2 n(p / 2)
+// + n(p), (value, d/dp). The coarse octave's lattice is two units, so the eddies are about a
+// unit across and the velocity about unit speed.
 fn curlNoiseComponent(p: vec3f, time: f32, seed: vec3f, drift: vec3f) -> vec4f {
-    let a = curlNoiseGradient(p + seed + drift * time);
-    let b = curlNoiseGradient(p * 2.0 + seed.zxy + drift.yzx * (time * 1.7));
-    return a + vec4f(b.x * 0.5, b.yzw);   // d/dp of 0.5 n(2p) is n'(2p)
+    let a = curlNoiseGradient(p * 0.5 + seed + drift * time);
+    let b = curlNoiseGradient(p + seed.zxy + drift.yzx * (time * 1.7));
+    // d/dp of 2 n(p / 2) is n'(p / 2)
+    return vec4f(2.0 * a.x + b.x, a.yzw + b.yzw);
 }
 
 // The potential psi(p, time) whose curl curlNoise is.
@@ -66,7 +69,8 @@ fn curlNoisePotential(p: vec3f, time: f32) -> vec3f {
     );
 }
 
-// The curl of curlNoisePotential at p: a divergence-free velocity of about unit size.
+// The curl of curlNoisePotential at p: a divergence-free velocity of about unit speed, its
+// eddies about a unit across.
 fn curlNoise(p: vec3f, time: f32) -> vec3f {
     let a = curlNoiseComponent(p, time, vec3f(0.0, 0.0, 0.0), vec3f(0.31, 0.17, -0.23)).yzw;
     let b = curlNoiseComponent(p, time, vec3f(31.4, -17.2, 9.1), vec3f(-0.19, 0.29, 0.13)).yzw;

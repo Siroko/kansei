@@ -40,7 +40,10 @@ impl Default for WavesSettings {
 pub struct CurlSettings {
     /// The noise velocity's scale, m/s.
     pub strength: f32,
-    /// The noise's feature size, metres.
+    /// The noise's feature size (its eddies' radius), metres. Keep it at least about 16 of the
+    /// volume's cells: eddies the grid can't resolve tear the gas into filaments thinner than a
+    /// cell, which blur, and the advection's limiter then adds gas to them (some 40% a second at
+    /// 5 cells, a few percent at 18).
     pub scale: f32,
     /// How fast the noise changes, per second.
     pub speed: f32,

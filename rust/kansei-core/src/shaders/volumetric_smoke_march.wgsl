@@ -94,9 +94,10 @@ fn smokeVelocityGridAt(i: u32, uvw: vec3f) -> vec4f {
 }
 
 // Volume i's gas velocity at a point of its unit cube, m/s along the box's axes: its MAC grid's
-// (Fluid), zero on the levels with no velocity grid.
+// (Fluid), its noise's (Curl noise), zero on Waves.
 fn smokeVolumeVelocity(i: u32, local: vec3f) -> vec3f {
     let v = sf.volumes[i];
+    if (v.motion == SMOKE_CURL) { return smokeVecToBox(v, smokeCurlVelocity(v, smokeLocalToWorld(v, local), sf.time)); }
     if (v.motion != SMOKE_FLUID) { return vec3f(0.0); }
     let d = vec3f(v.dims);
     let c = local * d;

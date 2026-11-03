@@ -289,3 +289,89 @@ fn the_default_plume_fades_before_the_lid() {
     assert!(max_density <= 1.05 * 4.0 / dissipation && max_temperature <= 1.001, "max density {max_density}, max temperature {max_temperature}");
 }
 
+
+#[test]
+fn the_curl_noise_velocity_is_divergence_free() {
+    let Some((device, queue)) = gpu() else { return };
+    // curlNoise and, as a control, the gradient of the potential's x (not divergence-free), on a
+    // 32^3 lattice of spacing h (noise units)
+    const N: u32 = 32;
+    let h = 1.0f32 / 8.0;
+    let code = format!(
+        "{CURL_NOISE_WGSL}\n\
+        @group(0) @binding(0) var<storage, read_write> out : array<vec4f>;\n\
+        @compute @workgroup_size(4, 4, 4) fn main(@builtin(global_invocation_id) g : vec3u) {{\n\
+            if (any(g >= vec3u({N}u))) {{ return; }}\n\
+            let p = vec3f(g) * {h} + vec3f(0.3, 1.7, -2.1);\n\
+            let i = (g.z * {N}u + g.y) * {N}u + g.x;\n\
+            out[2u * i] = vec4f(curlNoise(p, 0.37), 0.0);\n\
+            let e = 1e-3;\n\
+            let gx = (curlNoisePotential(p + vec3f(e, 0.0, 0.0), 0.37).x - curlNoisePotential(p - vec3f(e, 0.0, 0.0), 0.37).x) / (2.0 * e);\n\
+            let gy = (curlNoisePotential(p + vec3f(0.0, e, 0.0), 0.37).x - curlNoisePotential(p - vec3f(0.0, e, 0.0), 0.37).x) / (2.0 * e);\n\
+            let gz = (curlNoisePotential(p + vec3f(0.0, 0.0, e), 0.37).x - curlNoisePotential(p - vec3f(0.0, 0.0, e), 0.37).x) / (2.0 * e);\n\
+            out[2u * i + 1u] = vec4f(gx, gy, gz, 0.0);\n\
+        }}"
+    );
+    let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(code.into()) });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: None, module: &module, entry_point: Some("main"), compilation_options: Default::default(), cache: None });
+    let size = (N * N * N * 2 * 16) as u64;
+    let out = device.create_buffer(&wgpu::BufferDescriptor { label: None, size, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
+    let read = device.create_buffer(&wgpu::BufferDescriptor { label: None, size, usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
+    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: &pipeline.get_bind_group_layout(0), entries: &[wgpu::BindGroupEntry { binding: 0, resource: out.as_entire_binding() }] });
+    let mut e = device.create_command_encoder(&Default::default());
+    {
+        let mut pass = e.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.dispatch_workgroups(N / 4, N / 4, N / 4);
+    }
+    e.copy_buffer_to_buffer(&out, 0, &read, 0, size);
+    queue.submit([e.finish()]);
+    read.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    let data: Vec<[f32; 4]> = bytemuck::cast_slice(&read.slice(..).get_mapped_range().unwrap()).to_vec();
+    let field = |k: usize| -> Vec<[f32; 3]> { (0..(N * N * N) as usize).map(|i| { let v = data[2 * i + k]; [v[0], v[1], v[2]] }).collect() };
+    let (curl, gradient) = (field(0), field(1));
+    let mean_abs_central_div = |v: &[[f32; 3]], h: f32| {
+        let at = |x: u32, y: u32, z: u32| v[((z * N + y) * N + x) as usize];
+        let (mut sum, mut n) = (0.0f64, 0);
+        for z in 1..N - 1 {
+            for y in 1..N - 1 {
+                for x in 1..N - 1 {
+                    let div = (at(x + 1, y, z)[0] - at(x - 1, y, z)[0] + at(x, y + 1, z)[1] - at(x, y - 1, z)[1] + at(x, y, z + 1)[2] - at(x, y, z - 1)[2]) / (2.0 * h);
+                    sum += div.abs() as f64;
+                    n += 1;
+                }
+            }
+        }
+        (sum / n as f64) as f32
+    };
+    let mean_len = |v: &[[f32; 3]]| v.iter().map(|c| (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt() as f64).sum::<f64>() as f32 / v.len() as f32;
+    let ratio = |v: &[[f32; 3]]| mean_abs_central_div(v, h) * h / mean_len(v);
+    eprintln!("divergence ratio: curl {}, gradient (control) {}; mean speed {}", ratio(&curl), ratio(&gradient), mean_len(&curl));
+    assert!(ratio(&curl) < 0.02, "curl {}", ratio(&curl));
+    assert!(ratio(&gradient) > 0.2, "control {}", ratio(&gradient));
+}
+
+#[test]
+fn curl_noise_carries_the_gas_up_and_keeps_it() {
+    let Some((device, queue)) = gpu() else { return };
+    let mut sim = SmokeSimulation::new(&device, &queue);
+    // the plume's cells (0.83 cm): the default noise's eddies, 0.15 m, span about 18 of them
+    let mut v = SmokeVolume::new(Vec3::new(0.3, 0.45, 0.3), Vec3::new(0.6, 0.9, 0.6), SmokeMotion::CurlNoise(CurlSettings { rise: 0.2, ..Default::default() }));
+    v.resolution = 108;
+    v.look.dissipation = 0.0;
+    v.fill = SmokeFill::Sphere { center: Vec3::new(0.3, 0.3, 0.3), radius: 0.15, density: 1.0, temperature: 0.0 };
+    let size = v.size;
+    let id = sim.add(v);
+    let (cells, dims) = read_scalars(&device, &queue, &sim, id);
+    let (mass0, com0) = mass_and_com(&cells, dims, size);
+    for _ in 0..60 {
+        sim.step(1.0 / 60.0, &SmokeMouse::NONE);
+    }
+    let (cells, _) = read_scalars(&device, &queue, &sim, id);
+    let (mass, com) = mass_and_com(&cells, dims, size);
+    eprintln!("centre of mass {com0} -> {com}, mass {mass0} -> {mass}");
+    assert!((com.y - com0.y - 0.2).abs() < 0.06, "rose {}", com.y - com0.y);
+    assert!((mass / mass0 - 1.0).abs() < 0.10, "mass {mass0} -> {mass}");
+}

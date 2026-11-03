@@ -52,7 +52,7 @@ pub const MAX_SMOKE_RESOLUTION: u32 = 160;
 
 /// Curl noise in WGSL, self-contained: `fn curlNoisePotential(p: vec3f, time: f32) -> vec3f` and
 /// its curl, `fn curlNoise(p: vec3f, time: f32) -> vec3f`, a divergence-free velocity of about
-/// unit size with features about a unit across.
+/// unit speed whose eddies are about a unit across.
 pub const CURL_NOISE_WGSL: &str = include_str!("shaders/curl_noise.wgsl");
 
 /// Curl noise and the volumes' data and box maths, for every smoke shader.

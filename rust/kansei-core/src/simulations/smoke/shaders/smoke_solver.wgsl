@@ -62,9 +62,19 @@ fn macW(c: vec3f) -> f32 {
     return textureSampleLevel(velocityIn, smokeLinear, vec3f(c.x / d.x, c.y / d.y, (c.z + 0.5) / d.z), 0.0).z;
 }
 
-// The gas's velocity at a point in cells, m/s along the box's axes.
+// The gas's velocity at a point in cells, m/s along the box's axes: the MAC grid's on Fluid;
+// on Curl noise the noise's (smokeCurlVelocity) and the mouse's push.
 fn smokeVelocityAt(c: vec3f) -> vec3f {
+    if (st.volume.motion == SMOKE_CURL) {
+        let p = cellsToWorld(c);
+        return smokeVecToBox(st.volume, smokeCurlVelocity(st.volume, p, st.time) + smokeExtraVelocity(p));
+    }
     return vec3f(macU(c), macV(c), macW(c));
+}
+
+// Velocity the Curl noise level adds to its noise's at a world point: the mouse (a later stage).
+fn smokeExtraVelocity(p: vec3f) -> vec3f {
+    return vec3f(0.0);
 }
 
 // A point in cells carried back over the step (or forward, `dt` < 0) by the velocity at it.
