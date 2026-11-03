@@ -1,8 +1,8 @@
-//! `bench=1`: SMAA's single pass, its three-pass reference and TAA in turn inside one page, the
-//! scene held still, each mode's anti-aliasing GPU time (its passes' `exclusive_ms`, a span
-//! rather than one pass's timestamps, as Apple GPUs overlap passes) beside the frame's.
+//! `bench=1`: SMAA and TAA in turn inside one page, the scene held still, each one's
+//! anti-aliasing GPU time (the sum of its passes' `exclusive_ms`, a span rather than one pass's
+//! timestamps, as Apple GPUs overlap passes) beside the frame's and the velocity pass's.
 //!
-//! After a 3 s warm-up, phases of 8 s go round the three modes, `rounds` times. 4 s into a phase
+//! After a 3 s warm-up, phases of 8 s alternate the two, `rounds` times. 4 s into a phase
 //! the renderer's profile is taken and dropped (the switch, late readbacks); at its end it is
 //! taken again: that is the phase's window.
 
@@ -53,17 +53,18 @@ pub struct Bench {
     phase: Option<u32>,
     /// The open window: when it began, and the frames since.
     window: Option<(f64, u32)>,
-    /// By phase (round x 3 + mode).
+    /// By phase (round x 2 + mode).
     windows: Vec<Option<Window>>,
     done: bool,
 }
 
 impl Bench {
-    pub const MODES: [Aa; 3] = [Aa::Smaa, Aa::Smaa3, Aa::Taa];
+    pub const MODES: [Aa; 2] = [Aa::Smaa, Aa::Taa];
+    const N: u32 = Self::MODES.len() as u32;
 
     /// A bench of `rounds` rounds, starting at `now_ms`, of a drawing buffer of `size`.
     pub fn new(now_ms: f64, rounds: u32, size: (u32, u32)) -> Self {
-        Self { start_ms: now_ms, rounds, size, phase: None, window: None, windows: vec![None; (rounds * 3) as usize], done: false }
+        Self { start_ms: now_ms, rounds, size, phase: None, window: None, windows: vec![None; (rounds * Self::N) as usize], done: false }
     }
 
     /// The phase at `now_ms`; `None` in the warm-up.
@@ -76,7 +77,7 @@ impl Bench {
     pub fn mode(&self, now_ms: f64) -> Option<Aa> {
         match self.phase_at(now_ms) {
             None => Some(Self::MODES[0]),
-            Some((p, _)) if p < self.rounds * 3 => Some(Self::MODES[(p % 3) as usize]),
+            Some((p, _)) if p < self.rounds * Self::N => Some(Self::MODES[(p % Self::N) as usize]),
             Some(_) => None,
         }
     }
@@ -90,12 +91,12 @@ impl Bench {
         }
         if self.phase != Some(phase) {
             if let (Some(previous), Some((start, frames))) = (self.phase, self.window.take()) {
-                let mode = Self::MODES[(previous % 3) as usize];
+                let mode = Self::MODES[(previous % Self::N) as usize];
                 self.windows[previous as usize] = Some(Window::from_profile(&renderer.take_profile(), mode, now_ms - start, frames));
             }
             self.phase = Some(phase);
         }
-        if phase >= self.rounds * 3 {
+        if phase >= self.rounds * Self::N {
             if self.done {
                 return None;
             }
@@ -124,44 +125,36 @@ fn ms(value: Option<f64>) -> String {
     value.map_or("no GPU timestamps".to_string(), |v| format!("{v:.3}"))
 }
 
-/// `windows` by phase (round x 3 + mode, in `Bench::MODES` order).
+/// `windows` by phase (round x 2 + mode: SMAA, then TAA).
 pub fn report(size: (u32, u32), rounds: u32, windows: &[Option<Window>]) -> String {
-    let of = |mode: usize| (0..rounds as usize).map(move |r| windows.get(r * 3 + mode).copied().flatten());
+    let at = |r: usize, mode: usize| windows.get(r * 2 + mode).copied().flatten();
+    let of = |mode: usize| (0..rounds as usize).map(move |r| at(r, mode));
     let aa = |mode| mean(of(mode).map(|w| w.and_then(|w| w.aa_ms)));
     let field = |mode, f: fn(&Window) -> f64| mean(of(mode).map(|w| w.map(|w| f(&w))));
-    let three = |f: fn(&Window) -> f64| format!("{} / {} / {}", ms(field(0, f)), ms(field(1, f)), ms(field(2, f)));
+    let both = |f: fn(&Window) -> f64| format!("{} / {}", ms(field(0, f)), ms(field(1, f)));
     let mut out = format!(
-        "bench {}x{}, {rounds} rounds: SMAA {} ms | SMAA three-pass {} ms | TAA {} ms; frame GPU {} ms; interval {} ms; velocity pass {} ms\n",
+        "bench {}x{}, {rounds} rounds: SMAA {} ms | TAA {} ms; frame GPU {} ms; interval {} ms; velocity pass {} ms\n",
         size.0,
         size.1,
         ms(aa(0)),
         ms(aa(1)),
-        ms(aa(2)),
-        three(|w| w.gpu_ms),
-        three(|w| w.interval_ms),
-        three(|w| w.velocity_ms),
+        both(|w| w.gpu_ms),
+        both(|w| w.interval_ms),
+        both(|w| w.velocity_ms),
     );
     for r in 0..rounds as usize {
-        let at = |mode: usize| ms(windows.get(r * 3 + mode).copied().flatten().and_then(|w| w.aa_ms));
-        out += &format!("round {}: SMAA {} | three-pass {} | TAA {} ms\n", r + 1, at(0), at(1), at(2));
+        out += &format!("round {}: SMAA {} | TAA {} ms\n", r + 1, ms(at(r, 0).and_then(|w| w.aa_ms)), ms(at(r, 1).and_then(|w| w.aa_ms)));
     }
     // cheaper: a lower mean, and lower in at least 3 of 4 paired rounds (every window timed)
-    let cheaper = |other: usize| {
-        let pairs: Vec<Option<(f64, f64)>> = (0..rounds as usize)
-            .map(|r| {
-                let a = windows.get(r * 3).copied().flatten().and_then(|w| w.aa_ms)?;
-                let b = windows.get(r * 3 + other).copied().flatten().and_then(|w| w.aa_ms)?;
-                Some((a, b))
-            })
-            .collect();
-        if rounds == 0 || pairs.iter().any(Option::is_none) {
-            return "no (a window had no GPU timestamps)";
-        }
+    let pairs: Vec<Option<(f64, f64)>> = (0..rounds as usize).map(|r| Some((at(r, 0)?.aa_ms?, at(r, 1)?.aa_ms?))).collect();
+    let verdict = if rounds == 0 || pairs.iter().any(Option::is_none) {
+        "no (a window had no GPU timestamps)"
+    } else {
         let wins = pairs.iter().flatten().filter(|(a, b)| a < b).count() as u32;
-        let lower_mean = aa(0).zip(aa(other)).is_some_and(|(a, b)| a < b);
+        let lower_mean = aa(0).zip(aa(1)).is_some_and(|(a, b)| a < b);
         if lower_mean && wins * 4 >= rounds * 3 { "yes" } else { "no" }
     };
-    out += &format!("single pass cheaper than three-pass: {}, than TAA: {}", cheaper(1), cheaper(2));
+    out += &format!("SMAA cheaper than TAA: {verdict}");
     out
 }
 
@@ -176,24 +169,25 @@ mod tests {
 
     #[test]
     fn the_verdict_wants_a_lower_mean_and_three_rounds_in_four() {
-        // SMAA 0.2 against 0.3 and 0.5 in every round
-        let all: Vec<_> = (0..4).flat_map(|_| [window(0.2), window(0.3), window(0.5)]).collect();
+        // SMAA 0.3 against TAA 0.5 in every round
+        let all: Vec<_> = (0..4).flat_map(|_| [window(0.3), window(0.5)]).collect();
         let r = report((1920, 1080), 4, &all);
-        assert!(r.starts_with("bench 1920x1080, 4 rounds: SMAA 0.200 ms | SMAA three-pass 0.300 ms | TAA 0.500 ms; frame GPU 10.000 / 10.000 / 10.000 ms"), "{r}");
-        assert!(r.ends_with("single pass cheaper than three-pass: yes, than TAA: yes"), "{r}");
-        // a lower mean (0.205 against 0.3), but only 2 rounds of 4 lower than the three passes
+        assert!(r.starts_with("bench 1920x1080, 4 rounds: SMAA 0.300 ms | TAA 0.500 ms; frame GPU 10.000 / 10.000 ms; interval 16.000 / 16.000 ms; velocity pass 0.500 / 0.500 ms"), "{r}");
+        assert!(r.contains("round 4: SMAA 0.300 | TAA 0.500 ms"), "{r}");
+        assert!(r.ends_with("SMAA cheaper than TAA: yes"), "{r}");
+        // a lower mean (0.305 against 0.5), but only 2 rounds of 4 lower
         let mut split = all.clone();
-        split[0] = window(0.31);
-        split[3] = window(0.31);
+        split[0] = window(0.51);
+        split[2] = window(0.51);
+        split[4] = window(0.1);
         split[6] = window(0.1);
-        split[9] = window(0.1);
-        assert!(report((1920, 1080), 4, &split).ends_with("three-pass: no, than TAA: yes"));
+        assert!(report((1920, 1080), 4, &split).ends_with("SMAA cheaper than TAA: no"));
         // a window with no timestamps
         let mut missing = all;
-        missing[4] = Some(Window { aa_ms: None, ..window(0.0).unwrap() });
+        missing[3] = Some(Window { aa_ms: None, ..window(0.0).unwrap() });
         let r = report((1920, 1080), 4, &missing);
-        assert!(r.contains("round 2: SMAA 0.200 | three-pass no GPU timestamps | TAA 0.500 ms"), "{r}");
-        assert!(r.ends_with("three-pass: no (a window had no GPU timestamps), than TAA: yes"), "{r}");
+        assert!(r.contains("round 2: SMAA 0.300 | TAA no GPU timestamps ms"), "{r}");
+        assert!(r.ends_with("SMAA cheaper than TAA: no (a window had no GPU timestamps)"), "{r}");
     }
 
     #[test]
@@ -205,7 +199,7 @@ mod tests {
             gpu_ms: 9.0,
             ..Default::default()
         };
-        let w = Window::from_profile(&profile, Aa::Smaa3, 400.0, 50);
+        let w = Window::from_profile(&profile, Aa::Smaa, 400.0, 50);
         assert!((w.aa_ms.unwrap() - 0.35).abs() < 1e-9 && w.velocity_ms == 0.4 && w.interval_ms == 8.0 && w.gpu_ms == 9.0);
         assert_eq!(Window::from_profile(&profile, Aa::Taa, 1.0, 1).aa_ms, Some(0.7));
         assert_eq!(Window::from_profile(&FrameProfile::default(), Aa::Smaa, 1.0, 1).aa_ms, None);
@@ -216,9 +210,9 @@ mod tests {
         let b = Bench::new(1000.0, 4, (1920, 1080));
         assert_eq!(b.mode(1000.0), Some(Aa::Smaa));
         assert_eq!(b.mode(1000.0 + WARMUP_MS + 1.0), Some(Aa::Smaa));
-        assert_eq!(b.mode(1000.0 + WARMUP_MS + PHASE_MS + 1.0), Some(Aa::Smaa3));
-        assert_eq!(b.mode(1000.0 + WARMUP_MS + 2.0 * PHASE_MS + 1.0), Some(Aa::Taa));
-        assert_eq!(b.mode(1000.0 + WARMUP_MS + 3.0 * PHASE_MS + 1.0), Some(Aa::Smaa));
-        assert_eq!(b.mode(1000.0 + WARMUP_MS + 12.0 * PHASE_MS + 1.0), None);
+        assert_eq!(b.mode(1000.0 + WARMUP_MS + PHASE_MS + 1.0), Some(Aa::Taa));
+        assert_eq!(b.mode(1000.0 + WARMUP_MS + 2.0 * PHASE_MS + 1.0), Some(Aa::Smaa));
+        assert_eq!(b.mode(1000.0 + WARMUP_MS + 7.0 * PHASE_MS + 1.0), Some(Aa::Taa));
+        assert_eq!(b.mode(1000.0 + WARMUP_MS + 8.0 * PHASE_MS + 1.0), None);
     }
 }

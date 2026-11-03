@@ -7,10 +7,9 @@
 //! anti-aliasings (`PostProcessingVolume::set_enabled`) or neither. Every surface is the stock
 //! `Material::standard_lit` with `outputs_velocity` (the TAA's motion vectors).
 //!
-//! URL parameters: `aa=off|smaa|smaa3|taa` (the starting mode; `smaa3` is SMAA's three-pass
-//! reference), `reach=<px>` (the three passes' reach), `threshold=<luma>`, `t=<seconds>` (freeze
-//! the scene), `pan=<deg/s>`, `size=<w>x<h>` (the drawing buffer's size), `bench=1` (SMAA, its
-//! three passes and TAA in turn, see `bench.rs`).
+//! URL parameters: `aa=off|smaa|taa` (the starting mode), `reach=<px>` (SMAA's search reach),
+//! `threshold=<luma>`, `t=<seconds>` (freeze the scene), `pan=<deg/s>`, `size=<w>x<h>` (the
+//! drawing buffer's size), `bench=1` (SMAA and TAA in turn, see `bench.rs`).
 
 // natively only the bench's tests build (the page's entry points are wasm32's)
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code, unused_imports))]
@@ -31,7 +30,7 @@ use kansei_core::math::{Vec3, Vec4};
 use kansei_core::objects::{Renderable, Scene, SceneNode};
 use kansei_core::postprocessing::{
     PostProcessingEffect, PostProcessingVolume,
-    effects::{exposure_from_ev100, FilmGrain, SmaaEffect, SmaaMode, SmaaOptions, TemporalAAEffect, TemporalAAOptions, ToneMapEffect, ToneMapOptions},
+    effects::{exposure_from_ev100, FilmGrain, SmaaEffect, SmaaOptions, TemporalAAEffect, TemporalAAOptions, ToneMapEffect, ToneMapOptions},
 };
 use kansei_core::renderers::{Renderer, RendererConfig};
 use kansei_wasm::{flag, now, param, param_or, set_text, Canvas};
@@ -54,10 +53,7 @@ const SWING: f32 = 2.5;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Aa {
     Off,
-    /// SMAA's single pass.
     Smaa,
-    /// SMAA's three-pass reference.
-    Smaa3,
     Taa,
 }
 
@@ -66,7 +62,6 @@ impl Aa {
         match value.trim() {
             "off" | "0" | "none" => Some(Aa::Off),
             "smaa" => Some(Aa::Smaa),
-            "smaa3" => Some(Aa::Smaa3),
             "taa" => Some(Aa::Taa),
             _ => None,
         }
@@ -76,7 +71,6 @@ impl Aa {
         match self {
             Aa::Off => "off",
             Aa::Smaa => "smaa",
-            Aa::Smaa3 => "smaa3",
             Aa::Taa => "taa",
         }
     }
@@ -216,8 +210,7 @@ fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
     Some(f(&mut st))
 }
 
-/// Run `aa`: SMAA (single pass or three) or TAA, or neither, and hand SMAA the tonemapper's
-/// signal.
+/// Run `aa`: SMAA or TAA, or neither, and hand SMAA the tonemapper's signal.
 fn apply(st: &mut State, aa: Aa) {
     let taa = aa == Aa::Taa;
     if taa && !st.volume.is_enabled::<TemporalAAEffect>() {
@@ -226,10 +219,9 @@ fn apply(st: &mut State, aa: Aa) {
         }
     }
     st.volume.set_enabled::<TemporalAAEffect>(taa);
-    st.volume.set_enabled::<SmaaEffect>(matches!(aa, Aa::Smaa | Aa::Smaa3));
+    st.volume.set_enabled::<SmaaEffect>(aa == Aa::Smaa);
     let encode_srgb = st.volume.effect::<ToneMapEffect>().is_some_and(|t| t.options.encode_srgb);
     if let Some(smaa) = st.volume.effect_mut::<SmaaEffect>() {
-        smaa.set_mode(if aa == Aa::Smaa3 { SmaaMode::ThreePass } else { SmaaMode::SinglePass });
         smaa.set_film(FilmGrain { encode_srgb, ..Default::default() });
     }
     st.aa = aa;
@@ -317,7 +309,7 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
     };
     let smaa = SmaaEffect::new(SmaaOptions {
         threshold: param_or("threshold", 0.1),
-        three_pass_reach: param_or("reach", SmaaEffect::REACH),
+        reach: param_or("reach", SmaaEffect::REACH),
         ..Default::default()
     });
     let effects: Vec<Box<dyn PostProcessingEffect>> =
