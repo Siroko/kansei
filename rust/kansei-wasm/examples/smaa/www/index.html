@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Kansei — SMAA</title>
+    <style>
+        body { margin: 0; background: #000; overflow: hidden; }
+        canvas { width: 100vw; height: 100vh; display: block; }
+        #bench { position: fixed; left: 8px; bottom: 8px; margin: 0; color: #fff; font: 12px/1.4 ui-monospace, monospace; text-shadow: 0 0 3px #000; white-space: pre; pointer-events: none; }
+    </style>
+</head>
+<body>
+    <canvas id="kansei"></canvas>
+    <pre id="bench"></pre>
+    <script type="module">
+        import init, { start } from '../pkg/kansei_wasm_smaa.js';
+        await init();
+        await start('kansei');
+    </script>
+</body>
+</html>
