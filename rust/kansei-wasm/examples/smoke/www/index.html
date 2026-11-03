@@ -14,12 +14,44 @@
     <canvas id="kansei"></canvas>
     <script type="module">
         // Volumetric smoke through the volumetric fog: steam off a cup in a dark room, a low sun
-        // through the window. See ../README.md for the URL parameters.
+        // through the window. Hover to stir the smoke; drag to orbit, right-drag or shift-drag to
+        // pan, the wheel to zoom. URL parameters (README.md):
+        //   motion=waves|curl|fluid   the level of motion (default fluid)
+        //   layers=1                  smoke hanging in the room in sheets
+        //   aa=taa|off                TAA (default) or no anti-aliasing
+        //   res=<16..160>             the plume's grid along its height (default 96; the layers take 2/3)
+        //   stats=1                   log the frame interval and the GPU profile every 240 frames
+        //   perf=1                    the performance overlay (or the backquote key)
+        //   dpr=<ratio>               drawing-buffer pixels per CSS pixel
         import init, { start, set, view } from '../pkg/kansei_wasm_smoke.js';
         await init();
         await start('kansei');
-        // for scripted checks: window.kansei.set('fogDensity', 0.2), JSON.parse(window.kansei.view())
-        window.kansei = { set, view };
+
+        const read = () => JSON.parse(view());
+        const s = read();
+        const p = {
+            motion: s.motion,
+            steam: s.steam === 1,
+            layers: s.layers === 1,
+            density: s.density,
+            mouseStrength: s.mouseStrength,
+            mouseRadius: s.mouseRadius,
+            fogDensity: s.fogDensity,
+        };
+        const { Pane } = await import('https://cdn.jsdelivr.net/npm/tweakpane@4/dist/tweakpane.min.js');
+        const pane = new Pane({ title: 'Volumetric smoke' });
+        const bind = (key, options) => pane.addBinding(p, key, options).on('change', (e) => set(key, typeof e.value === 'boolean' ? Number(e.value) : e.value));
+        bind('motion', { label: 'motion', options: { Waves: 0, 'Curl noise': 1, Fluid: 2 } });
+        bind('steam', { label: 'steam' });
+        bind('layers', { label: 'hanging layers' });
+        bind('density', { min: 0, max: 4, step: 0.05, label: 'density' });
+        bind('mouseStrength', { min: 0, max: 4, step: 0.05, label: 'mouse strength' });
+        bind('mouseRadius', { min: 0.02, max: 0.4, step: 0.005, label: 'mouse radius (m)' });
+        bind('fogDensity', { min: 0, max: 0.3, step: 0.005, label: 'fog density' });
+        if (window.innerWidth < 768) pane.expanded = false;
+
+        // for scripted checks: window.kansei.set('motion', 1), window.kansei.view()
+        window.kansei = { set, view: read };
     </script>
 </body>
 </html>
