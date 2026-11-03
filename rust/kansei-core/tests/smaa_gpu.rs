@@ -5,7 +5,7 @@
 //! renders what a fresh one does. Skipped (passes) when no adapter is available.
 
 use kansei_core::cameras::Camera;
-use kansei_core::postprocessing::effects::{FilmGrain, SmaaEffect, SmaaOptions};
+use kansei_core::postprocessing::effects::{FilmGrain, SmaaEffect, SmaaOptions, ToneMapEffect, ToneMapOptions, ToneMapper};
 use kansei_core::postprocessing::{GBuffer, PostProcessingEffect};
 
 struct Dev {
@@ -61,7 +61,12 @@ fn halves(input: &[[f32; 3]]) -> Vec<[u16; 4]> {
 
 /// `fx` on `input` (`w` x `h`, uploaded as `Rgba16Float`, alpha 1) into an `Rgba16Float` output, in
 /// its own submit; the output's halves.
-fn render_with(dev: &Dev, fx: &mut SmaaEffect, input: &[[f32; 3]], w: u32, h: u32) -> Vec<[u16; 4]> {
+fn render_with(dev: &Dev, fx: &mut dyn PostProcessingEffect, input: &[[f32; 3]], w: u32, h: u32) -> Vec<[u16; 4]> {
+    render_halves(dev, fx, &halves(input), w, h)
+}
+
+/// `render_with` on an input given as halves.
+fn render_halves(dev: &Dev, fx: &mut dyn PostProcessingEffect, input: &[[u16; 4]], w: u32, h: u32) -> Vec<[u16; 4]> {
     let device = &dev.device;
     let size = wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 };
     let texture = |usage| {
@@ -79,7 +84,7 @@ fn render_with(dev: &Dev, fx: &mut SmaaEffect, input: &[[f32; 3]], w: u32, h: u3
     let input_tex = texture(wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
     dev.queue.write_texture(
         wgpu::TexelCopyTextureInfo { texture: &input_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-        bytemuck::cast_slice(&halves(input)),
+        bytemuck::cast_slice(input),
         wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 8), rows_per_image: Some(h) },
         size,
     );
@@ -279,6 +284,30 @@ fn resizing_matches_fresh_effects() {
         let reused = render_with(&dev, &mut fx, &input, w, h);
         let fresh = run(&dev, &input, w, h, FilmGrain::default());
         assert!(reused == fresh, "{w}x{h}: the reused effect differs from a fresh one");
+    }
+}
+
+/// Grain and dither left by the tonemapper (`defer_film`) to SMAA, applied after its blend, give
+/// the tonemapper's own picture: a ramp of scene light (no edges), the grain and the dither of
+/// the same frame, on an encoded signal and on a linear one.
+#[test]
+fn deferred_film_matches_the_tonemapper_s() {
+    let Some(dev) = gpu() else { return eprintln!("no GPU adapter: skipping") };
+    let (w, h) = (128, 64);
+    let ramp: Vec<[f32; 3]> = (0..h).flat_map(|_| (0..w).map(|x| [0.02 + (2.0 - 0.02) * x as f32 / (w - 1) as f32; 3])).collect();
+    for encode in [true, false] {
+        let options = || ToneMapOptions { tonemapper: ToneMapper::AcesFitted, grain: 0.4, grain_size: 1.6, dither: true, encode_srgb: encode, ..Default::default() };
+        let a = render_with(&dev, &mut ToneMapEffect::new(options()), &ramp, w, h);
+        let mut tonemap = ToneMapEffect::new(ToneMapOptions { defer_film: true, ..options() });
+        let between = render_with(&dev, &mut tonemap, &ramp, w, h);
+        let mut smaa = SmaaEffect::new(SmaaOptions::default());
+        smaa.set_film(tonemap.later_film());
+        let b = render_halves(&dev, &mut smaa, &between, w, h);
+        let (max, _, _) = difference(&a, &b);
+        assert!(max <= 2e-3, "encode {encode}: the deferred film differs from the tonemapper's by {max}");
+        // not vacuous: the film moved most pixels
+        let moved = b.iter().zip(&between).filter(|(p, q)| (0..3).any(|c| (f16_to_f32(p[c]) - f16_to_f32(q[c])).abs() > 1.0 / 255.0)).count();
+        assert!(moved * 4 >= b.len(), "encode {encode}: the film moved only {moved} of {} pixels", b.len());
     }
 }
 

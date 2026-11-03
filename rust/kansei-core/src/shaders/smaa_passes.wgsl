@@ -1,6 +1,7 @@
 // SmaaEffect's three passes: edges, blending weights and neighbourhood blending, each its own
 // compute pass over the frame, reading the input, the edges and the weights from textures.
-// Appended to smaa_common.wgsl, whose accessors it defines.
+// Appended to smaa_common.wgsl, whose accessors it defines. The blend adds the film the tonemapper
+// left (smaaFilm).
 
 @group(0) @binding(4) var smaaOutput     : texture_storage_2d<rgba16float, write>;
 @group(0) @binding(5) var smaaEdgesIn    : texture_2d<f32>;
@@ -59,5 +60,5 @@ fn blend(@builtin(global_invocation_id) gid: vec3u) {
     }
     let p = vec2i(gid.xy);
     let color = smaaBlend(p, smaaWeightsAt(p), smaaWeightsAt(p + vec2i(1, 0)), smaaWeightsAt(p + vec2i(0, 1)));
-    textureStore(smaaOutput, gid.xy, vec4f(color, 1.0));
+    textureStore(smaaOutput, gid.xy, vec4f(smaaFilm(color, gid.xy), 1.0));
 }

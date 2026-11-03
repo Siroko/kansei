@@ -6,7 +6,9 @@
 //            on exposed scene-linear light (UE applies its colour grading at this point too);
 //   curve:   a filmic tone curve to display-linear [0, 1] (or, for UnrealFilmic, Unreal's own
 //            grade and filmic curve in AP1, unrealDisplay);
-//   film:    monochrome grain and a triangular dither, in the sRGB-encoded signal;
+//   film:    monochrome grain and a triangular dither, in the sRGB-encoded signal (film_grain.wgsl,
+//            prepended), or left to a later pass with FLAG_DEFER_FILM (SmaaEffect applies them
+//            after its blend);
 //   output:  sRGB-encoded for non-sRGB targets, decoded back to linear for sRGB ones.
 
 @group(0) @binding(0) var inputTex      : texture_2d<f32>;
@@ -28,41 +30,13 @@ const TONEMAP_EXPONENTIAL    : u32 = 6u;
 
 const FLAG_ENCODE_SRGB : u32 = 1u;
 const FLAG_DITHER      : u32 = 2u;
+// grain and dither left to a later pass (ToneMapOptions::defer_film)
+const FLAG_DEFER_FILM  : u32 = 8u;
 
 const MIDDLE_GREY : f32 = 0.18;
 
 fn luminance(c: vec3f) -> f32 {
     return dot(c, vec3f(0.2126, 0.7152, 0.0722));
-}
-
-// ── Noise ──
-
-// PCG-based 3D hash (Jarzynski & Olano, "Hash Functions for GPU Rendering", 2020).
-fn pcg3d(v0: vec3u) -> vec3u {
-    var v = v0 * 1664525u + 1013904223u;
-    v.x += v.y * v.z; v.y += v.z * v.x; v.z += v.x * v.y;
-    v ^= v >> vec3u(16u);
-    v.x += v.y * v.z; v.y += v.z * v.x; v.z += v.x * v.y;
-    return v;
-}
-
-fn hash3(pix: vec2i, frame: u32) -> vec3f {
-    return vec3f(pcg3d(vec3u(bitcast<vec2u>(pix), frame))) * (1.0 / 4294967296.0);
-}
-
-// Film grain: value noise on a lattice of `grainSize` pixels, a new pattern every frame.
-// Each lattice value is triangular in [-1, 1] (two uniforms), which reads like film, not TV static.
-fn grainNoise(pix: vec2f) -> f32 {
-    let q = pix / max(p.grainSize, 1.0);
-    let i = vec2i(floor(q));
-    let f = fract(q);
-    let s = f * f * (3.0 - 2.0 * f);
-    let n00 = hash3(i, p.frame);
-    let n10 = hash3(i + vec2i(1, 0), p.frame);
-    let n01 = hash3(i + vec2i(0, 1), p.frame);
-    let n11 = hash3(i + vec2i(1, 1), p.frame);
-    let v = mix(mix(n00.x + n00.y, n10.x + n10.y, s.x), mix(n01.x + n01.y, n11.x + n11.y, s.x), s.y);
-    return v - 1.0;
 }
 
 // ── Lens ──
@@ -409,18 +383,13 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
         display = toneCurve(grade(scene));
     }
 
-    // film grain, strongest in the midtones of the encoded signal (where film shows it)
+    // film grain and dither in the encoded signal (film_grain.wgsl), unless a later pass adds them
     var encoded = srgbEncode(display);
-    if (p.grain > 0.0) {
-        let l = luminance(encoded);
-        encoded += p.grain * 0.12 * grainNoise(pix) * (4.0 * l * (1.0 - l));
+    if ((p.flags & FLAG_DEFER_FILM) == 0u) {
+        encoded = filmApply(encoded, gid.xy, p.grain, p.grainSize, p.frame, (p.flags & FLAG_DITHER) != 0u);
+    } else {
+        encoded = saturate(encoded);
     }
-    // triangular dither of one 8-bit step, so dusk gradients don't band on 8-bit swapchains
-    if ((p.flags & FLAG_DITHER) != 0u) {
-        let h = hash3(vec2i(gid.xy), p.frame ^ 0x9e3779b9u);
-        encoded += (h.x + h.y - 1.0) / 255.0;
-    }
-    encoded = saturate(encoded);
 
     let out = select(srgbDecode(encoded), encoded, (p.flags & FLAG_ENCODE_SRGB) != 0u);
     textureStore(outputTex, gid.xy, vec4f(out, 1.0));

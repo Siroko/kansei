@@ -12,6 +12,8 @@
 // Where iryoku reads two edge flags with one bilinear fetch (the searches' pseudo-gathers, the
 // crossing edges at -0.25 px), this reads the two flags and mixes them; the searches walk one
 // pixel at a time, so no search texture is needed.
+//
+// film_grain.wgsl comes before it (smaaFilm, the tonemapper's grain and dither after the blend).
 
 struct SmaaParams {
     size           : vec2u,
@@ -242,4 +244,25 @@ fn smaaBlend(p: vec2i, here: vec4f, right: vec4f, below: vec4f) -> vec3f {
         return smaaSrgbEncode(blended);
     }
     return blended;
+}
+
+// ── Film (the tonemapper's, left to SMAA: ToneMapOptions::defer_film) ──
+
+// The grain and dither on a pixel's final colour, in the encoded signal (a linear one encoded
+// first and decoded after), with SMAA's own frame counter. Without either, the colour comes
+// through as it is.
+fn smaaFilm(color: vec3f, pixel: vec2u) -> vec3f {
+    let dither = (smaa.flags & SMAA_FLAG_DITHER) != 0u;
+    if (smaa.grain <= 0.0 && !dither) {
+        return color;
+    }
+    var encoded = color;
+    if (!smaaIsEncoded()) {
+        encoded = smaaSrgbEncode(color);
+    }
+    let film = filmApply(encoded, pixel, smaa.grain, smaa.grainSize, smaa.frame, dither);
+    if (smaaIsEncoded()) {
+        return film;
+    }
+    return smaaSrgbDecode(film);
 }

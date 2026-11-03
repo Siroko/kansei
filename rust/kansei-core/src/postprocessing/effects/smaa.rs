@@ -73,6 +73,17 @@
 //! behind barriers for the slowest. About 42 % of the example's 16 x 16 tiles have edges; the
 //! early exit of edge-free tiles only paid on mostly flat images.
 //!
+//! # Film grain
+//!
+//! Grain on the input would read as edges and be smoothed. A tonemapper with
+//! [`ToneMapOptions::defer_film`](super::ToneMapOptions::defer_film) leaves its grain and dither
+//! out, and this effect adds them after the blend (`film_grain.wgsl`, the tonemapper's own code)
+//! with what [`ToneMapEffect::later_film`](super::ToneMapEffect::later_film) hands
+//! [`set_film`](SmaaEffect::set_film) each frame: the picture the tonemapper would have made,
+//! minus the smoothing. The vignette and the chromatic aberration stay in the tonemapper: the
+//! vignette darkens scene light before the tone curve, so no later pass could match it, and both
+//! are smooth enough that SMAA leaves them be.
+//!
 //! # Where it differs from iryoku's reference
 //!
 //! - Compute passes, not fragment passes, and the weights pass skips pixels with no edge by an
@@ -118,7 +129,7 @@ use crate::cameras::Camera;
 use crate::postprocessing::PostProcessingEffect;
 use crate::renderers::GBuffer;
 
-const WGSL: &str = concat!(include_str!("../../shaders/smaa_common.wgsl"), include_str!("../../shaders/smaa_passes.wgsl"));
+const WGSL: &str = concat!(include_str!("../../shaders/film_grain.wgsl"), include_str!("../../shaders/smaa_common.wgsl"), include_str!("../../shaders/smaa_passes.wgsl"));
 /// SMAA's area texture, its 1x subtexture (see the module docs).
 const AREA: &[u8] = include_bytes!("smaa_area.bin");
 const AREA_SIZE: (u32, u32) = (160, 80);
@@ -244,15 +255,20 @@ struct Gpu {
 /// perceptual values. The tonemapper writes the display signal, sRGB-encoded with
 /// `encode_srgb` (browsers' `Bgra8Unorm` surfaces) and display-linear without it (sRGB
 /// surfaces), and the volume's blit copies the chain's last texture to the surface as is; tell
-/// this effect which it is with [`set_film`](Self::set_film) (`FilmGrain::encode_srgb`). It finds
-/// edges on the encoded luma either way and blends in linear light.
+/// this effect which it is, and the grain and dither the tonemapper leaves to it, with
+/// [`set_film`](Self::set_film) (the tonemapper's [`later_film`](super::ToneMapEffect::later_film)).
+/// It finds edges on the encoded luma either way and blends in linear light.
 ///
-/// It renders at full resolution (it is no upscaler) and asks for no camera jitter.
+/// It renders at full resolution (it is no upscaler), asks for no camera jitter and reads no
+/// motion vectors (a chain with it and no TAA skips the renderer's velocity pass).
 ///
 /// ```ignore
-/// let tonemap = ToneMapEffect::new(ToneMapOptions::for_surface(renderer.presentation_format()));
+/// let mut options = ToneMapOptions::for_surface(renderer.presentation_format());
+/// options.grain = 0.3;
+/// options.defer_film = true; // the grain and dither after SMAA's blend
+/// let tonemap = ToneMapEffect::new(options);
 /// let mut smaa = SmaaEffect::new(SmaaOptions::default());
-/// smaa.set_film(FilmGrain { encode_srgb: tonemap.options.encode_srgb, ..Default::default() });
+/// smaa.set_film(tonemap.later_film()); // each frame, if the tonemapper's options change
 /// let volume = PostProcessingVolume::new(&renderer, vec![Box::new(tonemap), Box::new(smaa)]);
 /// ```
 pub struct SmaaEffect {
@@ -272,7 +288,8 @@ impl SmaaEffect {
         Self { options, film: FilmGrain::default(), frame: 0, gpu: None, bind_groups: Default::default() }
     }
 
-    /// The signal it reads (`encode_srgb`) and the film it adds after blending.
+    /// The signal it reads (`encode_srgb`) and the film it adds after blending: the tonemapper's
+    /// [`later_film`](super::ToneMapEffect::later_film), each frame.
     pub fn set_film(&mut self, film: FilmGrain) {
         self.film = film;
     }
