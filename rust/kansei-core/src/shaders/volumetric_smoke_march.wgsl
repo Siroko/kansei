@@ -197,27 +197,55 @@ fn smokeMax3(v: vec3f) -> f32 {
     return max(v.x, max(v.y, v.z));
 }
 
+// The smoke's own shadow toward each light varies slowly along a view ray: the march keeps each
+// light's optical depth (the first SMOKE_TAU_CACHE lights) and marches it again only every two
+// cells; < 0: none kept. The shadow maps' visibility is read at every step.
+const SMOKE_TAU_CACHE : u32 = 8u;
+var<private> smokeTaus : array<f32, SMOKE_TAU_CACHE>;
+
+// Light k's optical depth toward it from p: kept, or marched (and kept) when `refresh`.
+fn smokeLightTau(k: u32, refresh: bool, p: vec3f, toLight: vec3f, maxDist: f32, jitter: f32) -> f32 {
+    if (k < SMOKE_TAU_CACHE && !refresh && smokeTaus[k] >= 0.0) { return smokeTaus[k]; }
+    let tau = smokeShadowTau(p, toLight, maxDist, jitter);
+    if (k < SMOKE_TAU_CACHE) { smokeTaus[k] = tau; }
+    return tau;
+}
+
 // The light a unit of smoke scattering at p sends along -rd: the fog's lights through their
 // shadow maps and the smoke's own shadow, with smokePhase, and the fog's ambient and sky.
-fn smokeLight(p: vec3f, rd: vec3f, jitter: f32) -> vec3f {
+// `refresh`: march the smoke's own shadow again (else the kept depths, smokeLightTau).
+fn smokeLight(p: vec3f, rd: vec3f, jitter: f32, refresh: bool) -> vec3f {
     let g = params.anisotropy;
     var light = params.ambient + skyAmbient(rd, p);
+    var k = 0u;
     for (var di = 0u; di < params.numDirLights; di++) {
         let l = fogDirLight(di, p);
-        if (smokeMax3(l.radiance) <= 0.0) { continue; }
-        light += l.radiance * smokePhase(dot(rd, l.toLight), g, smokeShadowTau(p, l.toLight, 1e9, jitter));
+        if (smokeMax3(l.radiance) > 0.0) {
+            light += l.radiance * smokePhase(dot(rd, l.toLight), g, smokeLightTau(k, refresh, p, l.toLight, 1e9, jitter));
+        } else if (k < SMOKE_TAU_CACHE) {
+            smokeTaus[k] = -1.0;
+        }
+        k++;
     }
     for (var pi = 0u; pi < params.numPointLights; pi++) {
         let l = fogPointLight(pi, p);
-        if (smokeMax3(l.radiance) <= 0.0) { continue; }
-        let dist = length(ptLights[pi].position - p);
-        light += l.radiance * smokePhase(dot(rd, l.toLight), g, smokeShadowTau(p, l.toLight, dist, jitter));
+        if (smokeMax3(l.radiance) > 0.0) {
+            let dist = length(ptLights[pi].position - p);
+            light += l.radiance * smokePhase(dot(rd, l.toLight), g, smokeLightTau(k, refresh, p, l.toLight, dist, jitter));
+        } else if (k < SMOKE_TAU_CACHE) {
+            smokeTaus[k] = -1.0;
+        }
+        k++;
     }
     for (var si = 0u; si < spotLights.count; si++) {
         let l = fogSpotLight(si, p, 0.05);
-        if (smokeMax3(l.radiance) <= 0.0) { continue; }
-        let dist = length(spotLights.lights[si].position - p);
-        light += l.radiance * smokePhase(dot(rd, l.toLight), g, smokeShadowTau(p, l.toLight, dist, jitter));
+        if (smokeMax3(l.radiance) > 0.0) {
+            let dist = length(spotLights.lights[si].position - p);
+            light += l.radiance * smokePhase(dot(rd, l.toLight), g, smokeLightTau(k, refresh, p, l.toLight, dist, jitter));
+        } else if (k < SMOKE_TAU_CACHE) {
+            smokeTaus[k] = -1.0;
+        }
+        k++;
     }
     return light;
 }
@@ -327,6 +355,8 @@ fn smokeMarch(@builtin(global_invocation_id) gid : vec3u) {
     var tWeighted = 0.0;
     let tLast = bounds[nb - 1u];
     var opaque = false;
+    for (var k = 0u; k < SMOKE_TAU_CACHE; k++) { smokeTaus[k] = -1.0; }
+    var tauAt = -1e30;   // where along the ray the kept shadow depths were marched
     for (var s = 0u; s + 1u < nb && !opaque; s++) {
         let a = bounds[s];
         let b = bounds[s + 1u];
@@ -361,7 +391,9 @@ fn smokeMarch(@builtin(global_invocation_id) gid : vec3u) {
             if (tau > 1e-6) {
                 // the smoke's light, veiled by the fog in front of it
                 let fogT = mix(fogPrev.a, fog1.a, centroid);
-                rs += ts * fogT * m.scattering * smokeLight(x, rd, jitter) * ((1.0 - e) / m.extinction);
+                let refresh = tx - tauAt >= 2.0 * c;
+                if (refresh) { tauAt = tx; }
+                rs += ts * fogT * m.scattering * smokeLight(x, rd, jitter, refresh) * ((1.0 - e) / m.extinction);
                 let w = ts * (1.0 - e);
                 weight += w;
                 tWeighted += w * tx;

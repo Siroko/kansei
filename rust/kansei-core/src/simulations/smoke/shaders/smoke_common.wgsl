@@ -167,7 +167,11 @@ fn smokeLayers(local: vec3f, count: u32, thickness: f32, phase: f32) -> f32 {
 // is): each source's column, Gaussian across, widening by `wavesSpread` a metre, its axis swayed
 // by sines of height and time, diluted as it widens, pulsing as it rises, fading with the time
 // the gas takes to rise at its source's speed; nothing outside the box.
-const SMOKE_WAVES_DENSITY_PER_RATE : f32 = 0.3;
+const SMOKE_WAVES_DENSITY_PER_RATE : f32 = 0.5;
+// The column ends where its Gaussian falls under a thousandth of its middle: sqrt(ln(1000) / 2)
+// of its radius from its axis.
+const SMOKE_WAVES_REACH : f32 = 1.8585;
+const SMOKE_WAVES_FLOOR : f32 = 0.001;
 
 fn smokeWavesDensity(v: SmokeVolumeData, p: vec3f, time: f32) -> f32 {
     let local = smokeToLocal(v, p);
@@ -185,16 +189,20 @@ fn smokeWavesDensity(v: SmokeVolumeData, p: vec3f, time: f32) -> f32 {
         let st = saturate((h + s.radius) / s.radius);
         let start = st * st * (3.0 - 2.0 * st);
         let hp = max(h, 0.0);
+        let radius = s.radius + v.wavesSpread * hp;
+        // past the column's reach and its sway (at most the amplitude): nothing to compute
+        if (length(p.xz - s.position.xz) > v.wavesAmplitude + SMOKE_WAVES_REACH * radius) { continue; }
         let grow = saturate(hp / v.wavesWavelength);
         let ph = k * hp - v.wavesSpeed * time + f32(i) * 1.7;
         let sway = vec2f(sin(ph) + 0.5 * sin(1.7 * ph + 1.1), cos(0.8 * ph + 0.3) + 0.5 * cos(2.1 * ph + 2.3)) * (v.wavesAmplitude * grow / 1.5);
-        let radius = s.radius + v.wavesSpread * hp;
         let q = length(p.xz - s.position.xz - sway) / radius;
-        let dilution = (s.radius / radius) * (s.radius / radius);
+        let across = max(exp(-2.0 * q * q) - SMOKE_WAVES_FLOOR, 0.0) / (1.0 - SMOKE_WAVES_FLOOR);
+        if (across <= 0.0) { continue; }
+        let dilution = s.radius / radius;
         let rise = max(length(s.velocity), 0.05);
         let fade = exp(-v.dissipation * hp / rise);
         let pulse = 0.8 + 0.2 * sin(0.5 * k * hp - 1.3 * v.wavesSpeed * time + f32(i));
-        total += SMOKE_WAVES_DENSITY_PER_RATE * s.rate * dilution * fade * pulse * start * exp(-2.0 * q * q);
+        total += SMOKE_WAVES_DENSITY_PER_RATE * s.rate * dilution * fade * pulse * start * across;
     }
     return total;
 }

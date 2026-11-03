@@ -1,9 +1,11 @@
 //! The Waves level's density, on the CPU: the mirror of WGSL `smokeWavesDensity`
 //! (`shaders/smoke_common.wgsl`), which the march evaluates where it samples (no state).
 //!
-//! Each source sends up a column: Gaussian across, its radius growing by `spread` per metre, its
+//! Each source sends up a column: Gaussian across (cut where it falls under a thousandth of its
+//! middle, so the march skips the rest), its radius growing by `spread` per metre, its
 //! axis swayed by two sines of height and time each way (`amplitude`, `wavelength`, `speed`;
-//! no sway at the rim, full sway a wavelength up), its density diluted as it widens, pulsing
+//! no sway at the rim, full sway a wavelength up), its density diluted as it widens (as its
+//! radius), pulsing
 //! gently as it rises, and fading with the time the gas takes to rise at its source's speed
 //! (`dissipation` per second). Nothing outside the box. A volume with no sources holds its
 //! layers fill (`SmokeFill::Layers`), rolling slowly.
@@ -12,7 +14,11 @@ use super::volume::{SmokeVolume, SmokeVolumeGpu};
 use crate::math::Vec3;
 
 /// The density a source's column has at its centre, per unit of the source's `rate`.
-pub(crate) const WAVES_DENSITY_PER_RATE: f32 = 0.3;
+pub(crate) const WAVES_DENSITY_PER_RATE: f32 = 0.5;
+/// The column ends where its Gaussian falls under `WAVES_FLOOR` of its middle, `WAVES_REACH`
+/// radii from its axis (sqrt(ln(1000) / 2)).
+const WAVES_REACH: f32 = 1.8585;
+const WAVES_FLOOR: f32 = 0.001;
 
 fn smoothstep01(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
@@ -66,16 +72,23 @@ pub(crate) fn waves_density_gpu(v: &SmokeVolumeGpu, p: glam::Vec3, time: f32) ->
         }
         let start = smoothstep01((h + s.radius) / s.radius);
         let hp = h.max(0.0);
+        let radius = s.radius + v.waves_spread * hp;
+        if glam::Vec2::new(p.x - sp.x, p.z - sp.z).length() > v.waves_amplitude + WAVES_REACH * radius {
+            continue;
+        }
         let grow = (hp / v.waves_wavelength).clamp(0.0, 1.0);
         let ph = k * hp - v.waves_speed * time + i as f32 * 1.7;
         let sway = glam::Vec2::new(ph.sin() + 0.5 * (1.7 * ph + 1.1).sin(), (0.8 * ph + 0.3).cos() + 0.5 * (2.1 * ph + 2.3).cos()) * (v.waves_amplitude * grow / 1.5);
-        let radius = s.radius + v.waves_spread * hp;
         let q = (glam::Vec2::new(p.x - sp.x, p.z - sp.z) - sway).length() / radius;
-        let dilution = (s.radius / radius) * (s.radius / radius);
+        let across = (((-2.0 * q * q).exp() - WAVES_FLOOR).max(0.0)) / (1.0 - WAVES_FLOOR);
+        if across <= 0.0 {
+            continue;
+        }
+        let dilution = s.radius / radius;
         let rise = glam::Vec3::from(s.velocity).length().max(0.05);
         let fade = (-v.dissipation * hp / rise).exp();
         let pulse = 0.8 + 0.2 * (0.5 * k * hp - 1.3 * v.waves_speed * time + i as f32).sin();
-        total += WAVES_DENSITY_PER_RATE * s.rate * dilution * fade * pulse * start * (-2.0 * q * q).exp();
+        total += WAVES_DENSITY_PER_RATE * s.rate * dilution * fade * pulse * start * across;
     }
     total
 }
