@@ -56,6 +56,7 @@ const SMOKE_MARCH_WGSL: &str = concat!(
     include_str!("../../simulations/smoke/shaders/curl_noise.wgsl"),
     include_str!("../../simulations/smoke/shaders/smoke_common.wgsl"),
     include_str!("../../shaders/volumetric_smoke_march.wgsl"),
+    include_str!("../../shaders/volumetric_smoke_temporal.wgsl"),
 );
 /// The composite with the smoke (`compositeSmoke`) appended.
 const SMOKE_COMPOSITE_WGSL: &str = concat!(
@@ -1257,7 +1258,7 @@ impl PostProcessingEffect for VolumetricFogEffect {
             let renderer = gpu.smoke.as_mut().unwrap();
             smoke_targets = renderer
                 .march(device, queue, encoder, &self.bind_groups, handle, &self.smoke_render, &view, fog_entries, depth, gpu.grid.accum_view(), &gpu.accum_sampler)
-                .map(|t| (t.light.clone(), t.aux.clone()));
+                .map(|t| (t.light, t.aux));
         }
 
         // 5. composite over the scene (with the smoke, when there is some)

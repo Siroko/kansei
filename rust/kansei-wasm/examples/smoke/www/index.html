@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Kansei — Volumetric Smoke</title>
+    <link rel="icon" href="data:,">
+    <style>
+        body { margin: 0; background: #000; overflow: hidden; }
+        canvas { width: 100vw; height: 100vh; display: block; touch-action: none; }
+    </style>
+</head>
+<body>
+    <canvas id="kansei"></canvas>
+    <script type="module">
+        // Volumetric smoke through the volumetric fog: steam off a cup in a dark room, a low sun
+        // through the window. See ../README.md for the URL parameters.
+        import init, { start, set, view } from '../pkg/kansei_wasm_smoke.js';
+        await init();
+        await start('kansei');
+        // for scripted checks: window.kansei.set('fogDensity', 0.2), JSON.parse(window.kansei.view())
+        window.kansei = { set, view };
+    </script>
+</body>
+</html>

@@ -67,7 +67,9 @@ pub(crate) struct SmokeFrameGpu {
     pub(crate) jitter: u32,
     pub(crate) num_pushes: u32,
     pub(crate) shadow_distance: f32,
-    pub(crate) _pad: [f32; 3],
+    pub(crate) history_valid: u32,
+    pub(crate) blend: f32,
+    pub(crate) _pad: f32,
     pub(crate) volumes: [SmokeVolumeGpu; MAX_SMOKE_VOLUMES],
     pub(crate) pushes: [SmokePushGpu; MAX_SMOKE_PUSHES],
 }
@@ -89,11 +91,20 @@ fn target(device: &wgpu::Device, label: &str, (width, height): (u32, u32), forma
 }
 
 /// The march's targets at one size.
-pub(crate) struct SmokeTargets {
-    pub(crate) size: (u32, u32),
-    /// (R, Ts)
+struct SmokeTargets {
+    size: (u32, u32),
+    /// (R, Ts), this frame's
+    light: wgpu::TextureView,
+    /// (linear depth, previous uv, distance of the representative point), this frame's and the
+    /// previous one's
+    aux: [wgpu::TextureView; 2],
+    /// the resolved (R, Ts), this frame's and the previous one's
+    history: [wgpu::TextureView; 2],
+}
+
+/// What the composite reads of the smoke: its (R, Ts) and the aux with its depth.
+pub(crate) struct SmokeComposite {
     pub(crate) light: wgpu::TextureView,
-    /// (linear depth, previous uv, distance of the representative point)
     pub(crate) aux: wgpu::TextureView,
 }
 
@@ -116,6 +127,8 @@ pub(crate) struct SmokeView {
 pub(crate) struct SmokeRenderer {
     march: wgpu::ComputePipeline,
     march_bgl: wgpu::BindGroupLayout,
+    temporal: wgpu::ComputePipeline,
+    temporal_bgl: wgpu::BindGroupLayout,
     pub(crate) composite: wgpu::ComputePipeline,
     pub(crate) composite_bgl: wgpu::BindGroupLayout,
     frame_buffer: wgpu::Buffer,
@@ -146,14 +159,29 @@ impl SmokeRenderer {
         march_entries.extend((34..42).map(|b| entry(b, tex3d)));
         march_entries.extend([entry(42, storage(wgpu::TextureFormat::Rgba16Float)), entry(43, storage(wgpu::TextureFormat::Rgba32Float))]);
         let march_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("VolumetricFog/SmokeMarchBGL"), entries: &march_entries });
+        let temporal_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("VolumetricFog/SmokeTemporalBGL"),
+            entries: &[
+                entry(30, wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }),
+                entry(33, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)),
+                entry(44, tex2d),
+                entry(45, tex2d),
+                entry(46, wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }),
+                entry(47, tex2d),
+                entry(48, storage(wgpu::TextureFormat::Rgba16Float)),
+            ],
+        });
         let mut comp_entries: Vec<_> = composite_entries.to_vec();
         comp_entries.extend([entry(7, tex2d), entry(8, tex2d)]);
         let composite_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some("VolumetricFog/SmokeCompositeBGL"), entries: &comp_entries });
-        let pipeline = |label: &str, code: &str, entry: &str, bgl: &wgpu::BindGroupLayout| {
-            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(code.into()) });
+        let module = |label: &str, code: &str| device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(code.into()) });
+        let pipeline = |label: &str, module: &wgpu::ShaderModule, entry: &str, bgl: &wgpu::BindGroupLayout| {
             let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some(label), bind_group_layouts: &[Some(bgl)], immediate_size: 0 });
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some(label), layout: Some(&layout), module: &module, entry_point: Some(entry), compilation_options: Default::default(), cache: None })
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: Some(label), layout: Some(&layout), module, entry_point: Some(entry), compilation_options: Default::default(), cache: None })
         };
+        // the march and its temporal filter: one module, two entry points
+        let march_module = module("VolumetricFog/SmokeMarch", march_wgsl);
+        let composite_module = module("VolumetricFog/SmokeComposite", composite_wgsl);
         let stand_in = device
             .create_texture(&wgpu::TextureDescriptor {
                 label: Some("VolumetricFog/NoSmokeGrid"),
@@ -167,9 +195,11 @@ impl SmokeRenderer {
             })
             .create_view(&Default::default());
         Self {
-            march: pipeline("VolumetricFog/SmokeMarch", march_wgsl, "smokeMarch", &march_bgl),
-            composite: pipeline("VolumetricFog/SmokeComposite", composite_wgsl, "compositeSmoke", &composite_bgl),
+            march: pipeline("VolumetricFog/SmokeMarch", &march_module, "smokeMarch", &march_bgl),
+            temporal: pipeline("VolumetricFog/SmokeTemporal", &march_module, "smokeTemporal", &temporal_bgl),
+            composite: pipeline("VolumetricFog/SmokeComposite", &composite_module, "compositeSmoke", &composite_bgl),
             march_bgl,
+            temporal_bgl,
             composite_bgl,
             frame_buffer: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("VolumetricFog/SmokeFrame"),
@@ -206,7 +236,7 @@ impl SmokeRenderer {
         depth: &wgpu::TextureView,
         accum: &wgpu::TextureView,
         sampler: &wgpu::Sampler,
-    ) -> Option<&SmokeTargets> {
+    ) -> Option<SmokeComposite> {
         let (volumes, time, advanced) = {
             let mut shared = handle.shared.lock().unwrap();
             if shared.volumes.is_empty() {
@@ -217,10 +247,13 @@ impl SmokeRenderer {
         };
         let size = (view.full_size.0.div_ceil(2), view.full_size.1.div_ceil(2));
         if self.targets.as_ref().is_none_or(|t| t.size != size) {
+            let aux = || target(device, "VolumetricFog/SmokeAux", size, wgpu::TextureFormat::Rgba32Float);
+            let history = || target(device, "VolumetricFog/SmokeHistory", size, wgpu::TextureFormat::Rgba16Float);
             self.targets = Some(SmokeTargets {
                 size,
                 light: target(device, "VolumetricFog/SmokeLight", size, wgpu::TextureFormat::Rgba16Float),
-                aux: target(device, "VolumetricFog/SmokeAux", size, wgpu::TextureFormat::Rgba32Float),
+                aux: [aux(), aux()],
+                history: [history(), history()],
             });
             self.prev_view_proj = None;
         }
@@ -252,12 +285,15 @@ impl SmokeRenderer {
             jitter: options.temporal as u32,
             num_pushes: 0,
             shadow_distance: options.shadow_distance.max(0.0),
+            history_valid: (options.temporal && self.prev_view_proj.is_some()) as u32,
+            blend: options.blend.clamp(0.02, 1.0),
             ..Zeroable::zeroed()
         };
         for (dst, v) in frame.volumes.iter_mut().zip(&volumes) {
             *dst = v.data;
         }
         queue.write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&frame));
+        let current = (self.frame % 2) as usize;
         self.frame = self.frame.wrapping_add(1);
         self.prev_view_proj = Some(view.view_proj);
 
@@ -277,7 +313,7 @@ impl SmokeRenderer {
         }
         entries.extend([
             wgpu::BindGroupEntry { binding: 42, resource: tex(&targets.light) },
-            wgpu::BindGroupEntry { binding: 43, resource: tex(&targets.aux) },
+            wgpu::BindGroupEntry { binding: 43, resource: tex(&targets.aux[current]) },
         ]);
         let bg = cache.get(device, &wgpu::BindGroupDescriptor { label: Some("VolumetricFog/SmokeMarchBG"), layout: &self.march_bgl, entries: &entries });
         let stamp = crate::profiling::gpu_pass("VolumetricFog/SmokeMarch");
@@ -286,6 +322,31 @@ impl SmokeRenderer {
         pass.set_bind_group(0, &bg, &[]);
         pass.dispatch_workgroups(size.0.div_ceil(8), size.1.div_ceil(8), 1);
         drop(pass);
-        Some(targets)
+        if !options.temporal {
+            return Some(SmokeComposite { light: targets.light.clone(), aux: targets.aux[current].clone() });
+        }
+        let temporal_bg = cache.get(
+            device,
+            &wgpu::BindGroupDescriptor {
+                label: Some("VolumetricFog/SmokeTemporalBG"),
+                layout: &self.temporal_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 30, resource: self.frame_buffer.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 33, resource: wgpu::BindingResource::Sampler(sampler) },
+                    wgpu::BindGroupEntry { binding: 44, resource: tex(&targets.light) },
+                    wgpu::BindGroupEntry { binding: 45, resource: tex(&targets.aux[current]) },
+                    wgpu::BindGroupEntry { binding: 46, resource: tex(&targets.history[1 - current]) },
+                    wgpu::BindGroupEntry { binding: 47, resource: tex(&targets.aux[1 - current]) },
+                    wgpu::BindGroupEntry { binding: 48, resource: tex(&targets.history[current]) },
+                ],
+            },
+        );
+        let stamp = crate::profiling::gpu_pass("VolumetricFog/SmokeTemporal");
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("VolumetricFog/SmokeTemporal"), timestamp_writes: stamp.as_ref().map(crate::profiling::PassStamp::compute) });
+        pass.set_pipeline(&self.temporal);
+        pass.set_bind_group(0, &temporal_bg, &[]);
+        pass.dispatch_workgroups(size.0.div_ceil(8), size.1.div_ceil(8), 1);
+        drop(pass);
+        Some(SmokeComposite { light: targets.history[current].clone(), aux: targets.aux[current].clone() })
     }
 }

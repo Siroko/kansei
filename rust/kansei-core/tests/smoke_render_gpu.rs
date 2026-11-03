@@ -376,3 +376,54 @@ fn smoke_behind_a_surface_is_hidden() {
         assert!((left / want_left - 1.0).abs() < 0.1 && (right / want_right - 1.0).abs() < 0.1, "row {y} at the edge: {left} | {right}, want {want_left} | {want_right}");
     }
 }
+
+#[test]
+fn a_moved_volume_leaves_no_ghost() {
+    let Some((device, queue)) = gpu() else { return };
+    let s = scene(&device, &queue, (64, 32), |_, _| Some(10.0));
+    let background = render(&device, &queue, &mut fog(0.02, 0.5), &s, 1);
+    let mut sim = SmokeSimulation::new(&device, &queue);
+    let mut ball = smoke_box(Vec3::new(-1.0, 1.0, -4.0), Vec3::new(1.2, 1.2, 1.2), 0.0);
+    ball.fill = SmokeFill::Sphere { center: Vec3::new(-1.0, 1.0, -4.0), radius: 0.5, density: 5.0, temperature: 0.0 };
+    let id = sim.add(ball);
+    let mut with = fog(0.02, 0.5);
+    with.smoke_render.temporal = true;
+    with.set_smoke(Some(&sim.handle()));
+    let before = render(&device, &queue, &mut with, &s, 30);
+    // the ball's old place: x = -1 m at 4 m is 32 - 1 / (4 tan 30 * 2 / 32) = 25 pixels across
+    let old = |img: &[[f32; 4]]| mean(img, s.w, (25, 16), (4, 4));
+    assert!((old(&before) / old(&background) - 1.0).abs() > 0.2, "the ball does not show: {} vs {}", old(&before), old(&background));
+    // a still view's history settles on the march itself (it reprojects where it should)
+    let mut still = fog(0.02, 0.5);
+    still.set_smoke(Some(&sim.handle()));
+    let march = render(&device, &queue, &mut still, &s, 1);
+    assert!((old(&before) / old(&march) - 1.0).abs() < 0.02, "the history drifted: {} vs {}", old(&before), old(&march));
+    sim.volume_mut(id).center = Vec3::new(1.0, 1.0, -4.0);
+    sim.step(0.0, &SmokeMouse::NONE);
+    let after = render(&device, &queue, &mut with, &s, 1);
+    eprintln!("old place: background {}, with the ball {}, after the move {}", old(&background), old(&before), old(&after));
+    assert!((old(&after) / old(&background) - 1.0).abs() < 0.05, "a ghost: {} vs {}", old(&after), old(&background));
+}
+
+#[test]
+fn history_survives_a_resize() {
+    let Some((device, queue)) = gpu() else { return };
+    let small = scene(&device, &queue, (64, 32), |_, _| Some(10.0));
+    let large = scene(&device, &queue, (96, 48), |_, _| Some(10.0));
+    let mut sim = SmokeSimulation::new(&device, &queue);
+    let mut ball = smoke_box(Vec3::new(0.0, 1.0, -4.0), Vec3::new(1.2, 1.2, 1.2), 0.0);
+    ball.fill = SmokeFill::Sphere { center: Vec3::new(0.0, 1.0, -4.0), radius: 0.5, density: 5.0, temperature: 0.0 };
+    sim.add(ball);
+    let mut with = fog(0.02, 0.5);
+    with.smoke_render.temporal = true;
+    with.set_smoke(Some(&sim.handle()));
+    render(&device, &queue, &mut with, &small, 5);
+    let got = render(&device, &queue, &mut with, &large, 1);
+    assert!(got.iter().all(|c| c.iter().all(|v| v.is_finite())), "a pixel is not finite");
+    let mut still = fog(0.02, 0.5);
+    still.set_smoke(Some(&sim.handle()));
+    let want = render(&device, &queue, &mut still, &large, 1);
+    let m = |img: &[[f32; 4]]| mean(img, large.w, (48, 24), (16, 12));
+    eprintln!("after the resize {}, without history {}", m(&got), m(&want));
+    assert!((m(&got) / m(&want) - 1.0).abs() < 0.05, "{} vs {}", m(&got), m(&want));
+}

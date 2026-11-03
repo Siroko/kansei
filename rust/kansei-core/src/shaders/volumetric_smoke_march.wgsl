@@ -49,9 +49,9 @@ struct SmokeFrame {
     jitter         : u32,       // 1: jitter the steps per pixel and frame; 0: the middle of each
     numPushes      : u32,
     shadowDistance : f32,       // the farthest the self-shadow march looks toward a light
+    historyValid   : u32,       // 0: the smoke's history starts over (volumetric_smoke_temporal.wgsl)
+    blend          : f32,       // the new frame's weight in the history
     _pad0          : f32,
-    _pad1          : f32,
-    _pad2          : f32,
     volumes        : array<SmokeVolumeData, 4>,
     pushes         : array<SmokePush, 8>,
 }
@@ -232,9 +232,11 @@ fn smokeMarch(@builtin(global_invocation_id) gid : vec3u) {
             nb += 2u;
         }
     }
+    // the history reprojects the texel's centre (the composite's grid), at the point's distance
+    let rdTexel = smokeRay((vec2f(gid.xy) + 0.5) / vec2f(sf.size));
     if (nb == 0u) {
         textureStore(smokeLightOut, gid.xy, vec4f(0.0, 0.0, 0.0, 1.0));
-        let prev = smokePrevUv(sf.cameraPos + rd * tScene);
+        let prev = smokePrevUv(sf.cameraPos + rdTexel * tScene);
         textureStore(smokeAuxOut, gid.xy, vec4f(linear, prev, tScene));
         return;
     }
@@ -327,7 +329,7 @@ fn smokeMarch(@builtin(global_invocation_id) gid : vec3u) {
     // the point the smoke's light comes from, for the history: weighted by what it absorbed
     var tP = tScene;
     if (weight > 1e-4) { tP = tWeighted / weight; }
-    let prev = smokePrevUv(sf.cameraPos + rd * tP);
+    let prev = smokePrevUv(sf.cameraPos + rdTexel * tP);
     textureStore(smokeLightOut, gid.xy, vec4f(min(r, vec3f(60000.0)), ts));
     textureStore(smokeAuxOut, gid.xy, vec4f(linear, prev, tP));
 }
