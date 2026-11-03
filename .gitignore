@@ -50,3 +50,6 @@ examples/**/*.ogg
 examples/**/*.wav
 examples/**/*.m4a
 examples/**/*.flac
+
+# Brainstorming mockups
+.superpowers/
