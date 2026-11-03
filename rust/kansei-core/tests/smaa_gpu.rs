@@ -1,13 +1,12 @@
 //! Runs SmaaEffect on a real GPU over synthetic images in the display signal: flat colour and
-//! low-contrast noise come through bit-exact, straight axis-aligned edges stay sharp, and jagged
+//! low-contrast noise come through bit-exact, straight axis-aligned edges stay sharp, jagged
 //! edges (a turned square, near-horizontal and near-vertical lines) are blended between their two
-//! sides. Skipped (passes) when no adapter is available.
+//! sides, a display-linear signal gives the sRGB-encoded one's image, and a resized effect
+//! renders what a fresh one does. Skipped (passes) when no adapter is available.
 
 use kansei_core::cameras::Camera;
-use kansei_core::postprocessing::effects::{FilmGrain, SmaaEffect, SmaaMode, SmaaOptions};
+use kansei_core::postprocessing::effects::{FilmGrain, SmaaEffect, SmaaOptions};
 use kansei_core::postprocessing::{GBuffer, PostProcessingEffect};
-
-const MODES: &[SmaaMode] = &[SmaaMode::SinglePass, SmaaMode::ThreePass];
 
 struct Dev {
     device: wgpu::Device,
@@ -107,13 +106,13 @@ fn render_with(dev: &Dev, fx: &mut SmaaEffect, input: &[[f32; 3]], w: u32, h: u3
     out
 }
 
-/// A fresh `SmaaEffect` in `mode` with `film` on `input`.
-fn run(dev: &Dev, mode: SmaaMode, input: &[[f32; 3]], w: u32, h: u32, film: FilmGrain) -> Vec<[u16; 4]> {
-    run_with_options(dev, mode, SmaaOptions::default(), input, w, h, film)
+/// A fresh `SmaaEffect` with `film` on `input`.
+fn run(dev: &Dev, input: &[[f32; 3]], w: u32, h: u32, film: FilmGrain) -> Vec<[u16; 4]> {
+    run_with_options(dev, SmaaOptions::default(), input, w, h, film)
 }
 
-fn run_with_options(dev: &Dev, mode: SmaaMode, options: SmaaOptions, input: &[[f32; 3]], w: u32, h: u32, film: FilmGrain) -> Vec<[u16; 4]> {
-    let mut fx = SmaaEffect::new(options).with_mode(mode);
+fn run_with_options(dev: &Dev, options: SmaaOptions, input: &[[f32; 3]], w: u32, h: u32, film: FilmGrain) -> Vec<[u16; 4]> {
+    let mut fx = SmaaEffect::new(options);
     fx.set_film(film);
     render_with(dev, &mut fx, input, w, h)
 }
@@ -137,7 +136,7 @@ fn difference(a: &[[u16; 4]], b: &[[u16; 4]]) -> (f32, f32, usize) {
     (max, (sum / a.len() as f64) as f32, over)
 }
 
-const KINDS: [Kind; 9] = [Kind::Flat, Kind::Noise, Kind::StraightVertical, Kind::StraightHorizontal, Kind::RotatedSquare, Kind::NearHorizontal, Kind::NearVertical, Kind::Diagonal, Kind::Lattice];
+const KINDS: [Kind; 10] = [Kind::Flat, Kind::Noise, Kind::StraightVertical, Kind::StraightHorizontal, Kind::RotatedSquare, Kind::NearHorizontal, Kind::NearVertical, Kind::Diagonal, Kind::Lattice, Kind::FaintBright];
 
 #[derive(Debug, Clone, Copy)]
 enum Kind {
@@ -152,6 +151,9 @@ enum Kind {
     /// Thin dark lines on a bright ground, a shallow set and a steep one: edges in most tiles,
     /// as a fence fills a frame.
     Lattice,
+    /// A turned square 0.95 on 0.86: below the threshold in the encoded signal (0.09), above it in
+    /// linear light (0.18), so only luma taken on the encoded signal leaves it alone.
+    FaintBright,
 }
 
 /// A grey image of `kind` in the encoded signal, each pixel point-sampled at its centre.
@@ -185,6 +187,12 @@ fn image(kind: Kind, w: u32, h: u32) -> Vec<[f32; 3]> {
                 let line = (px - 3.0 * py).rem_euclid(14.0) < 1.6 || (0.35 * px + py).rem_euclid(11.0) < 1.4;
                 if line { 0.1 } else { 0.85 }
             }
+            Kind::FaintBright => {
+                let (s, c) = 20f32.to_radians().sin_cos();
+                let (dx, dy) = (px - wf * 0.5, py - hf * 0.5);
+                let half = 0.3 * wf.min(hf);
+                if (c * dx + s * dy).abs() < half && (-s * dx + c * dy).abs() < half { 0.95 } else { 0.86 }
+            }
         }
     };
     (0..h).flat_map(|y| (0..w).map(move |x| [value(x, y); 3])).collect()
@@ -192,15 +200,14 @@ fn image(kind: Kind, w: u32, h: u32) -> Vec<[f32; 3]> {
 
 #[test]
 fn flat_and_low_contrast_noise_come_through_unchanged() {
+    // and an edge below the threshold
     let Some(dev) = gpu() else { return eprintln!("no GPU adapter: skipping") };
     let (w, h) = (250, 190);
-    for &mode in MODES {
-        for kind in [Kind::Flat, Kind::Noise] {
+        for kind in [Kind::Flat, Kind::Noise, Kind::FaintBright] {
             let input = image(kind, w, h);
-            let out = run(&dev, mode, &input, w, h, FilmGrain::default());
+            let out = run(&dev, &input, w, h, FilmGrain::default());
             let changed = out.iter().zip(halves(&input)).filter(|(o, i)| **o != *i).count();
-            assert_eq!(changed, 0, "{mode:?} {kind:?}: {changed} pixels changed");
-        }
+            assert_eq!(changed, 0, "{kind:?}: {changed} pixels changed");
     }
 }
 
@@ -208,13 +215,11 @@ fn flat_and_low_contrast_noise_come_through_unchanged() {
 fn straight_axis_aligned_edges_stay_sharp() {
     let Some(dev) = gpu() else { return eprintln!("no GPU adapter: skipping") };
     let (w, h) = (250, 190);
-    for &mode in MODES {
         for kind in [Kind::StraightVertical, Kind::StraightHorizontal] {
             let input = image(kind, w, h);
-            let out = run(&dev, mode, &input, w, h, FilmGrain::default());
+            let out = run(&dev, &input, w, h, FilmGrain::default());
             let changed = out.iter().zip(halves(&input)).filter(|(o, i)| **o != *i).count();
-            assert_eq!(changed, 0, "{mode:?} {kind:?}: {changed} pixels changed");
-        }
+            assert_eq!(changed, 0, "{kind:?}: {changed} pixels changed");
     }
 }
 
@@ -222,69 +227,63 @@ fn straight_axis_aligned_edges_stay_sharp() {
 fn jagged_edges_are_blended_between_their_sides() {
     let Some(dev) = gpu() else { return eprintln!("no GPU adapter: skipping") };
     let (w, h) = (250, 190);
-    for &mode in MODES {
         for kind in [Kind::RotatedSquare, Kind::NearHorizontal, Kind::NearVertical] {
             let input = image(kind, w, h);
-            let out = run(&dev, mode, &input, w, h, FilmGrain::default());
+            let out = run(&dev, &input, w, h, FilmGrain::default());
             let mut moved = 0;
             for (o, i) in out.iter().zip(&input) {
                 for c in 0..3 {
                     let v = f16_to_f32(o[c]);
-                    assert!(v.is_finite() && (0.15 - 1e-3..=0.8 + 1e-3).contains(&v), "{mode:?} {kind:?}: {v}");
+                    assert!(v.is_finite() && (0.15 - 1e-3..=0.8 + 1e-3).contains(&v), "{kind:?}: {v}");
                 }
                 if (f16_to_f32(o[0]) - i[0]).abs() > 2.0 / 255.0 {
                     moved += 1;
                 }
             }
-            assert!(moved >= 50, "{mode:?} {kind:?}: only {moved} pixels blended");
-        }
+            assert!(moved >= 50, "{kind:?}: only {moved} pixels blended");
     }
 }
 
-/// The single pass computes the three passes' image (at the same reach), partial tiles and tiny
-/// frames included, on an encoded signal and on a linear one.
+/// A display-linear signal (`encode_srgb: false`, sRGB surfaces) gives the encoded signal's image:
+/// its edges are found on the encoded luma and its pixels blended in linear light. On partial
+/// workgroups and tiny frames too.
 #[test]
-fn single_pass_matches_three_pass() {
+fn a_linear_signal_gives_the_encoded_signal_s_image() {
     let Some(dev) = gpu() else { return eprintln!("no GPU adapter: skipping") };
+    let encode = |v: f32| if v <= 0.0031308 { v * 12.92 } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 };
     for (w, h) in [(250, 190), (7, 5)] {
-        for encoded in [true, false] {
-            let film = FilmGrain { encode_srgb: encoded, ..Default::default() };
-            for kind in KINDS {
-                let mut input = image(kind, w, h);
-                if !encoded {
-                    input.iter_mut().for_each(|c| c.iter_mut().for_each(|v| *v = srgb_decode(*v)));
-                }
-                let single = run(&dev, SmaaMode::SinglePass, &input, w, h, film);
-                let three = run(&dev, SmaaMode::ThreePass, &input, w, h, film);
-                let (max, _, over) = difference(&single, &three);
-                assert!(max <= 2.0 / 255.0, "{kind:?} {w}x{h} encoded {encoded}: max {max} ({over} pixels over 2/255)");
-            }
+        for kind in KINDS {
+            let encoded = image(kind, w, h);
+            let linear: Vec<[f32; 3]> = encoded.iter().map(|c| c.map(srgb_decode)).collect();
+            let a = run(&dev, &encoded, w, h, FilmGrain { encode_srgb: true, ..Default::default() });
+            let b = run(&dev, &linear, w, h, FilmGrain { encode_srgb: false, ..Default::default() });
+            let b: Vec<[u16; 4]> = b.iter().map(|p| [0, 1, 2].map(|c| f32_to_f16(encode(f16_to_f32(p[c])))).into_iter().chain([p[3]]).collect::<Vec<_>>().try_into().unwrap()).collect();
+            let (max, _, over) = difference(&a, &b);
+            assert!(max <= 2.0 / 255.0, "{kind:?} {w}x{h}: max {max} ({over} pixels over 2/255)");
         }
     }
-    // not vacuous: the single pass blends
+    // not vacuous: it blends
     let input = image(Kind::RotatedSquare, 250, 190);
-    let single = run(&dev, SmaaMode::SinglePass, &input, 250, 190, FilmGrain::default());
-    let (_, _, moved) = difference(&single, &halves(&input));
-    assert!(moved >= 50, "the single pass moved only {moved} pixels");
+    let (_, _, moved) = difference(&run(&dev, &input, 250, 190, FilmGrain::default()), &halves(&input));
+    assert!(moved >= 50, "only {moved} pixels blended");
 }
 
-/// One effect resized and switched between modes renders what a fresh one does.
+/// One effect resized back and forth renders what a fresh one does (its edges and weights follow
+/// the frame's size).
 #[test]
-fn resizing_and_switching_modes_match_fresh_effects() {
+fn resizing_matches_fresh_effects() {
     let Some(dev) = gpu() else { return eprintln!("no GPU adapter: skipping") };
     let mut fx = SmaaEffect::new(SmaaOptions::default());
-    for (mode, (w, h)) in [(SmaaMode::ThreePass, (64, 48)), (SmaaMode::ThreePass, (96, 80)), (SmaaMode::SinglePass, (96, 80)), (SmaaMode::ThreePass, (64, 48))] {
+    for (w, h) in [(64, 48), (96, 80), (96, 80), (64, 48)] {
         let input = image(Kind::RotatedSquare, w, h);
-        fx.set_mode(mode);
         let reused = render_with(&dev, &mut fx, &input, w, h);
-        let fresh = run(&dev, mode, &input, w, h, FilmGrain::default());
-        assert!(reused == fresh, "{mode:?} {w}x{h}: the reused effect differs from a fresh one");
+        let fresh = run(&dev, &input, w, h, FilmGrain::default());
+        assert!(reused == fresh, "{w}x{h}: the reused effect differs from a fresh one");
     }
 }
 
-/// GPU time at 1920 x 1080 by wall clock, the single pass, the three passes and the TAA resolve
-/// alternated, on a mostly flat image (RotatedSquare: few tiles have edges) and a dense one
-/// (Lattice: most do):
+/// GPU time at 1920 x 1080 by wall clock, SMAA's three passes and the TAA resolve alternated, on
+/// a mostly flat image (RotatedSquare) and a dense one (Lattice: edges in most of the frame):
 /// `cargo test -p kansei-core --release --test smaa_gpu time_smaa_1080p -- --ignored --nocapture`.
 #[test]
 #[ignore]
@@ -309,8 +308,7 @@ fn time_smaa_1080p() {
         );
         let input = input_tex.create_view(&Default::default());
         let mut effects: Vec<(&str, Box<dyn PostProcessingEffect>)> = vec![
-            ("SMAA single pass", Box::new(SmaaEffect::new(SmaaOptions::default()).with_mode(SmaaMode::SinglePass))),
-            ("SMAA three passes", Box::new(SmaaEffect::new(SmaaOptions::default()).with_mode(SmaaMode::ThreePass))),
+            ("SMAA", Box::new(SmaaEffect::new(SmaaOptions::default()))),
             ("TAA resolve", Box::new(TemporalAAEffect::new(TemporalAAOptions::default()))),
         ];
         let mut times = vec![Vec::new(); effects.len()];
@@ -335,20 +333,19 @@ fn time_smaa_1080p() {
     }
 }
 
-/// What the single pass's reach costs against the three passes at reach 32, on every image at
-/// 1920 x 1080:
+/// What the default reach (16 px) costs against iryoku High's 32, on every image at 1920 x 1080:
 /// `cargo test -p kansei-core --release --test smaa_gpu reach_cost_on_synthetic_edges -- --ignored --nocapture`.
 #[test]
 #[ignore]
 fn reach_cost_on_synthetic_edges() {
     let Some(dev) = gpu() else { return eprintln!("no GPU adapter: skipping") };
     let (w, h) = (1920, 1080);
-    let far = SmaaOptions { three_pass_reach: 32, ..Default::default() };
+    let far = SmaaOptions { reach: 32, ..Default::default() };
     for kind in KINDS {
         let input = image(kind, w, h);
-        let single = run(&dev, SmaaMode::SinglePass, &input, w, h, FilmGrain::default());
-        let three = run_with_options(&dev, SmaaMode::ThreePass, far, &input, w, h, FilmGrain::default());
-        let (max, mean, over) = difference(&single, &three);
+        let near = run(&dev, &input, w, h, FilmGrain::default());
+        let far = run_with_options(&dev, far, &input, w, h, FilmGrain::default());
+        let (max, mean, over) = difference(&near, &far);
         eprintln!("{kind:?}: mean {mean:.6}, max {max:.4} ({:.1}/255), {over} pixels over 2/255", max * 255.0);
     }
 }

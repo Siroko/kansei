@@ -1,7 +1,6 @@
-// SmaaEffect's three passes (SmaaMode::ThreePass, the reference the single pass is checked
-// against): edges, blending weights and neighbourhood blending, each its own compute pass over
-// the frame, reading the input, the edges and the weights from textures. Appended to
-// smaa_common.wgsl, whose accessors it defines.
+// SmaaEffect's three passes: edges, blending weights and neighbourhood blending, each its own
+// compute pass over the frame, reading the input, the edges and the weights from textures.
+// Appended to smaa_common.wgsl, whose accessors it defines.
 
 @group(0) @binding(4) var smaaOutput     : texture_storage_2d<rgba16float, write>;
 @group(0) @binding(5) var smaaEdgesIn    : texture_2d<f32>;

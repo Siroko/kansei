@@ -68,6 +68,25 @@ unchanged.
 
 ## Decided
 
+**Outcome (2026-11-03, the owner's fallback): `SmaaEffect` ships as the three passes alone.**
+Two single passes were built and checked against the three passes on the GPU, then timed. Both
+lost to the three passes at the gate, the `smaa` example's bench at 1920 x 1080 in Chrome (mean
+GPU time of the anti-aliasing passes over four rounds):
+
+| Single pass | single pass | three passes | TAA resolve |
+|---|---|---|---|
+| 16 x 16 tiles, luma and edge bits in workgroup memory | 1.231 ms | 0.716 ms | 0.785 ms |
+| 32 x 32 tiles, 4 px an invocation, edges straight from the input | 1.554 ms | 0.830 ms | 1.050 ms |
+
+Natively (wgpu on Metal) the single pass won on a mostly flat image (0.229 and 0.180 ms against
+0.390 and 0.371) but lost on a dense one (32 x 32: 1.707 ms against 0.668). The example's frame
+has edges in about 42 % of its tiles, and each tile with edges redoes its apron's edge
+detection for its own pixels. The three passes beat TAA in 4 of 4 rounds both times, so, as the
+owner authorized: the single-pass shader and `SmaaMode` are gone, the reach is
+`SmaaOptions::reach` (default 16, the preset below), and the example's bench compares SMAA with
+TAA. The numbers are in `smaa.rs`'s module docs. The bullets below are the original decisions;
+those about the single pass record what was tried.
+
 - One compute dispatch over workgroup tiles. Each workgroup loads its tile of colour plus a
   border into workgroup memory, finds edges for the tile and border, computes blending weights
   for the tile (plus the one-pixel ring the blend reads), and blends. The border width limits how

@@ -30,7 +30,7 @@ pub use fluid_surface::{FluidGlassSurface, FluidMask, FluidSurfaceEffect, FluidS
 pub use height_fog::{HeightFogEffect, HeightFogLayer};
 pub use motion_blur::{MotionBlurEffect, MotionBlurOptions};
 pub use screen_space_glass::{ScreenSpaceGlassEffect, ScreenSpaceGlassOptions};
-pub use smaa::{SmaaEffect, SmaaMode, SmaaOptions};
+pub use smaa::{SmaaEffect, SmaaOptions};
 pub use ssao::{SSAOAmbient, SSAOEffect, SSAOOptions};
 pub use ssgi::{GiQuality, ScreenSpaceGIEffect, ScreenSpaceGIOptions};
 pub use taa::{TemporalAAEffect, TemporalAAOptions};

@@ -1,15 +1,13 @@
-// SMAA 1x, the algorithm both of SmaaEffect's modes run: a port of Jorge Jimenez et al.'s
+// SMAA 1x, the algorithm SmaaEffect's three passes run: a port of Jorge Jimenez et al.'s
 // SMAA.hlsl (https://github.com/iryoku/smaa, MIT; the notice is in smaa.rs's module docs):
 // SMAALumaEdgeDetectionPS, SMAAArea, SMAADetectHorizontalCornerPattern,
 // SMAADetectVerticalCornerPattern, the orthogonal part of SMAABlendingWeightCalculationPS and
 // SMAANeighborhoodBlendingPS.
 //
-// It reads pixels through three functions the including module defines:
+// It reads pixels through three functions smaa_passes.wgsl defines (from textures):
 //   smaaLumaAt(p: vec2i) -> f32     the luma of the input at p (smaaLumaOf), clamped to the frame
 //   smaaEdgesAt(p: vec2i) -> vec2f  x the left edge, y the top edge, each 0 or 1; 0 outside the frame
 //   smaaColorAt(p: vec2i) -> vec3f  the input as stored, p clamped to the frame
-// smaa_passes.wgsl reads textures (the three passes); smaa_single.wgsl reads a tile and its
-// apron from workgroup memory (the single pass).
 //
 // Where iryoku reads two edge flags with one bilinear fetch (the searches' pseudo-gathers, the
 // crossing edges at -0.25 px), this reads the two flags and mixes them; the searches walk one
@@ -20,7 +18,7 @@ struct SmaaParams {
     threshold      : f32,
     localContrast  : f32,
     cornerRounding : f32,
-    // how far (px) the three passes' searches reach each way (the single pass's is SMAA_REACH)
+    // how far (px) the searches reach along an edge each way
     reach          : u32,
     // SMAA_FLAG_*
     flags          : u32,
@@ -206,12 +204,6 @@ fn smaaWeights(p: vec2i, reach: i32) -> vec4f {
         weights = vec4f(weights.xy, w);
     }
     return weights;
-}
-
-// The weights as an rgba8unorm texture stores them (8 bits each), so the single pass blends with
-// what the three passes read back.
-fn smaaQuantizeWeights(w: vec4f) -> vec4f {
-    return round(saturate(w) * 255.0) / 255.0;
 }
 
 // ── Neighbourhood blending (SMAANeighborhoodBlendingPS) ──

@@ -39,36 +39,39 @@
 //!
 //! iryoku's High settings (threshold 0.1, local contrast adaptation factor 2, corner rounding
 //! 25 %), with two changes: the orthogonal searches reach [`SmaaEffect::REACH`] (16) pixels each
-//! way, half of High's 32 (High's 16 search steps cover 2 px each; Medium's 8 reach 16), and there
-//! is no diagonal search (High has 8 diagonal steps). The three passes' reach is
-//! [`SmaaOptions::three_pass_reach`].
+//! way by default, half of High's 32 (High's 16 search steps cover 2 px each; Medium's 8 reach
+//! 16; [`SmaaOptions::reach`] takes up to 64), and there is no diagonal search (High has 8
+//! diagonal steps).
 //!
-//! # One pass
+//! # Three passes
 //!
-//! [`SmaaMode::SinglePass`] (the default) runs SMAA's three passes in one compute dispatch
-//! (`smaa_single.wgsl`). A workgroup of 16 x 16 invocations serves a tile of 16 x 16 output
-//! pixels; the tile's blend reads the weights of a 17 x 17 block (the tile and the ring right of
-//! and below it).
+//! Edges (`SMAA/Edges`), blending weights (`SMAA/Weights`) and neighbourhood blending
+//! (`SMAA/Blend`), each a compute pass over the frame (`smaa_common.wgsl` and
+//! `smaa_passes.wgsl`), with the edges and the weights in two `rgba8unorm` textures at the
+//! frame's size between them.
 //!
-//! - **Early exit.** First it loads the luma of the block's 20 x 20 surroundings (each invocation
-//!   its own pixel, whose colour it keeps, then the ring) and finds the block's edges. A tile with
-//!   none (the sky, flat walls) stores its input and stops.
-//! - **Apron.** Otherwise it loads what the block's searches reach, in two arms: along the rows
-//!   for the runs of top edges (luma columns -18..34 by rows -4..18 of the tile, edges -16..33 by
-//!   -2..17) and down the columns for the runs of left edges (the transpose, only the ends the
-//!   first arm lacks). The arms' width is the reach: a search from the block walks at most
-//!   [`SmaaEffect::REACH`] pixels each way, and one more for its far end's crossing edges.
-//! - **Memory.** The luma as f32, the edge flags at two bits a pixel (packed with workgroup
-//!   atomics), the block's weights packed into 8 bits each (as the three passes' `rgba8unorm`
-//!   store them): about 9.3 KB of WebGPU's default 16 KB.
+//! It was meant to be one dispatch, each workgroup finding the edges, the weights and the blend of
+//! a tile in its own memory with an apron as wide as the searches reach. Two such single passes
+//! were built (the same image as these three passes, checked on the GPU) and timed at
+//! 1920 x 1080 against the three passes and `TemporalAAEffect`'s resolve. Both lost on an
+//! edge-dense frame, so neither ships (mean GPU time of the anti-aliasing passes, ms):
 //!
-//! The search, area, corner and blend code is `smaa_common.wgsl`'s, shared with the three passes,
-//! which read the same functions' pixels from textures; `tests/smaa_gpu.rs` checks the two give
-//! the same image, partial tiles and tiny frames included.
+//! | single pass, measured on | single pass | three passes | TAA resolve |
+//! |---|---|---|---|
+//! | 16 x 16 tiles (luma and edge bits in 9.3 KB of workgroup memory), native, a mostly flat image | 0.229 | 0.390 | 0.863 |
+//! | the same, in Chrome on the `smaa` example | 1.231 | 0.716 | 0.785 |
+//! | 32 x 32 tiles, four pixels an invocation, edges found straight from the input (5.4 KB), native, mostly flat | 0.180 | 0.371 | 0.832 |
+//! | the same, native, a dense lattice | 1.707 | 0.668 | 0.853 |
+//! | the same, in Chrome on the `smaa` example | 1.554 | 0.830 | 1.050 |
 //!
-//! The pipeline turns off wgpu's zeroing of workgroup memory (natively, naga's Metal backend does
-//! it from one invocation, which doubled the pass's time) and clears its edge flags itself;
-//! browsers zero it whatever the pipeline asks.
+//! Native: wgpu on Metal, medians of wall-clock time; Chrome: the example's `bench=1`, its passes'
+//! timestamps averaged over four rounds; an Apple GPU shared with other work. (Before the 16 x 16
+//! pass cleared only its edge flags, naga's Metal backend zeroed its workgroup memory from one
+//! invocation: 0.433 ms against 0.368 and 0.846.) A tile with edges does its apron's work for its
+//! own few pixels: the 16 x 16 tile loaded about 1,900 luma texels and found about 1,600 pixels'
+//! edges for its 256 (six to seven times what these passes do a pixel), and its searches waited
+//! behind barriers for the slowest. About 42 % of the example's 16 x 16 tiles have edges; the
+//! early exit of edge-free tiles only paid on mostly flat images.
 //!
 //! # Where it differs from iryoku's reference
 //!
@@ -115,11 +118,7 @@ use crate::cameras::Camera;
 use crate::postprocessing::PostProcessingEffect;
 use crate::renderers::GBuffer;
 
-const THREE_PASS_WGSL: &str = concat!(include_str!("../../shaders/smaa_common.wgsl"), include_str!("../../shaders/smaa_passes.wgsl"));
-/// With `KANSEI_SMAA_REACH` for [`SmaaEffect::REACH`] (`single_pass_wgsl`).
-const SINGLE_PASS_WGSL: &str = concat!(include_str!("../../shaders/smaa_common.wgsl"), include_str!("../../shaders/smaa_single.wgsl"));
-/// The single pass's tile (smaa_single.wgsl's SMAA_TILE): one workgroup's output pixels a side.
-const TILE: u32 = 32;
+const WGSL: &str = concat!(include_str!("../../shaders/smaa_common.wgsl"), include_str!("../../shaders/smaa_passes.wgsl"));
 /// SMAA's area texture, its 1x subtexture (see the module docs).
 const AREA: &[u8] = include_bytes!("smaa_area.bin");
 const AREA_SIZE: (u32, u32) = (160, 80);
@@ -131,18 +130,6 @@ const FLAG_ENCODED: u32 = 1;
 /// A dither after the blend (SMAA_FLAG_DITHER).
 const FLAG_DITHER: u32 = 2;
 
-/// How [`SmaaEffect`] runs SMAA.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum SmaaMode {
-    /// One compute dispatch: each workgroup finds the edges, the weights and the blend of a
-    /// 16 x 16 tile in its own memory, reaching [`SmaaEffect::REACH`].
-    #[default]
-    SinglePass,
-    /// Three compute passes (edges, blending weights, neighbourhood blending) over textures, the
-    /// reference, at [`SmaaOptions::three_pass_reach`].
-    ThreePass,
-}
-
 /// [`SmaaEffect`]'s settings; the defaults are the module docs' preset.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SmaaOptions {
@@ -152,13 +139,14 @@ pub struct SmaaOptions {
     pub local_contrast: f32,
     /// How much of a corner's blending is kept (0..1; iryoku's SMAA_CORNER_ROUNDING / 100).
     pub corner_rounding: f32,
-    /// How far (px) the three passes' searches reach each way, 1..=64.
-    pub three_pass_reach: u32,
+    /// How far (px) the searches reach along an edge each way, 1..=64 ([`SmaaEffect::REACH`] by
+    /// default; iryoku's High reaches 32).
+    pub reach: u32,
 }
 
 impl Default for SmaaOptions {
     fn default() -> Self {
-        Self { threshold: 0.1, local_contrast: 2.0, corner_rounding: 0.25, three_pass_reach: SmaaEffect::REACH }
+        Self { threshold: 0.1, local_contrast: 2.0, corner_rounding: 0.25, reach: SmaaEffect::REACH }
     }
 }
 
@@ -234,23 +222,17 @@ impl Targets {
     }
 }
 
-/// The three passes' pipelines and textures.
-struct ThreePass {
-    edges: Pipeline,
-    weights: Pipeline,
-    blend: Pipeline,
-    targets: Option<Targets>,
-}
 
 struct Gpu {
     params: wgpu::Buffer,
     area_texture: wgpu::Texture,
     area: wgpu::TextureView,
     sampler: wgpu::Sampler,
-    /// Made on the first single-pass frame.
-    single: Option<Pipeline>,
-    /// Made on the first three-pass frame.
-    three: Option<ThreePass>,
+    edges: Pipeline,
+    weights: Pipeline,
+    blend: Pipeline,
+    /// The edges and weights at the last frame's size.
+    targets: Option<Targets>,
 }
 
 /// SMAA 1x on the display signal, a single-frame anti-aliasing for scenes where
@@ -275,7 +257,6 @@ struct Gpu {
 /// ```
 pub struct SmaaEffect {
     pub options: SmaaOptions,
-    mode: SmaaMode,
     film: FilmGrain,
     frame: u32,
     gpu: Option<Gpu>,
@@ -288,20 +269,7 @@ impl SmaaEffect {
     pub const REACH: u32 = 16;
 
     pub fn new(options: SmaaOptions) -> Self {
-        Self { options, mode: SmaaMode::default(), film: FilmGrain::default(), frame: 0, gpu: None, bind_groups: Default::default() }
-    }
-
-    pub fn with_mode(mut self, mode: SmaaMode) -> Self {
-        self.mode = mode;
-        self
-    }
-
-    pub fn mode(&self) -> SmaaMode {
-        self.mode
-    }
-
-    pub fn set_mode(&mut self, mode: SmaaMode) {
-        self.mode = mode;
+        Self { options, film: FilmGrain::default(), frame: 0, gpu: None, bind_groups: Default::default() }
     }
 
     /// The signal it reads (`encode_srgb`) and the film it adds after blending.
@@ -320,7 +288,7 @@ impl SmaaEffect {
             threshold: o.threshold,
             local_contrast: o.local_contrast,
             corner_rounding: o.corner_rounding.clamp(0.0, 1.0),
-            reach: o.three_pass_reach.clamp(1, 64),
+            reach: o.reach.clamp(1, 64),
             flags: if f.encode_srgb { FLAG_ENCODED } else { 0 } | if f.dither { FLAG_DITHER } else { 0 },
             frame: self.frame,
             grain: f.grain.max(0.0),
@@ -362,86 +330,26 @@ impl SmaaEffect {
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             ..Default::default()
         });
-        self.gpu = Some(Gpu { params, area_texture, area, sampler, single: None, three: None });
-    }
-
-    /// The single pass's WGSL, its reach filled in.
-    fn single_pass_wgsl() -> String {
-        SINGLE_PASS_WGSL.replace("KANSEI_SMAA_REACH", &Self::REACH.to_string())
-    }
-
-    /// One dispatch of 16 x 16 tiles (`params` already written).
-    fn encode_single_pass(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, input: &wgpu::TextureView, output: &wgpu::TextureView, width: u32, height: u32) {
-        let gpu = self.gpu.as_mut().unwrap();
-        gpu.single.get_or_insert_with(|| {
-            let entry = |binding, ty| wgpu::BindGroupLayoutEntry { binding, visibility: wgpu::ShaderStages::COMPUTE, ty, count: None };
-            let texture = wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false };
-            let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("SMAA/BGL"),
-                entries: &[
-                    entry(0, wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }),
-                    entry(1, texture),
-                    entry(2, texture),
-                    entry(3, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering)),
-                    entry(4, wgpu::BindingType::StorageTexture { access: wgpu::StorageTextureAccess::WriteOnly, format: GBuffer::COLOR_FORMAT, view_dimension: wgpu::TextureViewDimension::D2 }),
-                ],
-            });
-            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("SMAA/SinglePass"), source: wgpu::ShaderSource::Wgsl(Self::single_pass_wgsl().into()) });
-            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("SMAA/Layout"), bind_group_layouts: &[Some(&bgl)], immediate_size: 0 });
-            let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("SMAA"),
-                layout: Some(&layout),
-                module: &module,
-                entry_point: Some("main"),
-                // the shader clears what it reads before writing (its edge flags); naga's Metal
-                // backend would zero all its workgroup memory from one invocation
-                compilation_options: wgpu::PipelineCompilationOptions { zero_initialize_workgroup_memory: false, ..Default::default() },
-                cache: None,
-            });
-            Pipeline { pipeline, bgl }
-        });
-        let gpu = self.gpu.as_ref().unwrap();
-        let single = gpu.single.as_ref().unwrap();
-        let bind_group = self.bind_groups.get(device, &wgpu::BindGroupDescriptor {
-            label: Some("SMAA/BG"),
-            layout: &single.bgl,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: gpu.params.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(input) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&gpu.area) },
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&gpu.sampler) },
-                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(output) },
-            ],
-        });
-        let stamp = crate::profiling::gpu_pass("SMAA");
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("SMAA"), timestamp_writes: stamp.as_ref().map(crate::profiling::PassStamp::compute) });
-        pass.set_pipeline(&single.pipeline);
-        pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(width.div_ceil(TILE), height.div_ceil(TILE), 1);
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("SMAA/Shader"), source: wgpu::ShaderSource::Wgsl(WGSL.into()) });
+        let (edges, weights, blend) = (
+            Pipeline::derived(device, &module, "SMAA/Edges", "edges"),
+            Pipeline::derived(device, &module, "SMAA/Weights", "weights"),
+            Pipeline::derived(device, &module, "SMAA/Blend", "blend"),
+        );
+        self.gpu = Some(Gpu { params, area_texture, area, sampler, edges, weights, blend, targets: None });
     }
 
     /// Edges, weights and blend, each its own compute pass (`params` already written).
-    fn encode_three_pass(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, input: &wgpu::TextureView, output: &wgpu::TextureView, width: u32, height: u32) {
-        {
-            let three = self.gpu.as_mut().unwrap().three.get_or_insert_with(|| {
-                let module = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("SMAA/ThreePass"), source: wgpu::ShaderSource::Wgsl(THREE_PASS_WGSL.into()) });
-                ThreePass {
-                    edges: Pipeline::derived(device, &module, "SMAA/Edges", "edges"),
-                    weights: Pipeline::derived(device, &module, "SMAA/Weights", "weights"),
-                    blend: Pipeline::derived(device, &module, "SMAA/Blend", "blend"),
-                    targets: None,
-                }
-            });
-            if three.targets.as_ref().map(|t| t.size) != Some((width, height)) {
-                if let Some(old) = three.targets.take() {
-                    old.destroy();
-                }
-                three.targets = Some(Targets::new(device, (width, height)));
+    fn encode(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, input: &wgpu::TextureView, output: &wgpu::TextureView, width: u32, height: u32) {
+        let gpu = self.gpu.as_mut().unwrap();
+        if gpu.targets.as_ref().map(|t| t.size) != Some((width, height)) {
+            if let Some(old) = gpu.targets.take() {
+                old.destroy();
             }
+            gpu.targets = Some(Targets::new(device, (width, height)));
         }
         let gpu = self.gpu.as_ref().unwrap();
-        let three = gpu.three.as_ref().unwrap();
-        let targets = three.targets.as_ref().unwrap();
+        let targets = gpu.targets.as_ref().unwrap();
         let tex = wgpu::BindingResource::TextureView;
         let group = |pipeline: &Pipeline, entries: &[(u32, wgpu::BindingResource)]| {
             let entries: Vec<_> = entries.iter().map(|(binding, resource)| wgpu::BindGroupEntry { binding: *binding, resource: resource.clone() }).collect();
@@ -449,13 +357,13 @@ impl SmaaEffect {
         };
         let params = gpu.params.as_entire_binding();
         let passes = [
-            ("SMAA/Edges", &three.edges, group(&three.edges, &[(0, params.clone()), (1, tex(input)), (6, tex(&targets.edges_view))])),
+            ("SMAA/Edges", &gpu.edges, group(&gpu.edges, &[(0, params.clone()), (1, tex(input)), (6, tex(&targets.edges_view))])),
             (
                 "SMAA/Weights",
-                &three.weights,
-                group(&three.weights, &[(0, params.clone()), (2, tex(&gpu.area)), (3, wgpu::BindingResource::Sampler(&gpu.sampler)), (5, tex(&targets.edges_view)), (8, tex(&targets.weights_view))]),
+                &gpu.weights,
+                group(&gpu.weights, &[(0, params.clone()), (2, tex(&gpu.area)), (3, wgpu::BindingResource::Sampler(&gpu.sampler)), (5, tex(&targets.edges_view)), (8, tex(&targets.weights_view))]),
             ),
-            ("SMAA/Blend", &three.blend, group(&three.blend, &[(0, params), (1, tex(input)), (4, tex(output)), (7, tex(&targets.weights_view))])),
+            ("SMAA/Blend", &gpu.blend, group(&gpu.blend, &[(0, params), (1, tex(input)), (4, tex(output)), (7, tex(&targets.weights_view))])),
         ];
         for (label, pipeline, bind_group) in &passes {
             let stamp = crate::profiling::gpu_pass(label);
@@ -467,13 +375,8 @@ impl SmaaEffect {
     }
 
     #[cfg(test)]
-    pub(crate) fn three_pass_source() -> &'static str {
-        THREE_PASS_WGSL
-    }
-
-    #[cfg(test)]
-    pub(crate) fn single_pass_source() -> String {
-        Self::single_pass_wgsl()
+    pub(crate) fn shader_source() -> &'static str {
+        WGSL
     }
 }
 
@@ -499,10 +402,7 @@ impl PostProcessingEffect for SmaaEffect {
         let params = self.params(width, height);
         self.frame = self.frame.wrapping_add(1);
         queue.write_buffer(&self.gpu.as_ref().unwrap().params, 0, bytemuck::bytes_of(&params));
-        match self.mode {
-            SmaaMode::SinglePass => self.encode_single_pass(device, encoder, input, output, width, height),
-            SmaaMode::ThreePass => self.encode_three_pass(device, encoder, input, output, width, height),
-        }
+        self.encode(device, encoder, input, output, width, height);
     }
 
     // The intermediates follow the size `render` is given.
@@ -511,7 +411,7 @@ impl PostProcessingEffect for SmaaEffect {
     fn destroy(&mut self) {
         if let Some(gpu) = self.gpu.take() {
             gpu.area_texture.destroy();
-            if let Some(targets) = gpu.three.and_then(|t| t.targets) {
+            if let Some(targets) = gpu.targets {
                 targets.destroy();
             }
         }
@@ -541,7 +441,7 @@ mod tests {
 
     #[test]
     fn shaders_validate_and_params_layout_matches() {
-        let code = SmaaEffect::three_pass_source();
+        let code = SmaaEffect::shader_source();
         let module = naga::front::wgsl::parse_str(code).unwrap_or_else(|e| panic!("{}", e.emit_to_string(code)));
         naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
             .validate(&module)
@@ -556,23 +456,6 @@ mod tests {
             .unwrap();
         assert_eq!(span, std::mem::size_of::<SmaaParamsGpu>());
         assert_eq!(span, 48);
-    }
-
-    #[test]
-    fn the_single_pass_fits_webgpu_s_default_limits() {
-        let code = SmaaEffect::single_pass_source();
-        let module = naga::front::wgsl::parse_str(&code).unwrap_or_else(|e| panic!("{}", e.emit_to_string(&code)));
-        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all()).validate(&module).unwrap_or_else(|e| panic!("{e:?}"));
-        let mut layouter = naga::proc::Layouter::default();
-        layouter.update(module.to_ctx()).unwrap();
-        let bytes: u32 = module
-            .global_variables
-            .iter()
-            .filter(|(_, g)| g.space == naga::AddressSpace::WorkGroup)
-            .map(|(_, g)| layouter[g.ty].size.next_multiple_of(16))
-            .sum();
-        assert!(bytes <= 16384, "{bytes} bytes of workgroup memory");
-        assert_eq!(module.entry_points[0].workgroup_size, [16, 16, 1]);
     }
 
     #[test]
