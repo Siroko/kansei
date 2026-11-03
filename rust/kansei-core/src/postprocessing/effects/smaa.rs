@@ -417,6 +417,11 @@ impl PostProcessingEffect for SmaaEffect {
         }
     }
 
+    // never binds the GBuffer's velocity: a chain of such effects skips the velocity pass
+    fn reads_velocity(&self) -> bool {
+        false
+    }
+
     fn as_any(&self) -> &dyn std::any::Any { self }
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
 }
@@ -459,8 +464,9 @@ mod tests {
     }
 
     #[test]
-    fn smaa_never_asks_for_jitter_or_upscaling() {
+    fn smaa_never_asks_for_jitter_velocity_or_upscaling() {
         let smaa = SmaaEffect::new(Default::default());
         assert!(!smaa.wants_jitter() && !smaa.upscales_to_display());
+        assert!(!smaa.reads_velocity());
     }
 }

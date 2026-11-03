@@ -126,6 +126,11 @@ impl PostProcessingEffect for ColorGradingEffect {
 
     fn resize(&mut self, _width: u32, _height: u32, _gbuffer: &GBuffer) {}
     fn destroy(&mut self) { self.initialized = false; }
+    // never binds the GBuffer's velocity: a chain of such effects skips the velocity pass
+    fn reads_velocity(&self) -> bool {
+        false
+    }
+
     fn as_any(&self) -> &dyn std::any::Any { self }
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
 }

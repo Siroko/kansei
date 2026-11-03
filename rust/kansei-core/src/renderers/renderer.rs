@@ -3368,10 +3368,12 @@ impl Renderer {
             [0.0, 0.0]
         };
 
-        // Render scene to GBuffer (actually draw into it)
+        // Render scene to GBuffer (actually draw into it), its motion vectors only for a chain
+        // that reads them
         {
+            let velocity = volume.reads_velocity();
             let gbuffer = volume.gbuffer().unwrap();
-            self.render_scene_to_gbuffer(scene, camera, gbuffer);
+            self.render_scene_to_gbuffer_with(scene, camera, gbuffer, velocity);
         }
 
         // Get surface texture for blit
@@ -3401,12 +3403,19 @@ impl Renderer {
         crate::profiling::end_frame(self.device.as_ref().unwrap(), self.queue.as_ref().unwrap());
     }
 
-    /// Draw the scene into the GBuffer's targets.
-    pub(crate) fn render_scene_to_gbuffer(
+    /// Draw the scene into the GBuffer's targets, its motion vectors included.
+    pub(crate) fn render_scene_to_gbuffer(&mut self, scene: &mut Scene, camera: &mut Camera, gbuffer: &GBuffer) {
+        self.render_scene_to_gbuffer_with(scene, camera, gbuffer, true);
+    }
+
+    /// Draw the scene into the GBuffer's targets; its velocity pass (the materials'
+    /// `outputs_velocity`) only with `velocity`, else the velocity texture keeps what it had.
+    pub(crate) fn render_scene_to_gbuffer_with(
         &mut self,
         scene: &mut Scene,
         camera: &mut Camera,
         gbuffer: &GBuffer,
+        velocity: bool,
     ) {
         let _scene = crate::profiling::cpu_scope("scene");
         let t = crate::profiling::cpu_scope("scene/prepare");
@@ -3755,8 +3764,10 @@ impl Renderer {
         }
 
         // Pass 3: motion vectors of the materials that write them, against the GBuffer depth;
-        // the rest of the velocity texture keeps NO_VELOCITY
-        self.draw_velocity(&mut encoder, scene, camera, gbuffer);
+        // the rest of the velocity texture keeps NO_VELOCITY (skipped when nothing reads it)
+        if velocity {
+            self.draw_velocity(&mut encoder, scene, camera, gbuffer);
+        }
 
         drop(t);
         let t = crate::profiling::cpu_scope("scene/submit");

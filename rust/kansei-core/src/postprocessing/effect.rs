@@ -40,6 +40,13 @@ pub trait PostProcessingEffect {
     fn upscales_to_display(&self) -> bool {
         false
     }
+    /// Whether the effect binds the GBuffer's velocity texture. The renderer skips its velocity
+    /// pass on frames when no running effect of the chain reads it (the texture then keeps an
+    /// older frame's vectors). True by default; return false only from an effect that never binds
+    /// `gbuffer.velocity_view`.
+    fn reads_velocity(&self) -> bool {
+        true
+    }
     fn destroy(&mut self);
     /// Light by this environment (`environment::EnvironmentLighting`, from a
     /// `GradientEnvironment`, `SkyAtmosphere::lighting` or an `HdrEnvironment`): an effect that
