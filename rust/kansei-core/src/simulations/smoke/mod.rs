@@ -37,8 +37,8 @@ pub use mouse::SmokeMouse;
 pub use simulation::{SmokeGridTextures, SmokeHandle, SmokeSimulation, SmokeVolumeId};
 pub use volume::{CurlSettings, FluidSmokeSettings, SmokeFill, SmokeLook, SmokeMotion, SmokeSource, SmokeVolume, WavesSettings};
 
-#[allow(unused_imports)]
-pub(crate) use simulation::{SmokeHandleVolume, SmokeShared};
+pub(crate) use mouse::SmokePushGpu;
+pub(crate) use simulation::SmokeHandleVolume;
 pub(crate) use volume::SmokeVolumeGpu;
 
 /// Volumes a simulation holds, and the fog marches at once.

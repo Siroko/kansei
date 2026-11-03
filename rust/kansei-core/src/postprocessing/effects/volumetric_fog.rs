@@ -1330,7 +1330,7 @@ mod tests {
         assert_eq!(sizes["SkyLighting"] as u64, SKY_LIGHTING_BYTES);
         assert_eq!(sizes["ShaftParams"], std::mem::size_of::<ShaftParamsGpu>());
         assert_eq!(sizes["SmokeFrame"], std::mem::size_of::<super::super::volumetric_smoke::SmokeFrameGpu>());
-        assert_eq!(sizes["SmokePush"], std::mem::size_of::<super::super::volumetric_smoke::SmokePushGpu>());
+        assert_eq!(sizes["SmokePush"], std::mem::size_of::<crate::simulations::smoke::SmokePushGpu>());
         assert_eq!(sizes["SmokeVolumeData"], std::mem::size_of::<crate::simulations::smoke::SmokeVolumeGpu>());
     }
 

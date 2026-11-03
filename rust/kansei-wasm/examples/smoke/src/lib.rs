@@ -10,7 +10,7 @@ use std::rc::Rc;
 use wasm_bindgen::prelude::*;
 
 use kansei_core::cameras::Camera;
-use kansei_core::controls::CameraControls;
+use kansei_core::controls::{CameraControls, MouseVectors};
 use kansei_core::froxels::FroxelGridOptions;
 use kansei_core::geometries::{BoxGeometry, CylinderGeometry};
 use kansei_core::lights::{DirectionalLight, Light};
@@ -107,6 +107,10 @@ fn plume(motion: SmokeMotion) -> SmokeVolume {
     v
 }
 
+/// The mouse's stir: its push per unit of the cursor's speed, and its reach round the ray (m).
+const MOUSE_STRENGTH: f32 = 1.0;
+const MOUSE_RADIUS: f32 = 0.08;
+
 /// The hanging layers' look: thin haze, not steam.
 const LAYERS_DENSITY: f32 = 0.5;
 
@@ -165,6 +169,9 @@ struct State {
     scene: Scene,
     camera: Camera,
     controls: CameraControls,
+    mouse: MouseVectors,
+    mouse_strength: f32,
+    mouse_radius: f32,
     volume: PostProcessingVolume,
     smoke: SmokeSimulation,
     #[allow(dead_code)]
@@ -190,11 +197,26 @@ impl State {
         self.volume.effect_mut::<VolumetricFogEffect>()
     }
 
+    /// The mouse as the smoke takes it: none while the camera is being dragged (orbiting
+    /// doesn't tear the plume), else a push at the plume's depth.
+    fn smoke_mouse(&self, dt: f32) -> SmokeMouse {
+        if self.controls.is_dragging() || dt <= 0.0 {
+            return SmokeMouse::NONE;
+        }
+        let inv_view = self.camera.inverse_view_matrix.to_glam();
+        let eye = Vec3::from(inv_view.w_axis.truncate());
+        let forward = Vec3::from(-inv_view.z_axis.truncate().normalize());
+        let depth = (self.smoke.volume(self.plume).center - eye).dot(&forward).max(0.1);
+        SmokeMouse::from_screen(&self.camera, self.mouse.position, self.mouse.direction, dt, self.mouse_strength, self.mouse_radius, depth)
+    }
+
     fn frame(&mut self, dt: f32, time: f32) {
         self.controls.update(&mut self.camera, dt);
+        self.mouse.update(dt);
+        let mouse = self.smoke_mouse(dt);
         let steps = self.fixed.advance(dt as f64);
         for _ in 0..steps {
-            self.smoke.step(self.fixed.step as f32, &SmokeMouse::NONE);
+            self.smoke.step(self.fixed.step as f32, &mouse);
         }
         if let Some(fog) = self.fog() {
             fog.time = time;
@@ -313,7 +335,23 @@ pub async fn start(canvas_id: &str) -> Result<(), JsValue> {
 
     log::info!("Kansei — Volumetric Smoke (WASM) ready, TAA {taa}");
     let fixed = FixedStep::new(1.0 / 60.0);
-    let state = Rc::new(RefCell::new(State { renderer, scene, camera, controls, volume, smoke, plume, layers, fixed, stats }));
+    // hovering stirs the smoke
+    let mouse = MouseVectors::from_canvas(canvas.element());
+    let state = Rc::new(RefCell::new(State {
+        renderer,
+        scene,
+        camera,
+        controls,
+        mouse,
+        mouse_strength: MOUSE_STRENGTH,
+        mouse_radius: MOUSE_RADIUS,
+        volume,
+        smoke,
+        plume,
+        layers,
+        fixed,
+        stats,
+    }));
     STATE.with(|s| *s.borrow_mut() = Some(state.clone()));
     kansei_wasm::run(&canvas, move |frame| {
         let mut st = state.borrow_mut();

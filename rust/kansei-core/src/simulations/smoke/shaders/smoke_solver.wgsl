@@ -72,9 +72,11 @@ fn smokeVelocityAt(c: vec3f) -> vec3f {
     return vec3f(macU(c), macV(c), macW(c));
 }
 
-// Velocity the Curl noise level adds to its noise's at a world point: the mouse (a later stage).
+// Velocity the Curl noise level adds to its noise's at a world point: the mouse's push, round its
+// ray (the gas it moves stays moved: a trail).
 fn smokeExtraVelocity(p: vec3f) -> vec3f {
-    return vec3f(0.0);
+    if (st.mouseActive == 0u) { return vec3f(0.0); }
+    return st.mousePush * smokeMouseFalloff(p, st.mouseOrigin, st.mouseDirection, st.mouseRadius);
 }
 
 // A point in cells carried back over the step (or forward, `dt` < 0) by the velocity at it.
@@ -237,8 +239,8 @@ fn faceForce(axis: u32, q: vec3i, p: vec3f) -> f32 {
 }
 
 // Forces beyond the gas's own, at a world point, along the box's axes: the ambient draft (a
-// weak, slow curl-noise force: it stirs hanging smoke without piling it against a wall) and the
-// mouse (a later stage).
+// weak, slow curl-noise force: it stirs hanging smoke without piling it against a wall). The
+// mouse drags the gas (`mouseDrag`).
 fn smokeExtraForce(p: vec3f) -> vec3f {
     var f = vec3f(0.0);
     if (st.ambientDraft != 0.0) {
@@ -265,6 +267,16 @@ fn sourceVelocity(axis: u32, value: f32, p: vec3f) -> f32 {
     return v;
 }
 
+// The mouse on Fluid: round its ray, the gas is dragged toward the push's velocity (about 20 per
+// second), so a stir leaves a wake the solver carries on, and a push never adds more speed than
+// it has.
+fn mouseDrag(axis: u32, value: f32, p: vec3f) -> f32 {
+    if (st.mouseActive == 0u) { return value; }
+    let w = smokeMouseFalloff(cellsToWorld(p), st.mouseOrigin, st.mouseDirection, st.mouseRadius);
+    if (w <= 0.0) { return value; }
+    return mix(value, smokeVecToBox(st.volume, st.mousePush)[axis], w * (1.0 - exp(-20.0 * st.dt)));
+}
+
 @compute @workgroup_size(4, 4, 4)
 fn forces(@builtin(global_invocation_id) gid : vec3u) {
     if (!inGrid(gid)) { return; }
@@ -275,7 +287,7 @@ fn forces(@builtin(global_invocation_id) gid : vec3u) {
     for (var a = 0u; a < 3u; a++) {
         if (gid[a] == 0u) { vel[a] = 0.0; continue; }   // the wall
         var v = vel[a] + st.dt * faceForce(a, q, faces[a]);
-        vel[a] = sourceVelocity(a, v, faces[a]);
+        vel[a] = mouseDrag(a, sourceVelocity(a, v, faces[a]), faces[a]);
     }
     textureStore(vectorOut, gid, vec4f(vel, 0.0));
 }

@@ -198,3 +198,11 @@ fn smokeWavesDensity(v: SmokeVolumeData, p: vec3f, time: f32) -> f32 {
     }
     return total;
 }
+
+// How much of the mouse's push reaches a world point: 1 on its ray, 0 at `radius` from it.
+fn smokeMouseFalloff(p: vec3f, origin: vec3f, direction: vec3f, radius: f32) -> f32 {
+    let d = length(cross(p - origin, direction));
+    let r = saturate(d / max(radius, 1e-6));
+    let f = 1.0 - r * r;
+    return f * f;
+}

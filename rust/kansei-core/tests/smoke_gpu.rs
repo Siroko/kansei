@@ -441,3 +441,98 @@ fn layers_drift_on_fluid_and_do_not_dissipate() {
     assert!((mass / mass0 - 1.0).abs() < 0.05, "mass {mass0} -> {mass}");
     assert!(change > 0.05 * l1, "the layers barely moved: {}", change / l1);
 }
+
+/// Task 5's plume.
+fn default_plume() -> SmokeVolume {
+    let source = SmokeSource { position: Vec3::new(0.0, 0.0, 0.0), radius: 0.03, rate: 4.0, temperature: 1.0, velocity: Vec3::new(0.0, 0.15, 0.0) };
+    SmokeVolume::rising_from(source, 0.8, SmokeMotion::fluid())
+}
+
+#[test]
+fn the_mouse_still_stirs_after_a_long_run() {
+    let Some((device, queue)) = gpu() else { return };
+    let run = |push: bool| {
+        let mut sim = SmokeSimulation::new(&device, &queue);
+        let v = default_plume();
+        let (center, dims) = (v.center, v.grid_dims());
+        let size = v.size;
+        let id = sim.add(v);
+        for _ in 0..1200 {
+            sim.step(1.0 / 60.0, &SmokeMouse::NONE);
+        }
+        // a 2 m/s push along +x through the box's centre, the ray along -z
+        let mouse = SmokeMouse { origin: Vec3::new(center.x, center.y, center.z + 1.0), direction: Vec3::new(0.0, 0.0, -1.0), push: Vec3::new(2.0, 0.0, 0.0), radius: 0.05 };
+        for _ in 0..10 {
+            sim.step(1.0 / 60.0, if push { &mouse } else { &SmokeMouse::NONE });
+        }
+        let vel = read_rgba16(&device, &queue, sim.grid_textures(id).unwrap().velocity.unwrap(), dims);
+        (vel, dims, size)
+    };
+    let (pushed, dims, size) = run(true);
+    let (still, _, _) = run(false);
+    // the u faces within the radius of the ray: x = i, y = j + 1/2 in cells
+    let [w, h, d] = dims;
+    let (mut sum, mut n) = (0.0f32, 0);
+    for z in 0..d {
+        for y in 0..h {
+            for x in 0..w {
+                let p = glam::Vec2::new(x as f32 / w as f32 * size.x - size.x * 0.5, (y as f32 + 0.5) / h as f32 * size.y - size.y * 0.5);
+                if p.length() < 0.05 {
+                    let i = ((z * h + y) * w + x) as usize;
+                    sum += (pushed[i][0] - still[i][0]).abs();
+                    n += 1;
+                }
+            }
+        }
+    }
+    let mean = sum / n as f32;
+    eprintln!("mean |du| within the push: {mean} m/s over {n} faces");
+    assert!(mean > 0.2, "{mean}");
+}
+
+#[test]
+fn violent_stirring_stays_finite_and_capped() {
+    let Some((device, queue)) = gpu() else { return };
+    let mut sim = SmokeSimulation::new(&device, &queue);
+    let v = default_plume();
+    let (center, size, dims) = (v.center, v.size, v.grid_dims());
+    let max_speed = FluidSmokeSettings::default().max_speed;
+    let id = sim.add(v);
+    for k in 0..600 {
+        // a 50 m/s push sweeping back and forth across the box
+        let t = k as f32 / 30.0;
+        let x = center.x + (t * 3.0).sin() * size.x * 0.5;
+        let mouse = SmokeMouse { origin: Vec3::new(x, center.y + (t * 1.3).sin() * size.y * 0.4, center.z + 1.0), direction: Vec3::new(0.0, 0.0, -1.0), push: Vec3::new(50.0 * (t * 3.0).cos(), 20.0, 0.0), radius: 0.1 };
+        sim.step(1.0 / 30.0, &mouse);
+    }
+    let grid = sim.grid_textures(id).unwrap();
+    let vel = read_rgba16(&device, &queue, grid.velocity.unwrap(), dims);
+    let (cells, _) = read_scalars(&device, &queue, &sim, id);
+    let finite = vel.iter().all(|c| c.iter().all(|v| v.is_finite())) && cells.iter().all(|c| c[0].is_finite() && c[1].is_finite());
+    let fastest = vel.iter().map(|c| (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt()).fold(0.0f32, f32::max);
+    eprintln!("fastest {fastest} m/s (cap {max_speed})");
+    assert!(finite, "a value is not finite");
+    assert!(fastest <= max_speed * 1.01, "{fastest}");
+}
+
+#[test]
+fn curl_pushes_leave_a_trail() {
+    let Some((device, queue)) = gpu() else { return };
+    let mut sim = SmokeSimulation::new(&device, &queue);
+    let mut v = SmokeVolume::new(Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.2, 0.6, 0.6), SmokeMotion::CurlNoise(CurlSettings { strength: 0.0, rise: 0.0, ..Default::default() }));
+    v.resolution = 96;
+    v.look.dissipation = 0.0;
+    v.fill = SmokeFill::Sphere { center: Vec3::new(-0.3, 0.0, 0.0), radius: 0.1, density: 1.0, temperature: 0.0 };
+    let size = v.size;
+    let id = sim.add(v);
+    let (cells, dims) = read_scalars(&device, &queue, &sim, id);
+    let (_, com0) = mass_and_com(&cells, dims, size);
+    let mouse = SmokeMouse { origin: Vec3::new(-0.3, 0.0, 1.0), direction: Vec3::new(0.0, 0.0, -1.0), push: Vec3::new(1.0, 0.0, 0.0), radius: 0.3 };
+    for _ in 0..30 {
+        sim.step(1.0 / 60.0, &mouse);
+    }
+    let (cells, _) = read_scalars(&device, &queue, &sim, id);
+    let (_, com) = mass_and_com(&cells, dims, size);
+    eprintln!("centre of mass {com0} -> {com}");
+    assert!(com.x - com0.x > 0.15, "moved {}", com.x - com0.x);
+}

@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use bytemuck::{Pod, Zeroable};
 
-use super::mouse::SmokeMouse;
+use super::mouse::{SmokeMouse, SmokePushGpu, SmokePushes};
 use super::solver::{Solver, VolumeStep};
 use super::volume::{SmokeFill, SmokeMotion, SmokeVolume, SmokeVolumeGpu};
 use super::{FILL_WGSL, MAX_SMOKE_VOLUMES};
@@ -198,6 +198,8 @@ pub(crate) struct SmokeShared {
     pub(crate) time: f32,
     /// Simulated seconds since the fog last rendered (it takes them).
     pub(crate) advanced: f32,
+    /// The Waves level's recent mouse pushes.
+    pub(crate) pushes: Vec<SmokePushGpu>,
 }
 
 /// What `VolumetricFogEffect::set_smoke` marches: a [`SmokeSimulation`]'s enabled volumes and
@@ -239,6 +241,7 @@ pub struct SmokeSimulation {
     queue: wgpu::Queue,
     slots: Vec<Slot>,
     time: f32,
+    pushes: SmokePushes,
     handle: SmokeHandle,
     fill: FillGpu,
     /// every volume's `SmokeStep` slot, written once a step
@@ -279,6 +282,7 @@ impl SmokeSimulation {
             queue: queue.clone(),
             slots: Vec::new(),
             time: 0.0,
+            pushes: SmokePushes::default(),
             handle: SmokeHandle::default(),
             fill: FillGpu {
                 pipeline,
@@ -351,6 +355,13 @@ impl SmokeSimulation {
         if dt > 0.0 {
             self.time += dt;
             self.simulate(dt, mouse);
+            // the Waves level's pushes, relaxing over its (first Waves volume's) relax time
+            let relax = self.slots.iter().find_map(|s| match s.volume.motion {
+                SmokeMotion::Waves(w) if s.enabled => Some(w.relax_time),
+                _ => None,
+            });
+            self.pushes.age(dt);
+            self.pushes.record(mouse, dt, relax.unwrap_or(super::WavesSettings::default().relax_time));
             self.handle.shared.lock().unwrap().advanced += dt;
         }
         self.refresh_handle();
@@ -467,5 +478,6 @@ impl SmokeSimulation {
         let mut shared = self.handle.shared.lock().unwrap();
         shared.volumes = volumes;
         shared.time = self.time;
+        shared.pushes = self.pushes.gpu().to_vec();
     }
 }

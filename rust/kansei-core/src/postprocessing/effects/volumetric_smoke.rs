@@ -4,7 +4,7 @@
 
 use bytemuck::{Pod, Zeroable};
 
-use crate::simulations::smoke::{SmokeHandle, SmokeVolumeGpu, MAX_SMOKE_PUSHES, MAX_SMOKE_VOLUMES};
+use crate::simulations::smoke::{SmokeHandle, SmokePushGpu, SmokeVolumeGpu, MAX_SMOKE_PUSHES, MAX_SMOKE_VOLUMES};
 
 /// How the fog marches smoke.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -29,17 +29,6 @@ impl Default for SmokeRenderOptions {
     fn default() -> Self {
         Self { max_steps: 96, shadow_steps: 6, step_scale: 0.75, temporal: true, blend: 0.25, shadow_distance: 1.0 }
     }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-pub(crate) struct SmokePushGpu {
-    pub(crate) origin: [f32; 3],
-    pub(crate) radius: f32,
-    pub(crate) direction: [f32; 3],
-    pub(crate) age: f32,
-    pub(crate) push: [f32; 3],
-    pub(crate) _pad: f32,
 }
 
 /// WGSL `SmokeFrame`, written once a frame.
@@ -237,13 +226,13 @@ impl SmokeRenderer {
         accum: &wgpu::TextureView,
         sampler: &wgpu::Sampler,
     ) -> Option<SmokeComposite> {
-        let (volumes, time, advanced) = {
+        let (volumes, pushes, time, advanced) = {
             let mut shared = handle.shared.lock().unwrap();
             if shared.volumes.is_empty() {
                 return None;
             }
             let advanced = std::mem::take(&mut shared.advanced);
-            (shared.volumes.clone(), shared.time, advanced)
+            (shared.volumes.clone(), shared.pushes.clone(), shared.time, advanced)
         };
         let size = (view.full_size.0.div_ceil(2), view.full_size.1.div_ceil(2));
         if self.targets.as_ref().is_none_or(|t| t.size != size) {
@@ -283,7 +272,7 @@ impl SmokeRenderer {
             max_steps: options.max_steps.max(1),
             shadow_steps: options.shadow_steps,
             jitter: options.temporal as u32,
-            num_pushes: 0,
+            num_pushes: pushes.len().min(MAX_SMOKE_PUSHES) as u32,
             shadow_distance: options.shadow_distance.max(0.0),
             history_valid: (options.temporal && self.prev_view_proj.is_some()) as u32,
             blend: options.blend.clamp(0.02, 1.0),
@@ -291,6 +280,9 @@ impl SmokeRenderer {
         };
         for (dst, v) in frame.volumes.iter_mut().zip(&volumes) {
             *dst = v.data;
+        }
+        for (dst, p) in frame.pushes.iter_mut().zip(&pushes) {
+            *dst = *p;
         }
         queue.write_buffer(&self.frame_buffer, 0, bytemuck::bytes_of(&frame));
         let current = (self.frame % 2) as usize;

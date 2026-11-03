@@ -89,6 +89,8 @@ impl CameraControls {
         { let s = shared.clone();
           let cb = Closure::<dyn FnMut(web_sys::MouseEvent)>::new(move |e: web_sys::MouseEvent| {
             let mut st = s.borrow_mut();
+            // a button released off the canvas (or over a panel) sends no mouseup here
+            (st.dragging, st.panning) = drag_after_move(st.dragging, st.panning, e.buttons());
             if st.panning {
                 if let Some((lx, ly)) = st.last_mouse {
                     let pan_scale = st.radius * 0.0015;
@@ -376,6 +378,18 @@ impl CameraControls {
         #[cfg(target_arch = "wasm32")]
         if let Some(ref shared) = self.shared { shared.borrow_mut().elevation = e; }
     }
+    /// Whether an orbit or pan drag, or a touch, is in progress (WASM; always false natively,
+    /// where the caller drives the controls): an app can keep the mouse's other uses (stirring
+    /// smoke) off while the camera moves.
+    pub fn is_dragging(&self) -> bool {
+        #[cfg(target_arch = "wasm32")]
+        if let Some(ref shared) = self.shared {
+            let st = shared.borrow();
+            return st.dragging || st.panning || st.touch_count > 0;
+        }
+        false
+    }
+
     pub fn azimuth(&self) -> f32 { self.azimuth }
     pub fn elevation(&self) -> f32 { self.elevation }
 
@@ -403,6 +417,17 @@ impl CameraControls {
     }
 }
 
+/// The drag and pan state after a mousemove with `buttons` held (MouseEvent.buttons): a move with
+/// neither the left nor the right button down ends both, as the button was released where the
+/// canvas couldn't hear it.
+pub(crate) fn drag_after_move(dragging: bool, panning: bool, buttons: u16) -> (bool, bool) {
+    if buttons & 3 == 0 {
+        (false, false)
+    } else {
+        (dragging, panning)
+    }
+}
+
 /// Move the pan offset by `dx`, `dy` along the camera's right and up axes.
 #[cfg(target_arch = "wasm32")]
 fn pan_by(st: &mut ControlState, dx: f32, dy: f32) {
@@ -418,4 +443,16 @@ fn pan_by(st: &mut ControlState, dx: f32, dy: f32) {
     st.pan_offset[1] += dx * right.1 + dy * up.1;
     st.pan_offset[2] += dx * right.2 + dy * up.2;
     st.dirty = true;
+}
+
+#[cfg(test)]
+mod drag_tests {
+    use super::*;
+
+    #[test]
+    fn a_mousemove_with_no_button_ends_the_drag() {
+        assert_eq!(drag_after_move(true, false, 0), (false, false));
+        assert_eq!(drag_after_move(true, false, 1), (true, false));
+        assert_eq!(drag_after_move(false, true, 2), (false, true));
+    }
 }

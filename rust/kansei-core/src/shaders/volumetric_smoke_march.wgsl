@@ -122,6 +122,17 @@ fn smokeVelocityAtWorld(p: vec3f) -> vec3f {
     return vel / max(weight, 1e-6);
 }
 
+// Where the mouse's recent pushes have moved the gas at p (the Waves level), metres: each push's
+// displacement round its ray, relaxing over `relaxTime` (SmokePushes::displacement).
+fn smokePushDisplacement(p: vec3f, relaxTime: f32) -> vec3f {
+    var total = vec3f(0.0);
+    for (var k = 0u; k < sf.numPushes; k++) {
+        let push = sf.pushes[k];
+        total += push.push * (smokeMouseFalloff(p, push.origin, push.direction, push.radius) * exp(-push.age / max(relaxTime, 1e-3)));
+    }
+    return total;
+}
+
 // Volume i's density at p (scaled by its densityScale, faded at its faces).
 fn smokeDensityAt(i: u32, p: vec3f) -> f32 {
     let v = sf.volumes[i];
@@ -129,7 +140,8 @@ fn smokeDensityAt(i: u32, p: vec3f) -> f32 {
     if (any(local < vec3f(0.0)) || any(local > vec3f(1.0))) { return 0.0; }
     var d = 0.0;
     if (v.motion == SMOKE_WAVES) {
-        d = smokeWavesDensity(v, p, sf.time);
+        // the gas a push moved by D is found at p where it was at p - D
+        d = smokeWavesDensity(v, p - smokePushDisplacement(p, v.wavesRelaxTime), sf.time);
     } else {
         d = max(smokeGridAt(i, local).r, 0.0);
     }
